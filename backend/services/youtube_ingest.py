@@ -150,6 +150,37 @@ def _discover_js_runtimes() -> Dict[str, Dict[str, Any]]:
     return runtimes
 
 
+def _resolve_ytdlp_cookies_file() -> Optional[Path]:
+    env_path = os.environ.get("YTDLP_COOKIES_FILE", "").strip()
+    if env_path:
+        p = Path(env_path).expanduser()
+        if p.is_file() and p.stat().st_size > 0:
+            return p.resolve()
+
+    backend_dir = Path(__file__).resolve().parents[1]
+    repo_dir = Path(__file__).resolve().parents[2]
+    for candidate in (backend_dir / "cookies.txt", repo_dir / "cookies.txt"):
+        if candidate.is_file() and candidate.stat().st_size > 0:
+            return candidate.resolve()
+    return None
+
+
+def _apply_ytdlp_common_opts(opts: Dict[str, Any]) -> Dict[str, Any]:
+    """Attaches discovered JS runtimes and optional YouTube cookies to yt-dlp options."""
+    js_runtimes = _discover_js_runtimes()
+    if js_runtimes:
+        opts["js_runtimes"] = js_runtimes
+
+    cookies_file = _resolve_ytdlp_cookies_file()
+    if cookies_file is not None:
+        opts["cookiefile"] = str(cookies_file)
+    else:
+        browser = os.environ.get("YTDLP_COOKIES_FROM_BROWSER", "").strip()
+        if browser:
+            opts["cookiesfrombrowser"] = (browser.lower(),)
+    return opts
+
+
 def _compute_peaks_from_media(media_path: Path, num_buckets: int = 160) -> List[float]:
     """
     Streams ultra-low-sample-rate (200Hz) PCM via FFmpeg stdout to compute normalized volume peaks
@@ -438,8 +469,7 @@ def _download_youtube_sync(youtube_url: str, project_id: str, downloads_dir: Pat
     # Strictly cap YouTube resolution at <= 1080p MP4 for 8GB RAM constraint
     ffmpeg_bin = _find_ffmpeg()
     output_template = (downloads_dir / f"{project_id}.%(ext)s").as_posix()
-    js_runtimes = _discover_js_runtimes()
-    ydl_opts: Dict[str, Any] = {
+    ydl_opts: Dict[str, Any] = _apply_ytdlp_common_opts({
         "format": (
             "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
             "best[height<=1080][ext=mp4]/best[height<=1080]"
@@ -450,9 +480,7 @@ def _download_youtube_sync(youtube_url: str, project_id: str, downloads_dir: Pat
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-    }
-    if js_runtimes:
-        ydl_opts["js_runtimes"] = js_runtimes
+    })
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(youtube_url, download=True)
@@ -624,15 +652,12 @@ def extract_youtube_audio_and_meta(
     downloads_dir = downloads_dir.resolve()
     downloads_dir.mkdir(parents=True, exist_ok=True)
     ffmpeg_bin = _find_ffmpeg()
-    js_runtimes = _discover_js_runtimes()
 
-    meta_opts: Dict[str, Any] = {
+    meta_opts: Dict[str, Any] = _apply_ytdlp_common_opts({
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-    }
-    if js_runtimes:
-        meta_opts["js_runtimes"] = js_runtimes
+    })
 
     with yt_dlp.YoutubeDL(meta_opts) as ydl:
         info = ydl.extract_info(youtube_url, download=False)
@@ -675,18 +700,16 @@ def extract_youtube_audio_and_meta(
         max_audio_sec = 600.0
 
     raw_audio_tmpl = (downloads_dir / f"_raw_audio_{project_id}.%(ext)s").as_posix()
-    ydl_opts: Dict[str, Any] = {
+    ydl_opts: Dict[str, Any] = _apply_ytdlp_common_opts({
         "format": "bestaudio[abr<=64]/bestaudio/worst",
         "ffmpeg_location": str(Path(ffmpeg_bin).parent),
         "outtmpl": raw_audio_tmpl,
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-    }
+    })
     if max_audio_sec is not None:
         ydl_opts["download_ranges"] = yt_dlp.utils.download_range_func(None, [(0.0, max_audio_sec)])
-    if js_runtimes:
-        ydl_opts["js_runtimes"] = js_runtimes
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([youtube_url])
@@ -819,7 +842,7 @@ def download_youtube_clip_segments(
             s = float(seg["source_start"])
             e = float(seg["source_end"])
             seg_tmpl = (downloads_dir / f"_seg_{project_id}_{idx}.%(ext)s").as_posix()
-            ydl_opts: Dict[str, Any] = {
+            ydl_opts: Dict[str, Any] = _apply_ytdlp_common_opts({
                 "format": (
                     "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/"
                     "best[height<=720][ext=mp4]/best[height<=720]"
@@ -832,9 +855,7 @@ def download_youtube_clip_segments(
                 "noplaylist": True,
                 "quiet": True,
                 "no_warnings": True,
-            }
-            if js_runtimes:
-                ydl_opts["js_runtimes"] = js_runtimes
+            })
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([youtube_url])

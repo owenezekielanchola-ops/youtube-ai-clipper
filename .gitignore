@@ -4,6 +4,9 @@
 !.env.example
 backend/.env
 frontend/.env
+cookies.txt
+*.cookies.txt
+backend/cookies.txt
 
 # Local runtime media, transcripts, projects, and exports (keep .gitkeep placeholders)
 workspace_data/**/*

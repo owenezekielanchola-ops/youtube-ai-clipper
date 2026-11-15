@@ -63,6 +63,15 @@ Wait for both server windows (**Backend on 8000** and **Frontend on 5173**) to s
 
 ---
 
+### Optional: Fix `"Sign in to confirm you're not a bot"` on YouTube
+If YouTube blocks downloads on your network with `"Sign in to confirm you're not a bot"`:
+1. Sign into `youtube.com` in **Brave** or **Chrome**.
+2. Install **Get cookies.txt LOCALLY** from the Chrome Web Store.
+3. On `youtube.com`, click the extension → **Export** and save the file as **`backend\cookies.txt`**.
+4. Retry your YouTube link (no restart needed). *(Never share `cookies.txt`—it is ignored by `.gitignore`.)*
+
+---
+
 ### 5. Reopening the App Later
 You do **not** need to install packages or set `.env` again. Whenever you want to use it again:
 - Double-click **`start.bat`** (or run `.\start.bat` in the project folder), then open http://localhost:5173.
