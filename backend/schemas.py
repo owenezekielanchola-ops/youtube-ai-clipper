@@ -200,6 +200,7 @@ class AiEditRequest(BaseModel):
     history: List[Dict[str, str]] = Field(default_factory=list)
     campaign_id: Optional[str] = None
     campaign_rules: List[str] = Field(default_factory=list)
+    deep_think: bool = False
 
 
 class AiEditResponse(BaseModel):
@@ -243,6 +244,7 @@ class ReferenceStyleRequest(BaseModel):
     reference_url: str
     project_state: ProjectState
     custom_instruction: Optional[str] = None
+    deep_think: bool = False
 
 
 class ReferenceStyleResponse(BaseModel):

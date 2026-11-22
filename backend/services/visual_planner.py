@@ -13,9 +13,23 @@ from google import genai
 from google.genai import types
 
 from schemas import ProjectState, SfxAsset, ToolCallSchema, VideoCropRect
-from services.model_registry import get_gemini_models_chain, report_model_failure
+from services.ai_racer import race_ai_candidates
+from services.model_registry import (
+    get_gemini_models_chain,
+    get_nvidia_vision_models_chain,
+    report_model_failure,
+)
+from services.nvidia_client import (
+    build_nvidia_vision_user_content,
+    call_nvidia_chat,
+    is_nvidia_configured,
+)
 from services.sfx_library import find_best_matching_sfx
 from services.youtube_ingest import _find_ffmpeg
+
+_KEYFRAME_CACHE: Dict[str, Tuple[float, List[Tuple[float, bytes]], float]] = {}
+_VISUAL_PLAN_CACHE: Dict[str, Tuple[float, Dict[str, Any], str]] = {}
+_CACHE_TTL_SEC = 600.0
 
 VISUAL_PLANNER_PHRASES = (
     "creator",
@@ -135,7 +149,13 @@ def should_use_visual_planner(prompt: str, project_state: Optional[ProjectState]
     return False
 
 
-def _proxy_target_dims(aspect_ratio: str) -> Tuple[int, int]:
+def _proxy_target_dims(aspect_ratio: str, high_res: bool = False) -> Tuple[int, int]:
+    if high_res:
+        if aspect_ratio == "9:16":
+            return 406, 720
+        if aspect_ratio == "1:1":
+            return 640, 640
+        return 720, 406
     if aspect_ratio == "9:16":
         return 270, 480
     if aspect_ratio == "1:1":
@@ -143,23 +163,51 @@ def _proxy_target_dims(aspect_ratio: str) -> Tuple[int, int]:
     return 480, 270
 
 
+def _build_proxy_scale_filter(
+    aspect_ratio: str, include_aspect_pad: bool = True, high_res: bool = False
+) -> str:
+    """
+    Returns FFmpeg scale(+pad) filter for visual planner proxy frames.
+    When include_aspect_pad is False (for set_video_crop), omits black-bar aspect padding so normalized
+    (0..1) crop coordinates match the raw unpadded source video 1:1 in preview & export.
+    When high_res is True (Deep Think mode), uses 720px frames for sharper small-subject recognition.
+    """
+    if not include_aspect_pad:
+        max_dim = 720 if high_res else 480
+        return (
+            f"scale={max_dim}:{max_dim}:force_original_aspect_ratio=decrease:"
+            "force_divisible_by=2:flags=fast_bilinear,"
+        )
+    pw, ph = _proxy_target_dims(aspect_ratio, high_res=high_res)
+    return (
+        f"scale={pw}:{ph}:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear,"
+        f"pad={pw}:{ph}:(ow-iw)/2:(oh-ih)/2:black,"
+    )
+
+
 def _build_timeline_proxy_video(
     project_state: ProjectState,
     source_mp4: Path,
     work_dir: Path,
     include_existing_crop: bool = True,
+    include_aspect_pad: bool = True,
+    high_res: bool = False,
 ) -> Tuple[Optional[Path], float]:
     """
-    Renders a lightweight silent proxy MP4 representing the user's exact active timeline
-    (clips trimmed, reordered, speed-scaled, optional existing crop, and fit into targetAspectRatio)
-    so Gemini timestamps & normalized screen coordinates match the user's editor 1:1.
+    Renders a lightweight silent proxy MP4 representing the user's active timeline.
+    Uses targetAspectRatio padding for zooms/drawings/viewing, or raw unpadded source
+    aspect when include_aspect_pad=False so set_video_crop matches source coordinates 1:1.
     """
     clips = project_state.tracks.clips
     if not clips or not source_mp4.is_file():
         return None, 0.0
 
     ffmpeg_bin = _find_ffmpeg()
-    pw, ph = _proxy_target_dims(project_state.workspaceState.targetAspectRatio)
+    scale_pad_vf = _build_proxy_scale_filter(
+        project_state.workspaceState.targetAspectRatio,
+        include_aspect_pad=include_aspect_pad,
+        high_res=high_res,
+    )
     total_tl_dur = sum(max(0.1, float(c.duration)) for c in clips)
 
     crop_filter = ""
@@ -186,8 +234,7 @@ def _build_timeline_proxy_video(
             f"setpts=PTS/{clip_speed:.6f},"
             f"{crop_filter}"
             f"fps=6,"
-            f"scale={pw}:{ph}:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear,"
-            f"pad={pw}:{ph}:(ow-iw)/2:(oh-ih)/2:black,"
+            f"{scale_pad_vf}"
             f"setsar=1"
         )
         cmd = [
@@ -538,37 +585,96 @@ def plan_visual_edits_with_gemini(
     transcript_tl_text: str,
     downloads_dir: Path,
     sfx_assets: Optional[List[SfxAsset]] = None,
+    deep_think: bool = False,
+    director_brief: Optional[Dict[str, Any]] = None,
 ) -> Optional[Tuple[Dict[str, Any], str]]:
     """
-    Stage 1 (Gemini Visual Planner):
-    Inspects the user's actual edited timeline video (local proxy MP4 matching
-    current clips/speeds/aspect ratio, with keyframe fallback) and produces a
-    structured visual plan with exact normalized coordinates & timeline timestamps
-    for Stage 2 (Groq Tool Executor).
+    Stage 1 (Visual Planner Racer):
+    Extracts timestamped JPEG keyframes (cached in RAM) and races Gemini + live NVIDIA Vision
+    models in parallel ('first valid JSON wins'). Supports Deep Think mode (720px frames,
+    12-16 keyframes, extended thinking/timeout budget, and Stage 0 AI Director brief).
+    Falls back to Gemini proxy MP4 upload only if the keyframe race fails.
     """
     gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
-    if not gemini_key or gemini_key == "your_gemini_api_key_here":
+    has_gemini = bool(gemini_key and gemini_key != "your_gemini_api_key_here")
+    has_nvidia = is_nvidia_configured()
+    if not has_gemini and not has_nvidia:
         return None
 
     source_mp4 = (downloads_dir / f"{project_state.projectId}.mp4").resolve()
     if not source_mp4.is_file():
         return None
 
+    if director_brief and director_brief.get("vision_mode") in {"raw_source", "target_canvas"}:
+        wants_crop = director_brief["vision_mode"] == "raw_source"
+    else:
+        wants_crop = "crop" in prompt.lower()
+    include_crop = not wants_crop
+    include_aspect_pad = not wants_crop
+    crop_obj = project_state.workspaceState.crop if include_crop else None
+    crop_sig = (
+        f"{crop_obj.x:.3f},{crop_obj.y:.3f},{crop_obj.w:.3f},{crop_obj.h:.3f}"
+        if crop_obj is not None
+        else "nocrop"
+    )
+    clips_sig = "|".join(
+        f"{c.id}:{c.sourceStart:.2f}-{c.sourceEnd:.2f}@{getattr(c, 'speed', 1.0) or 1.0:.2f}"
+        for c in project_state.tracks.clips
+    )
+    view_mode_sig = (
+        project_state.workspaceState.targetAspectRatio if include_aspect_pad else "rawcrop"
+    )
+    mode_tag = "deep" if deep_think else "fast"
+    kf_cache_key = (
+        f"{project_state.projectId}::{mode_tag}::{view_mode_sig}::{crop_sig}::{clips_sig}"
+    )
+    now_ts = time.time()
+    zooms_sig = ",".join(f"{z.id}:{z.start:.1f}" for z in (project_state.tracks.zooms or [])[:10])
+    brief_sig = str((director_brief or {}).get("vision_brief") or "").strip().lower()
+    plan_cache_key = f"{kf_cache_key}::{len(sfx_assets or [])}::{zooms_sig}::{prompt.strip().lower()}::{brief_sig}"
+
+    cached_plan = _VISUAL_PLAN_CACHE.get(plan_cache_key)
+    if cached_plan and (now_ts - cached_plan[0]) < _CACHE_TTL_SEC:
+        print("[VisualPlanner] Reusing cached scene plan (0ms)", flush=True)
+        return dict(cached_plan[1]), f"{cached_plan[2]} [cached]"
+
     work_dir = Path(tempfile.mkdtemp(prefix="visplan_"))
-    client = genai.Client(api_key=gemini_key)
     uploaded_file = None
 
     try:
-        wants_crop = "crop" in prompt.lower()
-        print("[VisualPlanner] Building timeline proxy...", flush=True)
-        proxy_mp4, total_tl_dur = _build_timeline_proxy_video(
-            project_state,
-            source_mp4,
-            work_dir,
-            include_existing_crop=not wants_crop,
-        )
-        if proxy_mp4 is None or total_tl_dur <= 0:
-            return None
+        cached_kf = _KEYFRAME_CACHE.get(kf_cache_key)
+        keyframes: List[Tuple[float, bytes]] = []
+        total_tl_dur = 0.0
+        proxy_mp4: Optional[Path] = None
+
+        if cached_kf and (now_ts - cached_kf[0]) < _CACHE_TTL_SEC and cached_kf[1]:
+            keyframes = cached_kf[1]
+            total_tl_dur = cached_kf[2]
+            print(f"[VisualPlanner] Reusing {len(keyframes)} cached keyframes", flush=True)
+        else:
+            print("[VisualPlanner] Building timeline proxy & keyframes...", flush=True)
+            proxy_mp4, total_tl_dur = _build_timeline_proxy_video(
+                project_state,
+                source_mp4,
+                work_dir,
+                include_existing_crop=include_crop,
+                include_aspect_pad=include_aspect_pad,
+                high_res=deep_think,
+            )
+            if proxy_mp4 is None or total_tl_dur <= 0:
+                return None
+            frame_budget = (
+                (12 if total_tl_dur <= 25.0 else 16)
+                if deep_think
+                else (6 if total_tl_dur <= 22.0 else 8)
+            )
+            keyframes = _extract_timeline_keyframes(
+                proxy_mp4, work_dir, total_tl_dur, max_frames=frame_budget
+            )
+            if keyframes:
+                if len(_KEYFRAME_CACHE) >= 8:
+                    _KEYFRAME_CACHE.pop(next(iter(_KEYFRAME_CACHE)))
+                _KEYFRAME_CACHE[kf_cache_key] = (now_ts, keyframes, total_tl_dur)
 
         sfx_summary = [
             {
@@ -581,20 +687,30 @@ def plan_visual_edits_with_gemini(
             for a in (sfx_assets or [])
         ]
 
+        crop_coord_note = (
+            f"- CROP COORDINATE & FRAMING RULE: The attached frames show the full uncropped, unpadded source video (NO aspect-ratio black bars), "
+            f"so measure `set_video_crop` `{{x, y, w, h}}` directly on this source image (0.0..1.0). "
+            f"Carefully locate where the requested subject (e.g. streamer/creator face, webcam overlay, character) ACTUALLY appears on screen — NEVER guess center gameplay if the face/webcam is in a corner or overlay. "
+            f"Because the editor's Target Aspect Ratio is '{project_state.workspaceState.targetAspectRatio}', shape the crop tightly to fit "
+            f"{project_state.workspaceState.targetAspectRatio} cleanly around the requested subject (e.g. a narrow vertical `w` around a face/webcam for `9:16`), and include `start`/`end` in TL seconds when asked for a brief/timed reaction.\n"
+            if wants_crop
+            else ""
+        )
         planner_instruction = (
-            "You are Stage 1 (Gemini Visual Planner) for an AI video editor.\n"
-            "Stage 2 (Groq Tool Executor) CANNOT see images or video — it relies completely on YOUR visual observations.\n"
-            "Watch the attached video clip (whose timeline starts at 0.00s and ends at "
-            f"{total_tl_dur:.2f}s in exact 1:1 Timeline Seconds matching the editor) and inspect the user's request.\n\n"
+            "You are Stage 1 (Visual Planner) for an AI video editor.\n"
+            "Stage 2 CANNOT see images or video — it relies completely on YOUR visual observations.\n"
+            "Inspect the attached timestamped video frames (whose timeline starts at 0.00s and ends at "
+            f"{total_tl_dur:.2f}s in exact 1:1 Timeline Seconds matching the editor) and the user's request.\n\n"
             "COORDINATE & PLANNING RULES:\n"
             "- Screen coordinates are normalized 0.0 to 1.0: x=0.0 left edge, x=0.5 center, x=1.0 right edge; "
             "y=0.0 top edge, y=0.5 center, y=1.0 bottom edge.\n"
+            f"{crop_coord_note}"
             "- Always identify visible subjects (e.g. creator webcam, gameplay character, chat overlay) with `focus_x`, `focus_y`, and bounding `box: {x, y, w, h}`.\n"
-            "- Always produce `detected_moments` listing chronologically WHAT THEY ARE DOING and any FUNNY / REACTION / ACTION / PUNCHLINE / AWKWARD / ROAST / WIN moments (including silent facial reactions).\n"
+            "- Always produce `detected_moments` listing chronologically WHAT THEY ARE DOING and any FUNNY / REACTION / ACTION / PUNCHLINE / AWKWARD / ROAST / WIN moments.\n"
             "- CRITICAL CROP vs ZOOM RULE: If the user asks to CROP (e.g. 'crop to creator face', 'replace the zoom with crop', 'crop showing reaction'), you MUST use `set_video_crop` — NEVER use `add_zoom_effect` when the user asked for a crop!\n"
             "- `set_video_crop` takes `{x, y, w, h}` (normalized 0.0..1.0 bounding box around the requested subject/face) PLUS optional `start` and `end` (in Timeline Seconds `TL`) when the user asks to crop at a specific moment/funny part or 'only for a while'.\n"
             "- If the user asks to REMOVE or REPLACE an existing zoom, include a `delete_zoom_effect` step with its `zoom_id` from `Active Zoom Effects`.\n"
-            "- SMART SFX PLACEMENT RULE: If the user asks to add sound effects applicable/fitting to the video (e.g. 'add sound effects that is applicable for the video', 'add fitting sfx'), watch the ENTIRE clip and pick 2 to 6 key moments (funny/goofy slip, shocked face/punchline, savage roast/doom, awkward fail, boring/quiet beat, wholesome/win, smooth/rizz moment, or quick zoom/transition). Match EACH moment to the best sound in `Available Uploaded SFX Library` using its exact `id`, `name`, `tags`, and `description`. Space SFX at least ~2.0s apart, avoid repeating the exact same sound unnecessarily across different moods, and emit one `add_sfx_clip` step per beat with `{start, asset_id, sfx_name, volume}` (volume typically 0.75 to 0.9).\n"
+            "- SMART SFX PLACEMENT RULE: If the user asks to add sound effects applicable/fitting to the video, pick 2 to 6 key moments and match EACH moment to the best sound in `Available Uploaded SFX Library` using its exact `id`, `name`, `tags`, and `description`. Space SFX at least ~2.0s apart, avoid repeating the exact same sound unnecessarily across different moods, and emit one `add_sfx_clip` step per beat with `{start, asset_id, sfx_name, volume}` (volume typically 0.75 to 0.9).\n"
             "- Output VALID JSON ONLY matching this schema:\n"
             "{\n"
             '  "scene_summary": "Brief description of visual layout and overall funny/action story",\n'
@@ -607,12 +723,12 @@ def plan_visual_edits_with_gemini(
             '      "action": "add_zoom_effect" | "delete_zoom_effect" | "add_drawing" | "add_sfx_clip" | "set_clip_speed" | "set_video_crop",\n'
             '      "reason": "Why & where on screen",\n'
             '      "params": {\n'
-            '        // for add_zoom_effect: start, end, kind ("punch_in"|"zoom_in"|"zoom_out"), start_scale, end_scale, focus_x, focus_y, easing\n'
-            '        // for delete_zoom_effect: zoom_id\n'
-            '        // for add_drawing: start, end, tool ("arrow"|"circle"|"rect"|"line"|"highlight"), points: [{"x":..,"y":..},{"x":..,"y":..}], color, stroke_width\n'
-            '        // for add_sfx_clip: start, asset_id, sfx_name, volume\n'
-            '        // for set_clip_speed: start_time, end_time, speed\n'
-            '        // for set_video_crop: x, y, w, h (0.0 to 1.0), plus optional start, end (timeline seconds if cropping only for a while / at a specific moment)\n'
+            '        // add_zoom_effect: start, end, kind ("punch_in"|"zoom_in"|"zoom_out"), start_scale, end_scale, focus_x, focus_y, easing\n'
+            '        // delete_zoom_effect: zoom_id\n'
+            '        // add_drawing: start, end, tool ("arrow"|"circle"|"rect"|"line"|"highlight"), points: [{"x":..,"y":..},{"x":..,"y":..}], color, stroke_width\n'
+            '        // add_sfx_clip: start, asset_id, sfx_name, volume\n'
+            '        // set_clip_speed: start_time, end_time, speed\n'
+            '        // set_video_crop: x, y, w, h (0.0 to 1.0), plus optional start, end (TL sec)\n'
             "      }\n"
             "    }\n"
             "  ],\n"
@@ -623,7 +739,22 @@ def plan_visual_edits_with_gemini(
         active_zooms_summary = [
             z.model_dump() for z in (project_state.tracks.zooms or [])[:15]
         ]
+        director_block = ""
+        if director_brief:
+            director_block = (
+                "STAGE 0 AI DIRECTOR BRIEF:\n"
+                f"- Target Subjects to Locate: {json.dumps(director_brief.get('target_subjects') or [])}\n"
+                f"- Vision Brief: {director_brief.get('vision_brief') or prompt}\n"
+                f"- Timed Effect Requested: {bool(director_brief.get('is_timed'))}"
+                + (
+                    f" ({director_brief.get('time_hint')})"
+                    if director_brief.get("time_hint")
+                    else ""
+                )
+                + "\n"
+            )
         prompt_context = (
+            f"{director_block}"
             f"User Prompt: {prompt}\n"
             f"Target Aspect Ratio: {project_state.workspaceState.targetAspectRatio}\n"
             f"Total Timeline Duration: {total_tl_dur:.2f}s\n"
@@ -633,69 +764,136 @@ def plan_visual_edits_with_gemini(
             f"Timeline Transcript (TL sec):\n{transcript_tl_text[:3500]}\n"
         )
 
-        # Try full proxy video upload via Gemini Files API first (gives full motion & reaction timing)
-        media_parts: List[Any] = []
-        try:
-            print("[VisualPlanner] Uploading proxy to Gemini...", flush=True)
-            uploaded_file = client.files.upload(file=str(proxy_mp4))
-            waited = 0.0
-            while waited < 10.0:
-                state_str = str(getattr(uploaded_file, "state", "") or "").upper()
-                if "PROCESSING" not in state_str:
-                    break
-                time.sleep(1.0)
-                waited += 1.0
-                if getattr(uploaded_file, "name", None):
-                    uploaded_file = client.files.get(name=uploaded_file.name)
-            state_final = str(getattr(uploaded_file, "state", "") or "").upper()
-            if "FAILED" not in state_final and "PROCESSING" not in state_final:
-                media_parts.append(uploaded_file)
-        except Exception:
-            uploaded_file = None
+        def _validate_visual_text(raw_text: Any) -> Dict[str, Any]:
+            raw_dict = _strip_json_dict(str(raw_text or ""))
+            if not raw_dict or not (
+                raw_dict.get("subjects")
+                or raw_dict.get("detected_moments")
+                or raw_dict.get("planned_steps")
+                or raw_dict.get("scene_summary")
+            ):
+                raise ValueError("Visual response lacked structured visual fields")
+            return _sanitize_visual_plan(raw_dict, total_tl_dur)
 
-        # Fallback: sampled JPEG frames labeled with exact TL timestamps
-        if not media_parts:
-            print("[VisualPlanner] Falling back to keyframe images...", flush=True)
-            keyframes = _extract_timeline_keyframes(proxy_mp4, work_dir, total_tl_dur, max_frames=10)
-            if not keyframes:
-                return None
-            for ts, jpg_bytes in keyframes:
-                media_parts.append(f"[Frame at Timeline TL={ts:.2f}s]")
-                media_parts.append(types.Part.from_bytes(data=jpg_bytes, mime_type="image/jpeg"))
+        # 1. Keyframe-First Parallel Race across Gemini + NVIDIA Vision models
+        if keyframes:
+            gemini_cands: List[Dict[str, Any]] = []
+            if has_gemini:
+                gem_parts: List[Any] = []
+                for ts, jpg_bytes in keyframes:
+                    gem_parts.append(f"[Frame at Timeline TL={ts:.2f}s]")
+                    gem_parts.append(types.Part.from_bytes(data=jpg_bytes, mime_type="image/jpeg"))
+                gem_contents: List[Any] = [*gem_parts, prompt_context]
+                for g_model in get_gemini_models_chain()[:3]:
+                    def _run_gem(m_id: str = g_model) -> str:
+                        g_client = genai.Client(api_key=gemini_key)
+                        resp = g_client.models.generate_content(
+                            model=m_id,
+                            contents=gem_contents,
+                            config=types.GenerateContentConfig(
+                                system_instruction=planner_instruction,
+                                response_mime_type="application/json",
+                                temperature=0.2,
+                            ),
+                        )
+                        return resp.text or ""
+                    gemini_cands.append({"provider": "gemini", "model": g_model, "fn": _run_gem})
 
-        contents: List[Any] = [*media_parts, prompt_context]
+            nvidia_cands: List[Dict[str, Any]] = []
+            if has_nvidia:
+                nv_content = build_nvidia_vision_user_content(prompt_context, keyframes)
+                nv_messages = [
+                    {"role": "system", "content": planner_instruction},
+                    {"role": "user", "content": nv_content},
+                ]
+                for n_model in get_nvidia_vision_models_chain()[:3]:
+                    def _run_nv(m_id: str = n_model) -> str:
+                        # Keep reasoning enabled for smart video inspection with generous token/time headroom
+                        return call_nvidia_chat(
+                            model_id=m_id,
+                            messages=nv_messages,
+                            temperature=0.2,
+                            max_tokens=4096 if deep_think else 3072,
+                            timeout=55.0 if deep_think else 30.0,
+                        )
+                    nvidia_cands.append({"provider": "nvidia", "model": n_model, "fn": _run_nv})
 
-        quota_failures = 0
-        for model_id in get_gemini_models_chain()[:3]:
-            try:
-                print(f"[VisualPlanner] Inspecting clip with {model_id}...", flush=True)
-                resp = client.models.generate_content(
-                    model=model_id,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        system_instruction=planner_instruction,
-                        response_mime_type="application/json",
-                        temperature=0.2,
-                    ),
+            # Interleave Gemini & NVIDIA so top model from each races concurrently
+            racer_cands: List[Dict[str, Any]] = []
+            for idx in range(max(len(gemini_cands), len(nvidia_cands))):
+                if idx < len(nvidia_cands):
+                    racer_cands.append(nvidia_cands[idx])
+                if idx < len(gemini_cands):
+                    racer_cands.append(gemini_cands[idx])
+
+            if racer_cands:
+                try:
+                    sanitized, winner = race_ai_candidates(
+                        racer_cands,
+                        validate_fn=_validate_visual_text,
+                        label="visual_planner_deep" if deep_think else "visual_planner",
+                        max_workers=4,
+                        per_race_timeout=65.0 if deep_think else 35.0,
+                        hedge_delay_sec=0.0,
+                    )
+                    tag = f"{winner['provider']}:{winner['model']} ({winner['latency_ms']:.0f}ms)"
+                    if len(_VISUAL_PLAN_CACHE) >= 16:
+                        _VISUAL_PLAN_CACHE.pop(next(iter(_VISUAL_PLAN_CACHE)))
+                    _VISUAL_PLAN_CACHE[plan_cache_key] = (now_ts, dict(sanitized), tag)
+                    return sanitized, tag
+                except Exception:
+                    pass
+
+        # 2. Fallback: upload proxy MP4 to Gemini Files API if keyframe race failed
+        if has_gemini:
+            client = genai.Client(api_key=gemini_key)
+            if proxy_mp4 is None:
+                proxy_mp4, total_tl_dur = _build_timeline_proxy_video(
+                    project_state,
+                    source_mp4,
+                    work_dir,
+                    include_existing_crop=include_crop,
+                    include_aspect_pad=include_aspect_pad,
+                    high_res=deep_think,
                 )
-                raw_dict = _strip_json_dict(resp.text or "{}")
-                sanitized = _sanitize_visual_plan(raw_dict, total_tl_dur)
-                return sanitized, model_id
-            except Exception as exc:
-                print(f"[VisualPlanner] {model_id} failed: {str(exc)[:140]}", flush=True)
-                report_model_failure("gemini", model_id, exc)
-                low = str(exc).lower()
-                if any(k in low for k in ("429", "resource_exhausted", "quota", "rate_limit", "rate limit")):
-                    quota_failures += 1
-                    if quota_failures >= 2:
-                        break
-                continue
+            if proxy_mp4 is not None:
+                try:
+                    print("[VisualPlanner] Uploading proxy fallback to Gemini...", flush=True)
+                    uploaded_file = client.files.upload(file=str(proxy_mp4))
+                    waited = 0.0
+                    while waited < 10.0:
+                        state_str = str(getattr(uploaded_file, "state", "") or "").upper()
+                        if "PROCESSING" not in state_str:
+                            break
+                        time.sleep(1.0)
+                        waited += 1.0
+                        if getattr(uploaded_file, "name", None):
+                            uploaded_file = client.files.get(name=uploaded_file.name)
+                    state_final = str(getattr(uploaded_file, "state", "") or "").upper()
+                    if "FAILED" not in state_final and "PROCESSING" not in state_final:
+                        for model_id in get_gemini_models_chain()[:2]:
+                            try:
+                                resp = client.models.generate_content(
+                                    model=model_id,
+                                    contents=[uploaded_file, prompt_context],
+                                    config=types.GenerateContentConfig(
+                                        system_instruction=planner_instruction,
+                                        response_mime_type="application/json",
+                                        temperature=0.2,
+                                    ),
+                                )
+                                sanitized = _validate_visual_text(resp.text or "")
+                                return sanitized, f"gemini:{model_id} (proxy-upload)"
+                            except Exception as exc:
+                                report_model_failure("gemini", model_id, exc)
+                except Exception:
+                    pass
 
         return None
     finally:
-        if uploaded_file is not None and getattr(uploaded_file, "name", None):
+        if uploaded_file is not None and getattr(uploaded_file, "name", None) and has_gemini:
             try:
-                client.files.delete(name=uploaded_file.name)
+                genai.Client(api_key=gemini_key).files.delete(name=uploaded_file.name)
             except Exception:
                 pass
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -706,25 +904,35 @@ def analyze_user_clip_scenes_for_reference(
     transcript_tl_text: str,
     downloads_dir: Path,
     sfx_assets: Optional[List[SfxAsset]] = None,
+    deep_think: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """
-    Runs Gemini Visual Planner on the user's own active timeline clip to list
+    Runs Gemini/NVIDIA Visual Planner on the user's own active timeline clip to list
     chronological story/funny/reaction moments ('what they are doing') and exact
     subject coordinates so Reference Style Cloning maps reference edits onto
     the actual matching events in the user's clip.
     """
-    scene_prompt = (
-        "Break down what they are doing chronologically in THIS clip: list every hook, "
-        "buildup, funny moment, creator facial reaction, key action, and punchline with exact "
-        "TL timestamps, and identify exact (focus_x, focus_y) and bounding box for the main "
-        "creator/webcam/subject on screen."
-    )
+    if deep_think:
+        scene_prompt = (
+            "DEEP ANALYSIS: Break down what is happening visually and chronologically in THIS clip: "
+            "list EVERY hook, buildup, funny moment, facial reaction, action beat, camera/UI change, "
+            "transition, and punchline with exact TL timestamps, and identify exact (focus_x, focus_y) "
+            "and bounding box {x, y, w, h} for ALL key visible subjects on screen."
+        )
+    else:
+        scene_prompt = (
+            "Break down what they are doing chronologically in THIS clip: list every hook, "
+            "buildup, funny moment, creator facial reaction, key action, and punchline with exact "
+            "TL timestamps, and identify exact (focus_x, focus_y) and bounding box for the main "
+            "creator/webcam/subject on screen."
+        )
     res = plan_visual_edits_with_gemini(
         prompt=scene_prompt,
         project_state=project_state,
         transcript_tl_text=transcript_tl_text,
         downloads_dir=downloads_dir,
         sfx_assets=sfx_assets,
+        deep_think=deep_think,
     )
     if res is None:
         return None

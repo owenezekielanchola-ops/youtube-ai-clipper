@@ -11,11 +11,14 @@ from groq import Groq
 import yt_dlp
 
 from schemas import CaptionItem, ProjectState, SfxAsset, ToolCallSchema
+from services.ai_racer import race_ai_candidates
 from services.model_registry import (
     get_gemini_models_chain,
+    get_nvidia_fast_models_chain,
     get_tool_models_chain,
     report_model_failure,
 )
+from services.nvidia_client import call_nvidia_chat, is_nvidia_configured
 from services.sfx_library import find_best_matching_sfx
 from services.transcription import build_captions_from_transcript, detect_pause_gaps
 from services.visual_planner import analyze_user_clip_scenes_for_reference
@@ -224,11 +227,20 @@ def _fetch_reference_metadata_ytdlp(reference_url: str) -> Dict[str, Any]:
 
 
 def analyze_reference_youtube_style(
-    reference_url: str, custom_instruction: Optional[str] = None
+    reference_url: str,
+    custom_instruction: Optional[str] = None,
+    deep_think: bool = False,
 ) -> Tuple[Dict[str, Any], str]:
     clean_url = reference_url.strip()
     note = (custom_instruction or "").strip()
     note_clause = f"\nUser extra instruction: {note}" if note else ""
+    deep_clause = (
+        "\nDEEP ANALYSIS MODE: Study EVERY visual cut, pacing shift, zoom intensity/timing, "
+        "caption styling, sound effect cue, and extract 5-10 detailed chronological `reference_beats` "
+        "explaining why each edit was used so we can replicate the creative intent accurately."
+        if deep_think
+        else ""
+    )
 
     meta = _fetch_reference_metadata_ytdlp(clean_url)
     ref_dur = float(meta.get("duration") or 0.0)
@@ -264,7 +276,7 @@ def analyze_reference_youtube_style(
         "  ],\n"
         '  "summary": "1-3 sentence human summary of how this clip is edited"\n'
         "}"
-        f"{note_clause}"
+        f"{deep_clause}{note_clause}"
     )
 
     use_direct_uri = (
@@ -308,34 +320,83 @@ def analyze_reference_youtube_style(
         )
 
     groq_key = os.getenv("GROQ_API_KEY", "").strip()
-    if groq_key and groq_key != "your_groq_api_key_here":
-        groq_client = Groq(api_key=groq_key, timeout=20.0)
+    has_groq = bool(groq_key and groq_key != "your_groq_api_key_here")
+    has_nvidia = is_nvidia_configured()
+    if has_groq or has_nvidia:
         meta_context = (
             f"Reference YouTube URL: {clean_url}\n"
             f"Metadata: {json.dumps(meta, indent=2)}\n\n"
             f"{analysis_prompt}"
         )
-        for model_id in get_tool_models_chain()[:3]:
-            try:
-                print(f"[ReferenceStyle] Inferring style via Groq ({model_id})...", flush=True)
-                completion = groq_client.chat.completions.create(
-                    model=model_id,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": "Respond with valid JSON ONLY predicting the editing style profile from the YouTube clip metadata and format.",
-                        },
-                        {"role": "user", "content": meta_context},
-                    ],
-                    temperature=0.2,
-                )
-                raw = str(completion.choices[0].message.content or "")
-                profile = _sanitize_style_profile(_strip_json_payload(raw))
-                return profile, f"groq-metadata ({model_id})"
-            except Exception as exc:
-                print(f"[ReferenceStyle] Groq ({model_id}) failed: {str(exc)[:140]}", flush=True)
-                report_model_failure("groq", model_id, exc)
-                continue
+        sys_msg = (
+            "Respond with valid JSON ONLY predicting the editing style profile from the YouTube clip metadata and format."
+        )
+        race_cands: List[Dict[str, Any]] = []
+
+        if has_groq:
+            groq_client = Groq(api_key=groq_key, timeout=20.0)
+            for model_id in get_tool_models_chain()[:2]:
+                def _make_groq_ref(m_id: str = model_id):
+                    def _run() -> Dict[str, Any]:
+                        comp = groq_client.chat.completions.create(
+                            model=m_id,
+                            messages=[
+                                {"role": "system", "content": sys_msg},
+                                {"role": "user", "content": meta_context},
+                            ],
+                            temperature=0.2,
+                        )
+                        raw = str(comp.choices[0].message.content or "")
+                        return _sanitize_style_profile(_strip_json_payload(raw))
+                    return _run
+                race_cands.append({
+                    "provider": "groq",
+                    "model": model_id,
+                    "name": f"groq:{model_id}",
+                    "fn": _make_groq_ref(),
+                })
+
+        if has_nvidia:
+            for model_id in get_nvidia_fast_models_chain()[:2]:
+                def _make_nv_ref(m_id: str = model_id):
+                    def _run() -> Dict[str, Any]:
+                        raw = call_nvidia_chat(
+                            model_id=m_id,
+                            messages=[
+                                {"role": "system", "content": sys_msg},
+                                {"role": "user", "content": meta_context},
+                            ],
+                            temperature=0.2,
+                            max_tokens=2400 if deep_think else 1000,
+                            timeout=35.0 if deep_think else 16.0,
+                            enable_thinking=None if deep_think else False,
+                        )
+                        return _sanitize_style_profile(_strip_json_payload(raw))
+                    return _run
+                race_cands.append({
+                    "provider": "nvidia",
+                    "model": model_id,
+                    "name": f"nvidia:{model_id}",
+                    "fn": _make_nv_ref(),
+                })
+
+        def _validate_style_profile(profile_obj: Any) -> Dict[str, Any]:
+            if not isinstance(profile_obj, dict) or "pacing" not in profile_obj:
+                raise ValueError("Invalid style profile payload")
+            return profile_obj
+
+        try:
+            won_prof, winner = race_ai_candidates(
+                race_cands,
+                validate_fn=_validate_style_profile,
+                label="reference_style_deep" if deep_think else "reference_style",
+                max_workers=3,
+                per_race_timeout=40.0 if deep_think else 18.0,
+                hedge_delay_sec=0.0,
+            )
+            return won_prof, f"{winner['provider']}:{winner['model']} ({winner['latency_ms']:.0f}ms)"
+        except Exception as exc:
+            print(f"[ReferenceStyle] Groq+NVIDIA race failed: {str(exc)[:140]}", flush=True)
 
     # Deterministic fallback from URL / metadata
     is_short = (
@@ -850,11 +911,12 @@ def clone_reference_style_for_project(
     downloads_dir: Any,
     custom_instruction: Optional[str] = None,
     transcript_tl_text: str = "",
+    deep_think: bool = False,
 ) -> Tuple[Dict[str, Any], List[ToolCallSchema], Optional[List[CaptionItem]], str, str]:
     """
-    Two-side Gemini Reference Cloner:
+    Two-side Gemini/NVIDIA Reference Cloner:
     1. Watches reference YouTube URL -> extracts style profile & beat breakdown ('what happens').
-    2. Watches YOUR active timeline clip via Visual Planner (if downloaded & Gemini configured)
+    2. Watches YOUR active timeline clip via Visual Planner (if downloaded & vision configured)
        -> spots funny/reaction/action moments & subject coordinates in your clip.
     3. Runs both analyses concurrently and applies reference beats onto your clip's real moments.
     """
@@ -865,6 +927,7 @@ def clone_reference_style_for_project(
                 analyze_reference_youtube_style,
                 reference_url,
                 custom_instruction=custom_instruction,
+                deep_think=deep_think,
             )
             scene_future = pool.submit(
                 analyze_user_clip_scenes_for_reference,
@@ -872,6 +935,7 @@ def clone_reference_style_for_project(
                 transcript_tl_text=transcript_tl_text,
                 downloads_dir=downloads_dir,
                 sfx_assets=sfx_assets,
+                deep_think=deep_think,
             )
             profile, route_label = ref_future.result()
             try:
@@ -880,7 +944,9 @@ def clone_reference_style_for_project(
                 user_scene = None
     else:
         profile, route_label = analyze_reference_youtube_style(
-            reference_url, custom_instruction=custom_instruction
+            reference_url,
+            custom_instruction=custom_instruction,
+            deep_think=deep_think,
         )
 
     tool_calls, auto_captions, summary_msg = apply_reference_style_to_project(
@@ -896,4 +962,6 @@ def clone_reference_style_for_project(
         profile["matched_user_moments"] = user_scene.get("detected_moments", [])
         if user_scene.get("planner_model"):
             route_label = f"{route_label} + clip-vision ({user_scene['planner_model']})"
+    if deep_think:
+        route_label = f"{route_label} [Deep Think]"
     return profile, tool_calls, auto_captions, summary_msg, route_label

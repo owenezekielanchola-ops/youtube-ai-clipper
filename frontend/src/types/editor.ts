@@ -231,11 +231,23 @@ export interface ModelStatus {
   backupSttModels: string[];
   primaryViralModel: string | null;
   backupViralModels: string[];
+  primaryNvidiaFastModel: string | null;
+  backupNvidiaFastModels: string[];
+  primaryNvidiaVisionModel: string | null;
+  backupNvidiaVisionModels: string[];
   availableGroqModels: string[];
   availableGeminiModels: string[];
+  availableNvidiaModels: string[];
   lastRefreshedIso: string | null;
   nextRefreshInSeconds: number;
   groqConfigured: boolean;
   geminiConfigured: boolean;
+  nvidiaConfigured: boolean;
+  lastRaceWinner: {
+    provider?: string;
+    model?: string;
+    latency_ms?: number;
+    task?: string;
+  } | null;
 }
 

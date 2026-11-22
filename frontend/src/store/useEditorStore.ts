@@ -200,6 +200,11 @@ function mapModelStatusResponse(data: Record<string, unknown>): ModelStatus {
   const toStringArray = (val: unknown): string[] =>
     Array.isArray(val) ? val.filter((item): item is string => typeof item === 'string') : [];
 
+  const rawWinner =
+    data.last_race_winner && typeof data.last_race_winner === 'object'
+      ? (data.last_race_winner as Record<string, unknown>)
+      : null;
+
   return {
     primaryToolModel: typeof data.primary_tool_model === 'string' ? data.primary_tool_model : null,
     backupToolModels: toStringArray(data.backup_tool_models),
@@ -210,13 +215,32 @@ function mapModelStatusResponse(data: Record<string, unknown>): ModelStatus {
     backupSttModels: toStringArray(data.backup_stt_models),
     primaryViralModel: typeof data.primary_viral_model === 'string' ? data.primary_viral_model : null,
     backupViralModels: toStringArray(data.backup_viral_models),
+    primaryNvidiaFastModel:
+      typeof data.primary_nvidia_fast_model === 'string' ? data.primary_nvidia_fast_model : null,
+    backupNvidiaFastModels: toStringArray(data.backup_nvidia_fast_models),
+    primaryNvidiaVisionModel:
+      typeof data.primary_nvidia_vision_model === 'string'
+        ? data.primary_nvidia_vision_model
+        : null,
+    backupNvidiaVisionModels: toStringArray(data.backup_nvidia_vision_models),
     availableGroqModels: toStringArray(data.available_groq_models),
     availableGeminiModels: toStringArray(data.available_gemini_models),
+    availableNvidiaModels: toStringArray(data.available_nvidia_models),
     lastRefreshedIso: typeof data.last_refreshed_iso === 'string' ? data.last_refreshed_iso : null,
     nextRefreshInSeconds:
       typeof data.next_refresh_in_seconds === 'number' ? data.next_refresh_in_seconds : 86400,
     groqConfigured: Boolean(data.groq_configured),
     geminiConfigured: Boolean(data.gemini_configured),
+    nvidiaConfigured: Boolean(data.nvidia_configured),
+    lastRaceWinner: rawWinner
+      ? {
+          provider: typeof rawWinner.provider === 'string' ? rawWinner.provider : undefined,
+          model: typeof rawWinner.model === 'string' ? rawWinner.model : undefined,
+          latency_ms:
+            typeof rawWinner.latency_ms === 'number' ? rawWinner.latency_ms : undefined,
+          task: typeof rawWinner.task === 'string' ? rawWinner.task : undefined,
+        }
+      : null,
   };
 }
 
@@ -417,7 +441,7 @@ export const useEditorStore = create<EditorStoreState>()(
       forceRefreshModels: async () => {
         set({
           isRefreshingModels: true,
-          statusBanner: 'Reloading API keys & scanning available Groq/Gemini models...',
+          statusBanner: 'Reloading API keys & scanning available Groq/Gemini/NVIDIA models...',
         });
         try {
           const res = await fetch(`${API_BASE}/api/models/refresh`, {
@@ -431,10 +455,11 @@ export const useEditorStore = create<EditorStoreState>()(
           const mapped = mapModelStatusResponse(data);
           const groqCount = mapped.availableGroqModels.length;
           const geminiCount = mapped.availableGeminiModels.length;
+          const nvidiaCount = mapped.availableNvidiaModels.length;
           set({
             modelStatus: mapped,
             isRefreshingModels: false,
-            statusBanner: `AI models refreshed (${groqCount} Groq, ${geminiCount} Gemini live; primary: ${mapped.primaryToolModel ?? 'default'}).`,
+            statusBanner: `AI models refreshed (${groqCount} Groq, ${geminiCount} Gemini, ${nvidiaCount} NVIDIA live; primary: ${mapped.primaryToolModel ?? mapped.primaryNvidiaFastModel ?? 'default'}).`,
           });
         } catch (err) {
           set({

@@ -554,6 +554,7 @@ async def ai_edit_endpoint(req: AiEditRequest) -> AiEditResponse:
             campaign_id=req.campaign_id,
             campaign_rules=req.campaign_rules,
             sfx_dir=WORKSPACE_DIR / "sfx",
+            deep_think=req.deep_think,
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"AI edit error: {exc}") from exc
@@ -584,6 +585,7 @@ async def reference_style_endpoint(req: ReferenceStyleRequest) -> ReferenceStyle
             WORKSPACE_DIR / "downloads",
             req.custom_instruction,
             tl_text,
+            req.deep_think,
         )
         return ReferenceStyleResponse(
             profile=profile,

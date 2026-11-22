@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
   Bot,
+  Brain,
   Check,
   ChevronDown,
   ChevronUp,
@@ -178,6 +179,7 @@ export const RightAiAndStyles: React.FC = () => {
   const [promptInput, setPromptInput] = useState('');
   const [isRecording, setIsRecording] = useState(false);
   const [isChatExpanded, setIsChatExpanded] = useState(false);
+  const [deepThink, setDeepThink] = useState(false);
   const [showQuickPrompts, setShowQuickPrompts] = useState(false);
   const [copiedTextId, setCopiedTextId] = useState<string | null>(null);
 
@@ -227,6 +229,7 @@ export const RightAiAndStyles: React.FC = () => {
           history,
           campaign_id: active?.id,
           campaign_rules: active?.editingRules ?? [],
+          deep_think: deepThink,
         }),
       });
       if (!resp.ok) {
@@ -281,6 +284,7 @@ export const RightAiAndStyles: React.FC = () => {
           reference_url: cleanRef,
           project_state: useEditorStore.getState().project,
           custom_instruction: refInstruction.trim() || undefined,
+          deep_think: deepThink,
         }),
       });
       if (!resp.ok) {
@@ -437,19 +441,25 @@ export const RightAiAndStyles: React.FC = () => {
                   setIsRefOpen(false);
                 }}
                 className="flex items-center gap-1.5 min-w-0 text-left group cursor-pointer"
-                title="Click to inspect live Groq & Gemini model configuration"
+                title="Click to inspect live Groq, Gemini & NVIDIA NIM model configuration"
               >
                 <span
                   className={`w-2 h-2 rounded-full shrink-0 ${
-                    modelStatus?.groqConfigured ? 'bg-emerald-400' : 'bg-amber-400'
+                    modelStatus?.groqConfigured || modelStatus?.nvidiaConfigured
+                      ? 'bg-emerald-400'
+                      : 'bg-amber-400'
                   }`}
                 />
                 <span className="text-[11px] font-medium text-slate-200 group-hover:text-white truncate">
-                  {modelStatus?.groqConfigured && modelStatus?.geminiConfigured
-                    ? 'AI Ready · Groq + Gemini'
-                    : modelStatus?.groqConfigured
-                      ? 'AI Ready · Groq Active'
-                      : 'AI Models · Check Keys'}
+                  {(() => {
+                    const active: string[] = [];
+                    if (modelStatus?.groqConfigured) active.push('Groq');
+                    if (modelStatus?.geminiConfigured) active.push('Gemini');
+                    if (modelStatus?.nvidiaConfigured) active.push('NVIDIA');
+                    return active.length > 0
+                      ? `AI Ready · ${active.join(' + ')}`
+                      : 'AI Models · Check Keys';
+                  })()}
                 </span>
                 {showModels ? (
                   <ChevronUp className="w-3.5 h-3.5 text-slate-400 shrink-0" />
@@ -538,6 +548,52 @@ export const RightAiAndStyles: React.FC = () => {
                     </span>
                   )}
                 </div>
+                <div
+                  className="text-slate-300 truncate"
+                  title={modelStatus?.backupNvidiaFastModels.join(' -> ')}
+                >
+                  <span className="text-slate-400">NVIDIA Fast:</span>{' '}
+                  <span className="text-lime-300 font-mono">
+                    {modelStatus?.primaryNvidiaFastModel ?? 'Not configured'}
+                  </span>
+                  {modelStatus && modelStatus.backupNvidiaFastModels.length > 0 && (
+                    <span className="text-slate-500">
+                      {' '}
+                      (+{modelStatus.backupNvidiaFastModels.length} racer
+                      {modelStatus.backupNvidiaFastModels.length > 1 ? 's' : ''})
+                    </span>
+                  )}
+                </div>
+                <div
+                  className="text-slate-300 truncate"
+                  title={modelStatus?.backupNvidiaVisionModels.join(' -> ')}
+                >
+                  <span className="text-slate-400">NVIDIA Vision:</span>{' '}
+                  <span className="text-cyan-300 font-mono">
+                    {modelStatus?.primaryNvidiaVisionModel ?? 'Not configured'}
+                  </span>
+                  {modelStatus && modelStatus.backupNvidiaVisionModels.length > 0 && (
+                    <span className="text-slate-500">
+                      {' '}
+                      (+{modelStatus.backupNvidiaVisionModels.length} racer
+                      {modelStatus.backupNvidiaVisionModels.length > 1 ? 's' : ''})
+                    </span>
+                  )}
+                </div>
+                {modelStatus?.lastRaceWinner?.model && (
+                  <div className="text-slate-300 truncate">
+                    <span className="text-slate-400">Last Race Winner:</span>{' '}
+                    <span className="text-amber-300 font-mono">
+                      {modelStatus.lastRaceWinner.provider}:{modelStatus.lastRaceWinner.model}
+                    </span>
+                    {typeof modelStatus.lastRaceWinner.latency_ms === 'number' && (
+                      <span className="text-slate-400">
+                        {' '}
+                        · {(modelStatus.lastRaceWinner.latency_ms / 1000).toFixed(2)}s
+                      </span>
+                    )}
+                  </div>
+                )}
                 <div className="flex items-center justify-between gap-2 text-[11px] text-slate-400 pt-0.5">
                   <span className="truncate">
                     STT:{' '}
@@ -551,7 +607,11 @@ export const RightAiAndStyles: React.FC = () => {
                     </span>
                     {' · '}
                     <span className={modelStatus?.geminiConfigured ? 'text-emerald-400' : 'text-slate-400'}>
-                      Gemini {modelStatus?.geminiConfigured ? 'OK' : 'Fallback'}
+                      Gemini {modelStatus?.geminiConfigured ? 'OK' : 'Off'}
+                    </span>
+                    {' · '}
+                    <span className={modelStatus?.nvidiaConfigured ? 'text-emerald-400' : 'text-slate-500'}>
+                      NVIDIA {modelStatus?.nvidiaConfigured ? 'OK' : 'Off'}
                     </span>
                   </span>
                 </div>
@@ -566,7 +626,8 @@ export const RightAiAndStyles: React.FC = () => {
                     </span>
                     <span>
                       {modelStatus.availableGroqModels.length} Groq ·{' '}
-                      {modelStatus.availableGeminiModels.length} Gemini
+                      {modelStatus.availableGeminiModels.length} Gemini ·{' '}
+                      {modelStatus.availableNvidiaModels.length} NVIDIA
                     </span>
                   </div>
                 )}
@@ -596,17 +657,29 @@ export const RightAiAndStyles: React.FC = () => {
                   type="button"
                   disabled={!refUrl.trim() || !project.sourceVideo.videoUrl || isCloningStyle}
                   onClick={() => void submitReferenceStyle()}
-                  className="w-full py-2 rounded-lg bg-sky-500 hover:bg-sky-400 disabled:opacity-40 text-slate-950 text-xs font-semibold flex items-center justify-center gap-1.5 transition cursor-pointer"
+                  className={`w-full py-2 rounded-lg disabled:opacity-40 text-slate-950 text-xs font-semibold flex items-center justify-center gap-1.5 transition cursor-pointer ${
+                    deepThink
+                      ? 'bg-violet-400 hover:bg-violet-300'
+                      : 'bg-sky-500 hover:bg-sky-400'
+                  }`}
                 >
                   {isCloningStyle ? (
                     <>
                       <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                      Analyzing Reference Style...
+                      {deepThink
+                        ? 'Deep Thinking: analyzing reference & your clip...'
+                        : 'Analyzing Reference Style...'}
                     </>
                   ) : (
                     <>
-                      <Wand2 className="w-3.5 h-3.5" />
-                      Clone Style onto My Clip
+                      {deepThink ? (
+                        <Brain className="w-3.5 h-3.5" />
+                      ) : (
+                        <Wand2 className="w-3.5 h-3.5" />
+                      )}
+                      {deepThink
+                        ? 'Deep Clone Style onto My Clip'
+                        : 'Clone Style onto My Clip'}
                     </>
                   )}
                 </button>
@@ -735,9 +808,23 @@ export const RightAiAndStyles: React.FC = () => {
               </div>
             ))}
             {isAiThinking && (
-              <div className="flex items-center gap-2 text-xs text-slate-300 bg-[#1c212d] border border-[#272f40] rounded-xl p-2.5">
-                <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-400 shrink-0" />
-                <span>Planning visuals &amp; executing timeline edits...</span>
+              <div
+                className={`flex items-center gap-2 text-xs rounded-xl p-2.5 border ${
+                  deepThink
+                    ? 'text-violet-200 bg-violet-500/10 border-violet-400/35'
+                    : 'text-slate-300 bg-[#1c212d] border-[#272f40]'
+                }`}
+              >
+                <Loader2
+                  className={`w-3.5 h-3.5 animate-spin shrink-0 ${
+                    deepThink ? 'text-violet-300' : 'text-amber-400'
+                  }`}
+                />
+                <span>
+                  {deepThink
+                    ? 'Deep Thinking: understanding request & inspecting high-res frames...'
+                    : 'Planning visuals & executing timeline edits...'}
+                </span>
               </div>
             )}
             <div ref={chatEndRef} />
@@ -779,8 +866,30 @@ export const RightAiAndStyles: React.FC = () => {
             </div>
           )}
 
-          {/* Bottom Composer: Collapsible Quick Suggestions + Auto-Expanding Prompt Box */}
+          {/* Bottom Composer: Collapsible Quick Suggestions + Deep Think Toggle + Prompt Box */}
           <div className="px-3 py-2.5 border-t border-[#272f40] bg-[#12161f] space-y-2 shrink-0">
+            <div className="flex items-center justify-between gap-2">
+              <button
+                type="button"
+                onClick={() => setDeepThink((prev) => !prev)}
+                aria-pressed={deepThink}
+                title="Deep Think (stays ON until clicked OFF): takes ~15-45s to deeply understand any natural prompt, inspect sharper 720p frames, and enhance Edit Like This analysis."
+                className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full border text-[11px] font-medium transition cursor-pointer ${
+                  deepThink
+                    ? 'bg-violet-500/20 border-violet-400/60 text-violet-200 shadow-sm shadow-violet-500/10'
+                    : 'bg-[#1c212d] hover:bg-[#242b3b] border-[#272f40] text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                <Brain className={`w-3 h-3 shrink-0 ${deepThink ? 'text-violet-300' : ''}`} />
+                <span>{deepThink ? 'Deep Think · ON' : 'Deep Think'}</span>
+              </button>
+              <span className="text-[10px] text-slate-500 truncate">
+                {deepThink
+                  ? '720p Vision + AI Director active (AI Chat & Edit Like This)'
+                  : 'Fast mode'}
+              </span>
+            </div>
+
             {(showQuickPrompts || aiMessages.length <= 1) && (
               <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
                 {QUICK_PROMPTS.map((qp) => (

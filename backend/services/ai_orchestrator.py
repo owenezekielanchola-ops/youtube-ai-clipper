@@ -19,12 +19,15 @@ from schemas import (
     SfxAsset,
     ToolCallSchema,
 )
+from services.ai_racer import race_ai_candidates
 from services.model_registry import (
     get_gemini_models_chain,
+    get_nvidia_fast_models_chain,
     get_router_models_chain,
     get_tool_models_chain,
     report_model_failure,
 )
+from services.nvidia_client import call_nvidia_chat, is_nvidia_configured
 from services.reference_style import clone_reference_style_for_project
 from services.sfx_library import find_best_matching_sfx, list_sfx_assets
 from services.transcription import (
@@ -896,6 +899,7 @@ def _enforce_crop_and_zoom_intent(
     project_state: ProjectState,
     visual_plan: Optional[Dict[str, Any]] = None,
     transcript: Optional[Dict[str, Any]] = None,
+    director_brief: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[ToolCallSchema], Optional[str]]:
     """
     Guarantees that:
@@ -940,10 +944,15 @@ def _enforce_crop_and_zoom_intent(
     )
     wants_timed_crop = wants_crop and (
         bool(explicit_range_match or explicit_for_dur_match)
+        or bool(director_brief and director_brief.get("is_timed"))
         or any(
             p in lowered
             for p in (
                 "for a while",
+                "for a second",
+                "for a seconds",
+                "just for",
+                "for couple",
                 "only for",
                 "a while",
                 "temporarily",
@@ -1091,6 +1100,38 @@ def _enforce_crop_and_zoom_intent(
         e = min(total_tl_dur, max(s + 1.0, s + 3.5))
         return round(s, 2), round(e, 2)
 
+    def _match_visual_subject(subjects_list: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not subjects_list:
+            return None
+        target_tokens = [
+            tok
+            for sub in ((director_brief or {}).get("target_subjects") or [])
+            for tok in re.findall(r"[a-z0-9]+", str(sub).lower())
+            if len(tok) >= 2
+        ]
+        if target_tokens:
+            best_sub: Optional[Dict[str, Any]] = None
+            best_hits = 0
+            for s in subjects_list:
+                lbl = str(s.get("label") or "").lower()
+                hits = sum(1 for tok in target_tokens if tok in lbl)
+                if hits > best_hits:
+                    best_hits = hits
+                    best_sub = s
+            if best_sub is not None:
+                return best_sub
+        return next(
+            (
+                s
+                for s in subjects_list
+                if any(
+                    k in str(s.get("label") or "").lower()
+                    for k in ("creator", "face", "webcam", "streamer", "person", "cam", "reaction")
+                )
+            ),
+            subjects_list[0],
+        )
+
     # 4. Resolve best crop bounding box {x, y, w, h}
     def _resolve_crop_box() -> Dict[str, float]:
         if visual_plan:
@@ -1106,17 +1147,7 @@ def _enforce_crop_and_zoom_intent(
                             return {"x": round(cx, 3), "y": round(cy, 3), "w": round(cw, 3), "h": round(ch, 3)}
             subjects = [s for s in (visual_plan.get("subjects") or []) if isinstance(s, dict)]
             if subjects:
-                chosen_sub = next(
-                    (
-                        s
-                        for s in subjects
-                        if any(
-                            k in str(s.get("label") or "").lower()
-                            for k in ("creator", "face", "webcam", "streamer", "person", "cam", "reaction")
-                        )
-                    ),
-                    subjects[0],
-                )
+                chosen_sub = _match_visual_subject(subjects) or subjects[0]
                 box = chosen_sub.get("box")
                 if isinstance(box, dict) and box.get("w") is not None and box.get("h") is not None:
                     cx = max(0.0, min(0.85, float(box.get("x", 0.0))))
@@ -1158,7 +1189,7 @@ def _enforce_crop_and_zoom_intent(
             return {"x": 0.0, "y": 0.52, "w": 0.42, "h": 0.48}
         if any(k in lowered for k in ("bottom-right", "bottom right")):
             return {"x": 0.58, "y": 0.52, "w": 0.42, "h": 0.48}
-        if any(k in lowered for k in ("webcam", "facecam", "face cam")):
+        if any(k in lowered for k in ("webcam", "facecam", "face cam", "streamer", "creator", "camera", "face")):
             return {"x": 0.0, "y": 0.0, "w": 0.42, "h": 0.48}
         return {"x": 0.22, "y": 0.06, "w": 0.56, "h": 0.68}
 
@@ -1186,8 +1217,27 @@ def _enforce_crop_and_zoom_intent(
         )
     else:
         c_args = dict(existing_crop_tc.arguments or {})
-        # If LLM emitted full-frame or invalid box by mistake when user asked to crop in
-        if (
+        subjects_vp = [s for s in ((visual_plan or {}).get("subjects") or []) if isinstance(s, dict)]
+        has_visual_crop_source = bool(
+            visual_plan
+            and (
+                any(
+                    isinstance(st, dict) and st.get("action") == "set_video_crop"
+                    for st in (visual_plan.get("planned_steps") or [])
+                )
+                or (_match_visual_subject(subjects_vp) is not None if director_brief and director_brief.get("target_subjects") else False)
+                or any(
+                    any(
+                        k in str(s.get("label") or "").lower()
+                        for k in ("creator", "face", "webcam", "streamer", "person", "cam", "reaction")
+                    )
+                    for s in subjects_vp
+                )
+            )
+        )
+        # Prefer visually-measured Stage 1 crop coordinates over text-only Stage 2 LLM guesses,
+        # and also fix accidental full-frame boxes.
+        if has_visual_crop_source or (
             float(c_args.get("x", 0.0)) <= 0.005
             and float(c_args.get("y", 0.0)) <= 0.005
             and float(c_args.get("w", 1.0)) >= 0.99
@@ -2320,11 +2370,12 @@ def _run_gemini_viral_pipeline(
                         break
         return None
 
-    def _try_groq_viral() -> Optional[AiEditResponse]:
+    def _try_fast_text_viral_race() -> Optional[AiEditResponse]:
         nonlocal last_error
-        if not has_groq:
+        has_nvidia = is_nvidia_configured()
+        if not has_groq and not has_nvidia:
             return None
-        groq_client = Groq(api_key=groq_key, timeout=25.0)
+
         compact_context = _build_viral_context(
             heatmap_peaks[:5],
             _extract_targeted_transcript_windows(
@@ -2336,45 +2387,105 @@ def _run_gemini_viral_pipeline(
                 prefer_start=prefer_start,
             ),
         )
-        active_context = user_context
-        for model_id in get_tool_models_chain()[:3]:
-            for attempt in range(2):
-                try:
-                    print(f"[AI] Viral discovery via Groq ({model_id})...", flush=True)
-                    completion = groq_client.chat.completions.create(
-                        model=model_id,
+        cands: List[Dict[str, Any]] = []
+        if has_groq:
+            for g_id in get_tool_models_chain()[:2]:
+                def _run_g(m_id: str = g_id) -> AiEditResponse:
+                    groq_client = Groq(api_key=groq_key, timeout=20.0)
+                    ctx = user_context
+                    for attempt in range(2):
+                        try:
+                            completion = groq_client.chat.completions.create(
+                                model=m_id,
+                                messages=[
+                                    {"role": "system", "content": system_instruction},
+                                    {"role": "user", "content": ctx},
+                                ],
+                                temperature=0.2,
+                            )
+                            raw_text = (completion.choices[0].message.content or "").strip()
+                            return _parse_viral_json_response(
+                                raw_text,
+                                project_state,
+                                transcript,
+                                prompt,
+                                duration,
+                                f"groq:{m_id} [viral]",
+                            )
+                        except Exception as exc:
+                            msg_low = str(exc).lower()
+                            if attempt == 0 and ("413" in msg_low or "request_too_large" in msg_low or "too large" in msg_low):
+                                ctx = compact_context
+                                continue
+                            raise
+                    raise RuntimeError(f"Groq {m_id} failed")
+
+                cands.append({"provider": "groq", "model": g_id, "fn": _run_g})
+
+        if has_nvidia:
+            for nv_id in get_nvidia_fast_models_chain()[:2]:
+                def _run_nv(m_id: str = nv_id) -> AiEditResponse:
+                    raw_text = call_nvidia_chat(
+                        model_id=m_id,
                         messages=[
                             {"role": "system", "content": system_instruction},
-                            {"role": "user", "content": active_context},
+                            {"role": "user", "content": user_context},
                         ],
                         temperature=0.2,
+                        max_tokens=1100,
+                        timeout=14.0,
+                        enable_thinking=False,
                     )
-                    raw_text = (completion.choices[0].message.content or "").strip()
                     return _parse_viral_json_response(
                         raw_text,
                         project_state,
                         transcript,
                         prompt,
                         duration,
-                        f"groq ({model_id}) [viral]",
+                        f"nvidia:{m_id} [viral]",
                     )
-                except Exception as exc:
-                    last_error = exc
-                    msg_low = str(exc).lower()
-                    if attempt == 0 and ("413" in msg_low or "request_too_large" in msg_low or "too large" in msg_low):
-                        active_context = compact_context
-                        continue
-                    print(f"[AI] Groq ({model_id}) failed: {str(exc)[:140]}", flush=True)
-                    report_model_failure("groq", model_id, exc)
-                    break
-        return None
 
-    # On >2h VODs (where direct video URI is skipped), Groq answers text JSON in ~1-3s;
+                cands.append({"provider": "nvidia", "model": nv_id, "fn": _run_nv})
+
+        if not cands:
+            return None
+
+        # Interleave Groq & NVIDIA so backups are diverse; 0.8s hedge saves RPM when Groq is sub-second
+        ordered: List[Dict[str, Any]] = []
+        g_cands = [c for c in cands if c["provider"] == "groq"]
+        n_cands = [c for c in cands if c["provider"] == "nvidia"]
+        for i in range(max(len(g_cands), len(n_cands))):
+            if i < len(g_cands):
+                ordered.append(g_cands[i])
+            if i < len(n_cands):
+                ordered.append(n_cands[i])
+
+        def _validate_viral(res_obj: Any) -> AiEditResponse:
+            if not isinstance(res_obj, AiEditResponse) or not res_obj.tool_calls:
+                raise ValueError("Viral response had no tool_calls")
+            return res_obj
+
+        try:
+            won_res, winner = race_ai_candidates(
+                ordered,
+                validate_fn=_validate_viral,
+                label="viral_discovery",
+                max_workers=3,
+                per_race_timeout=20.0,
+                hedge_delay_sec=0.8 if has_groq and has_nvidia else 0.0,
+            )
+            won_res.route_used = f"{winner['provider']}:{winner['model']} ({winner['latency_ms']:.0f}ms)"
+            return won_res
+        except Exception as exc:
+            last_error = exc
+            return None
+
+    # On >2h VODs (where direct video URI is skipped), race Groq + NVIDIA first (~1-3s);
     # keep Gemini first on <=2h videos where multimodal YouTube URL inspection is active.
-    if duration > 7200.0 and has_groq:
-        res = _try_groq_viral() or _try_gemini_viral()
+    if duration > 7200.0 and (has_groq or is_nvidia_configured()):
+        res = _try_fast_text_viral_race() or _try_gemini_viral()
     else:
-        res = _try_gemini_viral() or _try_groq_viral()
+        res = _try_gemini_viral() or _try_fast_text_viral_race()
     if res is not None:
         return res
 
@@ -2464,6 +2575,196 @@ def _run_gemini_editor_fallback(
     return None
 
 
+def _is_pure_visual_prompt(prompt: str) -> bool:
+    """True when a prompt only requests visual edits handled directly by Visual Planner output."""
+    low = (prompt or "").lower()
+    disqualifiers = (
+        "caption",
+        "subtitle",
+        "pause",
+        "silence",
+        "trim",
+        "cut ",
+        "cut-",
+        "split",
+        "merge",
+        "delete ",
+        "remove ",
+        "aspect ratio",
+        "9:16",
+        "16:9",
+        "1:1",
+        "portrait",
+        "vertical",
+        "square",
+        "when he says",
+        "when she says",
+        "describe",
+        "list what",
+        "tell me what",
+        "what is happening",
+        "what's happening",
+        "what happens",
+        "explain what",
+    )
+    return not any(tok in low for tok in disqualifiers)
+
+
+def _sanitize_director_brief(raw: Dict[str, Any], fallback_prompt: str) -> Dict[str, Any]:
+    """Normalizes Stage 0 AI Director JSON into a reliable brief for Vision & Tool stages."""
+    low_prompt = (fallback_prompt or "").lower()
+    route = str(raw.get("route") or "timeline_edit").strip().lower()
+    if route not in {"timeline_edit", "viral_discovery", "reference_style", "describe_only"}:
+        route = "timeline_edit"
+
+    vision_mode = str(raw.get("vision_mode") or "").strip().lower()
+    if vision_mode not in {"raw_source", "target_canvas"}:
+        vision_mode = "raw_source" if "crop" in low_prompt else "target_canvas"
+
+    raw_targets = raw.get("target_subjects") or []
+    targets: List[str] = []
+    if isinstance(raw_targets, list):
+        targets = [str(t).strip()[:80] for t in raw_targets if str(t).strip()][:5]
+
+    return {
+        "route": route,
+        "needs_vision": bool(raw.get("needs_vision", True)),
+        "vision_mode": vision_mode,
+        "target_subjects": targets,
+        "is_timed": bool(raw.get("is_timed", False)),
+        "time_hint": str(raw.get("time_hint") or "").strip()[:160],
+        "is_pure_visual": bool(raw.get("is_pure_visual", False)),
+        "vision_brief": str(raw.get("vision_brief") or fallback_prompt).strip()[:500],
+        "tool_brief": str(raw.get("tool_brief") or fallback_prompt).strip()[:600],
+    }
+
+
+def _run_ai_director(
+    prompt: str,
+    project_state: ProjectState,
+    history: List[Dict[str, str]],
+    transcript: Optional[Dict[str, Any]],
+) -> Optional[Tuple[Dict[str, Any], str]]:
+    """
+    Stage 0 (Deep Think AI Director):
+    Understands ANY natural user wording (objects, HUDs, pets, reactions, slang, multi-step
+    edits) and outputs a structured PromptBrief so downstream Stage 1 Vision and Stage 2 Tools
+    know exactly what to look for without relying on hardcoded keywords.
+    """
+    groq_key = os.getenv("GROQ_API_KEY", "").strip()
+    gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+    has_groq = bool(groq_key and groq_key != "your_groq_api_key_here")
+    has_gemini = bool(gemini_key and gemini_key != "your_gemini_api_key_here")
+    has_nvidia = is_nvidia_configured()
+    if not (has_groq or has_nvidia or has_gemini):
+        return None
+
+    tl_preview = _format_timeline_transcript_for_llm(
+        transcript, project_state.tracks.clips, max_segments=20, max_chars=1800
+    )
+    director_system = (
+        "You are Stage 0 (AI Director) for a video editing pipeline.\n"
+        "Your job is to deeply understand what the user REALLY wants from their natural wording, "
+        "slang, typos, or chat history, and emit a clean JSON brief for Vision (Stage 1) and Tool Execution (Stage 2).\n"
+        "Output VALID JSON ONLY (no markdown fences) matching:\n"
+        "{\n"
+        '  "route": "timeline_edit" | "viral_discovery" | "reference_style" | "describe_only",\n'
+        '  "needs_vision": boolean (true if the edit requires seeing what/where things are in the video frames — e.g. crop onto any subject/face/object/HUD, zoom onto a visible subject/reaction, draw arrow/circle on an object, describe video, smart visual SFX placement; false ONLY for pure transcript/caption/audio/speed/ratio commands),\n'
+        '  "vision_mode": "raw_source" | "target_canvas" ("raw_source" whenever cropping to an object/subject so coordinates match the unpadded source; "target_canvas" for zooms, drawings, or viewing),\n'
+        '  "target_subjects": ["exact objects/people/regions user wants targeted, e.g. streamer face, boss health bar, red ferrari, dog"],\n'
+        '  "is_timed": boolean (true if user wants the effect briefly/temporarily/during a reaction or timestamp window),\n'
+        '  "time_hint": "when it should start/end or what reaction/event triggers it",\n'
+        '  "is_pure_visual": boolean,\n'
+        '  "vision_brief": "Clear step-by-step instruction telling Stage 1 Vision what to spot and return boxes/timestamps for",\n'
+        '  "tool_brief": "Clear normalized summary of all timeline edits Stage 2 should apply"\n'
+        "}"
+    )
+    user_payload = (
+        f"Project Context:\n"
+        f"- Target Aspect Ratio: {project_state.workspaceState.targetAspectRatio}\n"
+        f"- Active Crop: {project_state.workspaceState.crop.model_dump_json() if project_state.workspaceState.crop else 'None'}\n"
+        f"- Active Zooms: {len(project_state.tracks.zooms)} | Active Captions: {len(project_state.tracks.captions)}\n"
+        f"- Playhead (TL): {project_state.workspaceState.playheadPosition:.2f}s\n"
+        f"- Recent Chat History: {json.dumps(history[-4:])}\n"
+        f"- Transcript Snippet:\n{tl_preview}\n\n"
+        f"Current User Request: {prompt}"
+    )
+
+    def _parse_brief(raw_text: str) -> Dict[str, Any]:
+        cleaned = _strip_json_fences(raw_text)
+        s_i = cleaned.find("{")
+        e_i = cleaned.rfind("}")
+        if s_i != -1 and e_i > s_i:
+            cleaned = cleaned[s_i : e_i + 1]
+        data = json.loads(cleaned)
+        if not isinstance(data, dict):
+            raise ValueError("Director brief must be JSON object")
+        return _sanitize_director_brief(data, prompt)
+
+    cands: List[Dict[str, Any]] = []
+    if has_groq:
+        g_client = Groq(api_key=groq_key, timeout=16.0)
+        for g_id in get_tool_models_chain()[:2]:
+            def _run_g(m_id: str = g_id) -> Dict[str, Any]:
+                comp = g_client.chat.completions.create(
+                    model=m_id,
+                    messages=[
+                        {"role": "system", "content": director_system},
+                        {"role": "user", "content": user_payload},
+                    ],
+                    temperature=0.1,
+                )
+                return _parse_brief(str(comp.choices[0].message.content or ""))
+            cands.append({"provider": "groq", "model": g_id, "fn": _run_g})
+
+    if has_nvidia:
+        for nv_id in get_nvidia_fast_models_chain()[:2]:
+            def _run_nv(m_id: str = nv_id) -> Dict[str, Any]:
+                raw = call_nvidia_chat(
+                    model_id=m_id,
+                    messages=[
+                        {"role": "system", "content": director_system},
+                        {"role": "user", "content": user_payload},
+                    ],
+                    temperature=0.1,
+                    max_tokens=1600,
+                    timeout=20.0,
+                )
+                return _parse_brief(raw)
+            cands.append({"provider": "nvidia", "model": nv_id, "fn": _run_nv})
+
+    if has_gemini:
+        for gem_id in get_gemini_models_chain()[:1]:
+            def _run_gem(m_id: str = gem_id) -> Dict[str, Any]:
+                client = genai.Client(api_key=gemini_key)
+                resp = client.models.generate_content(
+                    model=m_id,
+                    contents=user_payload,
+                    config=types.GenerateContentConfig(
+                        system_instruction=director_system,
+                        response_mime_type="application/json",
+                        temperature=0.1,
+                    ),
+                )
+                return _parse_brief(resp.text or "")
+            cands.append({"provider": "gemini", "model": gem_id, "fn": _run_gem})
+
+    if not cands:
+        return None
+    try:
+        brief, winner = race_ai_candidates(
+            cands,
+            validate_fn=lambda b: b if isinstance(b, dict) and "tool_brief" in b else None,
+            label="ai_director",
+            max_workers=3,
+            per_race_timeout=24.0,
+            hedge_delay_sec=0.0,
+        )
+        return brief, f"{winner['provider']}:{winner['model']}"
+    except Exception:
+        return None
+
+
 def _run_groq_fast_editor(
     prompt: str,
     project_state: ProjectState,
@@ -2474,6 +2775,7 @@ def _run_groq_fast_editor(
     sfx_assets: Optional[List[SfxAsset]] = None,
     visual_plan: Optional[Dict[str, Any]] = None,
     planner_model: Optional[str] = None,
+    director_brief: Optional[Dict[str, Any]] = None,
 ) -> AiEditResponse:
     groq_key = os.getenv("GROQ_API_KEY", "").strip()
     has_groq = bool(groq_key and groq_key != "your_groq_api_key_here")
@@ -2523,6 +2825,16 @@ def _run_groq_fast_editor(
         else ""
     )
     campaign_block = _format_campaign_rules_block(campaign_id, campaign_rules)
+    director_block = (
+        f"\n\nSTAGE 0 AI DIRECTOR BRIEF:\n"
+        f"- Normalized Goal: {director_brief.get('tool_brief') or prompt}\n"
+        f"- Target Subjects: {json.dumps(director_brief.get('target_subjects') or [])}\n"
+        f"- Timed Effect: {bool(director_brief.get('is_timed'))}"
+        + (f" ({director_brief.get('time_hint')})" if director_brief.get("time_hint") else "")
+        + "\n"
+        if director_brief is not None
+        else ""
+    )
     visual_plan_block = (
         f"\n\nGEMINI VISUAL PLANNER REPORT (visual analysis already performed on the user's clip):\n"
         f"{json.dumps(visual_plan, indent=2)}\n"
@@ -2554,7 +2866,7 @@ def _run_groq_fast_editor(
             "9. 'Add a sound effect here' or 'Add sound effects that are applicable for the video': inspect EVERY sound's `id`, `name`, `tags`, and `description` in `Available Custom MP3 SFX Library`. For a targeted SFX request, call `add_sfx_clip` at `playheadPosition` (or the matched `TL` timestamp). For a whole-video / 'applicable sound effects' request, follow Gemini Visual Planner's `planned_steps` / `detected_moments` and emit multiple well-spaced `add_sfx_clip` calls (>= 2s apart) matched to each moment's mood using exact `asset_id` and `sfx_name`, varying sounds across different moments. To trim an existing timeline sound effect (skip leading audio or shorten duration), call `trim_sfx_clip(sfx_id?, sfx_name?, trim_start?, duration?)`. If the library is empty, politely tell the user to upload `.mp3` files in the SFX Library tab.\n"
             "10. 'Draw a line/arrow/circle pointing here': call `add_drawing` over `[playheadPosition, playheadPosition + 2.5]` using normalized `0.0..1.0` coordinates (e.g. arrow from `(0.24, 0.26)` to `(0.50, 0.48)`).\n"
             "11. CROP vs ZOOM RULE: When the user asks to CROP (e.g. 'crop to creator face', 'replace the zoom with crop', 'crop showing reaction but only for a while'), you MUST call `set_video_crop(x, y, w, h, start?, end?)` — NEVER call `add_zoom_effect` when the user asks for a crop! If the user says 'only for a while', 'at the funny part', or 'during the reaction', pass `start` and `end` (in Timeline Seconds `TL`) to `set_video_crop`. If the user also asks to remove or replace an existing zoom, call BOTH `delete_zoom_effect` (using the ID from `Active Zoom Effects`) AND `set_video_crop`."
-            f"{first_note}{campaign_block}{visual_plan_block}\n\n"
+            f"{first_note}{campaign_block}{director_block}{visual_plan_block}\n\n"
             f"Current Project Context:\n"
             f"- Original Duration: {project_state.sourceVideo.originalDuration:.2f}s\n"
             f"- Playhead Position (TL): {project_state.workspaceState.playheadPosition:.2f}s\n"
@@ -2577,14 +2889,20 @@ def _run_groq_fast_editor(
 
     system_prompt = _build_editor_system_prompt(pauses[:35], transcript_text)
 
-    if not has_groq:
+    has_nvidia = is_nvidia_configured()
+    if not has_groq and not has_nvidia:
         if visual_plan is not None and (
             visual_plan.get("planned_steps") or visual_plan.get("detected_moments")
         ):
             direct_calls = convert_visual_plan_to_tool_calls(visual_plan, sfx_assets)
             direct_calls = _enrich_sfx_tool_calls(direct_calls, sfx_assets or [])
             direct_calls, _ = _enforce_crop_and_zoom_intent(
-                prompt, direct_calls, project_state, visual_plan=visual_plan, transcript=transcript
+                prompt,
+                direct_calls,
+                project_state,
+                visual_plan=visual_plan,
+                transcript=transcript,
+                director_brief=director_brief,
             )
             direct_calls, _ = _enforce_caption_and_timeline_tools(
                 prompt,
@@ -2599,7 +2917,7 @@ def _run_groq_fast_editor(
                 return AiEditResponse(
                     message=f"{visual_plan.get('scene_summary', 'Planned visual edits.')} Executed {len(direct_calls)} planned edit(s).",
                     tool_calls=direct_calls,
-                    route_used=f"gemini ({planner_model}) [direct-plan]",
+                    route_used=f"{planner_model or 'visual-planner'} [direct-plan]",
                 )
         gemini_backup = _run_gemini_editor_fallback(
             prompt,
@@ -2614,8 +2932,6 @@ def _run_groq_fast_editor(
         return _deterministic_edit_fallback(
             prompt, project_state, transcript, pauses, sfx_assets=sfx_assets
         )
-
-    client = Groq(api_key=groq_key, timeout=25.0)
 
     messages: List[Dict[str, Any]] = [{"role": "system", "content": system_prompt}]
     for msg in history[-6:]:
@@ -2635,44 +2951,154 @@ def _run_groq_fast_editor(
         ),
     )
 
-    tool_models = get_tool_models_chain()[:4]
-    completion = None
-    used_model = tool_models[0] if tool_models else "openai/gpt-oss-120b"
-    used_backup = False
+    def _extract_json_dict(raw_text: str) -> Dict[str, Any]:
+        cleaned = (raw_text or "").strip()
+        if cleaned.startswith("```"):
+            lines = cleaned.splitlines()
+            if len(lines) >= 2:
+                cleaned = "\n".join(lines[1:-1] if lines[-1].strip().startswith("```") else lines[1:]).strip()
+        start_i = cleaned.find("{")
+        end_i = cleaned.rfind("}")
+        if start_i != -1 and end_i > start_i:
+            cleaned = cleaned[start_i : end_i + 1]
+        data = json.loads(cleaned)
+        if not isinstance(data, dict):
+            raise ValueError("Expected JSON object")
+        return data
+
+    # Build parallel/hedged racers across Groq native tool calling & NVIDIA NIM JSON tool calling
+    raced_cands: List[Dict[str, Any]] = []
+    if has_groq:
+        groq_client = Groq(api_key=groq_key, timeout=22.0)
+        for m_id in get_tool_models_chain()[:2]:
+            def _make_groq_ed(model_name: str = m_id):
+                def _run() -> Tuple[str, List[Tuple[str, str, Dict[str, Any]]]]:
+                    local_msgs = list(messages)
+                    for attempt in range(2):
+                        try:
+                            comp = groq_client.chat.completions.create(
+                                model=model_name,
+                                messages=local_msgs,
+                                tools=SHARED_TOOLS_DEFINITIONS,
+                                tool_choice="auto",
+                                temperature=0.1,
+                            )
+                            ch = comp.choices[0].message
+                            parsed_calls: List[Tuple[str, str, Dict[str, Any]]] = []
+                            for tc in (ch.tool_calls or []):
+                                try:
+                                    tc_args = json.loads(tc.function.arguments or "{}")
+                                except json.JSONDecodeError:
+                                    tc_args = {}
+                                parsed_calls.append((
+                                    tc.id or f"tc_{uuid.uuid4().hex[:8]}",
+                                    tc.function.name,
+                                    tc_args if isinstance(tc_args, dict) else {},
+                                ))
+                            return (ch.content or "").strip(), parsed_calls
+                        except Exception as g_exc:
+                            g_low = str(g_exc).lower()
+                            if attempt == 0 and ("413" in g_low or "request_too_large" in g_low or "too large" in g_low):
+                                local_msgs = [{"role": "system", "content": compact_system_prompt}, *messages[1:]]
+                                continue
+                            raise
+                    raise RuntimeError("Groq tool call exhausted attempts")
+                return _run
+            raced_cands.append({
+                "provider": "groq",
+                "model": m_id,
+                "name": f"groq:{m_id}",
+                "fn": _make_groq_ed(),
+            })
+
+    if has_nvidia:
+        tool_specs = "\n".join(
+            f"- {t['function']['name']}: {t['function'].get('description', '')} "
+            f"params={json.dumps(t['function'].get('parameters', {}))}"
+            for t in SHARED_TOOLS_DEFINITIONS
+        )
+        nv_system = (
+            f"{system_prompt}\n\n"
+            "Output VALID JSON ONLY (no markdown fences) matching:\n"
+            '{"explanation": "brief summary", "tool_calls": [{"name": "<tool_name>", "arguments": {...}}]}\n\n'
+            f"Available tools & schemas:\n{tool_specs}"
+        )
+        nv_msgs: List[Dict[str, Any]] = [{"role": "system", "content": nv_system}, *messages[1:]]
+        for m_id in get_nvidia_fast_models_chain()[:2]:
+            def _make_nv_ed(model_name: str = m_id):
+                def _run() -> Tuple[str, List[Tuple[str, str, Dict[str, Any]]]]:
+                    raw_out = call_nvidia_chat(
+                        model_id=model_name,
+                        messages=nv_msgs,
+                        temperature=0.1,
+                        max_tokens=1600,
+                        timeout=18.0,
+                        enable_thinking=False,
+                    )
+                    payload = _extract_json_dict(raw_out)
+                    raw_tcs = payload.get("tool_calls") or []
+                    if not isinstance(raw_tcs, list):
+                        raise ValueError("tool_calls must be a list")
+                    parsed_calls: List[Tuple[str, str, Dict[str, Any]]] = []
+                    for item in raw_tcs:
+                        if isinstance(item, dict) and item.get("name"):
+                            tc_args = item.get("arguments") or {}
+                            if isinstance(tc_args, str):
+                                try:
+                                    tc_args = json.loads(tc_args)
+                                except Exception:
+                                    tc_args = {}
+                            parsed_calls.append((
+                                f"tc_{uuid.uuid4().hex[:8]}",
+                                str(item["name"]),
+                                tc_args if isinstance(tc_args, dict) else {},
+                            ))
+                    expl = str(payload.get("explanation") or payload.get("message") or "").strip()
+                    return expl, parsed_calls
+                return _run
+            raced_cands.append({
+                "provider": "nvidia",
+                "model": m_id,
+                "name": f"nvidia:{m_id}",
+                "fn": _make_nv_ed(),
+            })
+
+    def _validate_edit_result(res_pair: Any) -> Tuple[str, List[Tuple[str, str, Dict[str, Any]]]]:
+        expl_text, calls_list = res_pair
+        if not calls_list and not expl_text:
+            raise ValueError("Empty AI editor response")
+        return expl_text, calls_list
+
+    winner_info: Optional[Dict[str, Any]] = None
+    explanation_raw = ""
+    raw_tool_tuples: List[Tuple[str, str, Dict[str, Any]]] = []
     last_exc: Optional[Exception] = None
 
-    for idx, model_id in enumerate(tool_models):
-        for attempt in range(2):
-            try:
-                completion = client.chat.completions.create(
-                    model=model_id,
-                    messages=messages,
-                    tools=SHARED_TOOLS_DEFINITIONS,
-                    tool_choice="auto",
-                    temperature=0.1,
-                )
-                used_model = model_id
-                used_backup = idx > 0
-                break
-            except Exception as exc:
-                last_exc = exc
-                msg_low = str(exc).lower()
-                if attempt == 0 and ("413" in msg_low or "request_too_large" in msg_low or "too large" in msg_low):
-                    messages[0] = {"role": "system", "content": compact_system_prompt}
-                    continue
-                report_model_failure("groq", model_id, exc)
-                break
-        if completion is not None:
-            break
+    try:
+        (explanation_raw, raw_tool_tuples), winner_info = race_ai_candidates(
+            raced_cands,
+            validate_fn=_validate_edit_result,
+            label="timeline_edit",
+            max_workers=3,
+            per_race_timeout=22.0,
+            hedge_delay_sec=1.2 if (has_groq and has_nvidia) else 0.0,
+        )
+    except Exception as exc:
+        last_exc = exc
 
-    if completion is None:
+    if winner_info is None:
         if visual_plan is not None and (
             visual_plan.get("planned_steps") or visual_plan.get("detected_moments")
         ):
             direct_calls = convert_visual_plan_to_tool_calls(visual_plan, sfx_assets)
             direct_calls = _enrich_sfx_tool_calls(direct_calls, sfx_assets or [])
             direct_calls, _ = _enforce_crop_and_zoom_intent(
-                prompt, direct_calls, project_state, visual_plan=visual_plan, transcript=transcript
+                prompt,
+                direct_calls,
+                project_state,
+                visual_plan=visual_plan,
+                transcript=transcript,
+                director_brief=director_brief,
             )
             direct_calls, _ = _enforce_caption_and_timeline_tools(
                 prompt,
@@ -2687,7 +3113,7 @@ def _run_groq_fast_editor(
                 return AiEditResponse(
                     message=f"{visual_plan.get('scene_summary', 'Planned visual edits.')} Executed {len(direct_calls)} planned edit(s).",
                     tool_calls=direct_calls,
-                    route_used=f"gemini ({planner_model}) [direct-plan]",
+                    route_used=f"{planner_model or 'visual-planner'} [direct-plan]",
                 )
         gemini_backup = _run_gemini_editor_fallback(
             prompt,
@@ -2702,21 +3128,13 @@ def _run_groq_fast_editor(
         assert last_exc is not None
         raise last_exc
 
-    choice = completion.choices[0].message
-    raw_tool_calls = choice.tool_calls or []
-
     tool_calls: List[ToolCallSchema] = []
     wants_captions = False
     isolated_clips: List[Dict[str, Any]] = []
     cap_range: Tuple[Optional[float], Optional[float]] = (None, None)
     duration = project_state.sourceVideo.originalDuration
 
-    for tc in raw_tool_calls:
-        try:
-            args = json.loads(tc.function.arguments or "{}")
-        except json.JSONDecodeError:
-            args = {}
-        name = tc.function.name
+    for tc_id, name, args in raw_tool_tuples:
         if name == "isolate_highlight_clips" and isinstance(args.get("clips"), list):
             snapped_clips = _normalize_isolated_clips(args["clips"], transcript, duration)
             args["clips"] = snapped_clips
@@ -2738,7 +3156,7 @@ def _run_groq_fast_editor(
             cap_range = (start_t, end_t)
         tool_calls.append(
             ToolCallSchema(
-                id=tc.id or f"tc_{uuid.uuid4().hex[:8]}",
+                id=tc_id,
                 name=name,
                 arguments=args,
             )
@@ -2747,7 +3165,12 @@ def _run_groq_fast_editor(
     tool_calls = _filter_protected_caption_calls(tool_calls, project_state, prompt)
     tool_calls = _enrich_sfx_tool_calls(tool_calls, sfx_assets or [])
     tool_calls, crop_zoom_note = _enforce_crop_and_zoom_intent(
-        prompt, tool_calls, project_state, visual_plan=visual_plan, transcript=transcript
+        prompt,
+        tool_calls,
+        project_state,
+        visual_plan=visual_plan,
+        transcript=transcript,
+        director_brief=director_brief,
     )
     tool_calls, style_tool_note = _enforce_caption_and_timeline_tools(
         prompt,
@@ -2767,7 +3190,7 @@ def _run_groq_fast_editor(
         else None
     )
 
-    explanation = (choice.content or "").strip()
+    explanation = explanation_raw.strip()
     extra_notes = "; ".join(n for n in (crop_zoom_note, style_tool_note) if n)
     if extra_notes and extra_notes.lower() not in explanation.lower():
         explanation = f"{explanation} ({extra_notes}.)".strip() if explanation else f"{extra_notes}."
@@ -2775,12 +3198,12 @@ def _run_groq_fast_editor(
         names = ", ".join(tc.name for tc in tool_calls)
         explanation = f"Applied timeline edits: {names}." if names else "No timeline changes were required."
 
-    base_route = f"groq ({used_model}) [backup]" if used_backup else f"groq ({used_model})"
+    base_route = f"{winner_info['provider']}:{winner_info['model']} ({winner_info['latency_ms']:.0f}ms)"
     return AiEditResponse(
         message=explanation,
         tool_calls=tool_calls,
         auto_captions=auto_captions,
-        route_used=f"gemini ({planner_model}) -> {base_route}" if planner_model else base_route,
+        route_used=f"{planner_model} -> {base_route}" if planner_model else base_route,
     )
 
 
@@ -3343,6 +3766,7 @@ def process_ai_edit(
     campaign_id: Optional[str] = None,
     campaign_rules: Optional[List[str]] = None,
     sfx_dir: Optional[Path] = None,
+    deep_think: bool = False,
 ) -> AiEditResponse:
     transcript = load_cached_transcript(project_state.projectId, transcripts_dir)
     sfx_assets = list_sfx_assets(sfx_dir) if sfx_dir is not None else []
@@ -3373,6 +3797,7 @@ def process_ai_edit(
                 downloads_dir=transcripts_dir.parent / "downloads",
                 custom_instruction=prompt,
                 transcript_tl_text=tl_text,
+                deep_think=deep_think,
             )
         )
         return AiEditResponse(
@@ -3382,12 +3807,29 @@ def process_ai_edit(
             route_used=f"reference-style ({route_label})",
         )
 
-    intent, router_used = _classify_prompt_intent_with_ai(prompt)
-    print(f"[AI Edit] intent={intent} ({router_used})", flush=True)
+    director_brief: Optional[Dict[str, Any]] = None
+    director_model: Optional[str] = None
+    if deep_think:
+        dir_res = _run_ai_director(prompt, project_state, history or [], transcript)
+        if dir_res is not None:
+            director_brief, director_model = dir_res
+
+    if director_brief is not None:
+        intent = (
+            "viral_discovery"
+            if director_brief.get("route") == "viral_discovery"
+            else "timeline_edit"
+        )
+        router_used = f"director:{director_model}"
+    else:
+        intent, router_used = _classify_prompt_intent_with_ai(prompt)
+    print(f"[AI Edit] intent={intent} ({router_used}) deep_think={deep_think}", flush=True)
 
     def _with_router_tag(res: AiEditResponse) -> AiEditResponse:
         if router_used != "keyword-fast-path":
             res.route_used = f"{res.route_used} [router: {router_used}]"
+        if deep_think and "[Deep Think]" not in res.route_used:
+            res.route_used = f"{res.route_used} [Deep Think]"
         return res
 
     if intent == "viral_discovery":
@@ -3410,7 +3852,12 @@ def process_ai_edit(
 
     visual_plan: Optional[Dict[str, Any]] = None
     planner_model: Optional[str] = None
-    if should_use_visual_planner(prompt, project_state):
+    run_vision = (
+        bool(director_brief.get("needs_vision"))
+        if director_brief is not None
+        else should_use_visual_planner(prompt, project_state)
+    )
+    if run_vision and project_state.tracks.clips:
         try:
             tl_text = _format_timeline_transcript_for_llm(
                 transcript,
@@ -3424,12 +3871,52 @@ def process_ai_edit(
                 transcript_tl_text=tl_text,
                 downloads_dir=transcripts_dir.parent / "downloads",
                 sfx_assets=sfx_assets,
+                deep_think=deep_think,
+                director_brief=director_brief,
             )
             if planned is not None:
                 visual_plan, planner_model = planned
         except Exception:
             visual_plan = None
             planner_model = None
+
+    if (
+        not deep_think
+        and visual_plan is not None
+        and (visual_plan.get("planned_steps") or visual_plan.get("detected_moments"))
+        and _is_pure_visual_prompt(prompt)
+    ):
+        pauses_fast = detect_pause_gaps(transcript, min_gap=0.7) if transcript else []
+        direct_calls = convert_visual_plan_to_tool_calls(visual_plan, sfx_assets)
+        direct_calls = _enrich_sfx_tool_calls(direct_calls, sfx_assets or [])
+        direct_calls, _ = _enforce_crop_and_zoom_intent(
+            prompt,
+            direct_calls,
+            project_state,
+            visual_plan=visual_plan,
+            transcript=transcript,
+            director_brief=director_brief,
+        )
+        direct_calls, _ = _enforce_caption_and_timeline_tools(
+            prompt,
+            direct_calls,
+            project_state,
+            pauses=pauses_fast,
+            visual_plan=visual_plan,
+            transcript=transcript,
+            sfx_assets=sfx_assets,
+        )
+        if direct_calls:
+            return _with_router_tag(
+                AiEditResponse(
+                    message=(
+                        f"{visual_plan.get('scene_summary', 'Planned visual edits.')} "
+                        f"Executed {len(direct_calls)} planned edit(s)."
+                    ),
+                    tool_calls=direct_calls,
+                    route_used=f"{planner_model or 'visual-planner'} [single-pass]",
+                )
+            )
 
     try:
         return _with_router_tag(
@@ -3443,6 +3930,7 @@ def process_ai_edit(
                 sfx_assets=sfx_assets,
                 visual_plan=visual_plan,
                 planner_model=planner_model,
+                director_brief=director_brief,
             )
         )
     except Exception as exc:
@@ -3453,7 +3941,12 @@ def process_ai_edit(
             direct_calls = convert_visual_plan_to_tool_calls(visual_plan, sfx_assets)
             direct_calls = _enrich_sfx_tool_calls(direct_calls, sfx_assets or [])
             direct_calls, _ = _enforce_crop_and_zoom_intent(
-                prompt, direct_calls, project_state, visual_plan=visual_plan, transcript=transcript
+                prompt,
+                direct_calls,
+                project_state,
+                visual_plan=visual_plan,
+                transcript=transcript,
+                director_brief=director_brief,
             )
             direct_calls, _ = _enforce_caption_and_timeline_tools(
                 prompt,
@@ -3469,7 +3962,7 @@ def process_ai_edit(
                     AiEditResponse(
                         message=f"{visual_plan.get('scene_summary', 'Planned visual edits.')} Executed {len(direct_calls)} planned edit(s).",
                         tool_calls=direct_calls,
-                        route_used=f"gemini ({planner_model}) [direct-plan]",
+                        route_used=f"{planner_model or 'visual-planner'} [direct-plan]",
                     )
                 )
         fallback = _deterministic_edit_fallback(
