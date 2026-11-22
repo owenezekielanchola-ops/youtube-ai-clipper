@@ -1,0 +1,150 @@
+{
+  "dramatic_fail_sting.mp3": {
+    "id": "sfx_b79dbdf9",
+    "name": "Dramatic Fail Sting",
+    "duration": 4.57,
+    "tags": [
+      "fail",
+      "sad",
+      "awkward",
+      "dramatic",
+      "brass",
+      "womp",
+      "disappointment",
+      "bruh",
+      "realization",
+      "cringe"
+    ],
+    "description": "Dramatic low brass wah/fail sting for awkward fails, disappointing moments, cringe realizations, or bruised-ego punchlines."
+  },
+  "rizz_synth_ding.mp3": {
+    "id": "sfx_48c8ad59",
+    "name": "Rizz Synth Ding",
+    "duration": 1.93,
+    "tags": [
+      "rizz",
+      "smooth",
+      "synth",
+      "ding",
+      "pop",
+      "cool",
+      "reveal",
+      "flex",
+      "charm",
+      "slick"
+    ],
+    "description": "Smooth retro synth chord ding for rizz moments, slick comebacks, cool reveals, or confident flexes."
+  },
+  "cartoon_slip_bongo.mp3": {
+    "id": "sfx_b36212a0",
+    "name": "Cartoon Slip Bongo",
+    "duration": 1.71,
+    "tags": [
+      "cartoon",
+      "slip",
+      "bongo",
+      "goofy",
+      "clumsy",
+      "silly",
+      "funny",
+      "fall",
+      "whistle",
+      "chaotic",
+      "run"
+    ],
+    "description": "Fast cartoon bongo run and slide whistle slip for goofy movements, clumsy fails, silly panic, or chaotic funny moments."
+  },
+  "vine_boom.mp3": {
+    "id": "sfx_25b310e5",
+    "name": "Vine Boom",
+    "duration": 1.42,
+    "tags": [
+      "boom",
+      "vine",
+      "shock",
+      "punchline",
+      "impact",
+      "eyebrow",
+      "meme",
+      "stare",
+      "zoom",
+      "dramatic",
+      "funny"
+    ],
+    "description": "Heavy bass Vine Boom thud for shocked faces, eyebrow raises, punchlines, deadpan stares, or sudden punch-in zooms."
+  },
+  "whoosh_whip_snap.mp3": {
+    "id": "sfx_336f53cb",
+    "name": "Whoosh Whip Snap",
+    "duration": 1.07,
+    "tags": [
+      "whoosh",
+      "whip",
+      "snap",
+      "transition",
+      "cut",
+      "fast",
+      "zoom",
+      "slap",
+      "swish",
+      "quick"
+    ],
+    "description": "Fast whoosh/whip-crack snap for quick transitions, sudden cuts, punch-in zooms, or rapid text/arrow pop-ins."
+  },
+  "meme_snore_auuuugh.mp3": {
+    "id": "sfx_d145510f",
+    "name": "Meme Snore",
+    "duration": 9.98,
+    "tags": [
+      "snore",
+      "sleep",
+      "boring",
+      "dead",
+      "quiet",
+      "tired",
+      "auuuugh",
+      "meme",
+      "yawn",
+      "roast"
+    ],
+    "description": "Loud cartoon meme snoring ('AUUUUGH') for boring stretches, dead silence, sleepy reactions, or roasting someone as boring."
+  },
+  "angelic_choir_reveal.mp3": {
+    "id": "sfx_2974ef44",
+    "name": "Angelic Choir Reveal",
+    "duration": 3.5,
+    "tags": [
+      "angelic",
+      "choir",
+      "heaven",
+      "wholesome",
+      "win",
+      "clutch",
+      "magic",
+      "sparkle",
+      "glow",
+      "reveal",
+      "blessed"
+    ],
+    "description": "Heavenly choir sparkle chime for wholesome moments, clutch wins, glow-ups, magical reveals, or blessed luck."
+  },
+  "dramatic_bell_bong.mp3": {
+    "id": "sfx_5de181c6",
+    "name": "Dramatic Bell Bong",
+    "duration": 1.88,
+    "tags": [
+      "bell",
+      "bong",
+      "gong",
+      "roast",
+      "savage",
+      "doom",
+      "undertaker",
+      "taco",
+      "shock",
+      "dead",
+      "cooked"
+    ],
+    "description": "Deep dramatic bell toll / Taco Bell / Undertaker bong for savage roasts, 'he is cooked' doom moments, or brutal punchlines."
+  }
+}

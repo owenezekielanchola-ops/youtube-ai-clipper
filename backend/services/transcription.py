@@ -266,6 +266,102 @@ def transcribe_audio_groq(
     return transcript
 
 
+def transcribe_audio_slices_groq(
+    project_id: str,
+    audio_slices: List[Dict[str, Any]],
+    transcripts_dir: Path,
+    duration: float = 45.0,
+) -> Dict[str, Any]:
+    """
+    Transcribes targeted audio slices extracted from long (30m–24h) captionless VODs,
+    preserving each slice's exact YouTube VOD timestamp offsets.
+    """
+    transcripts_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = transcripts_dir / f"{project_id}.json"
+
+    api_key = os.getenv("GROQ_API_KEY", "").strip()
+    has_groq_key = bool(api_key and api_key != "your_groq_api_key_here")
+    if not audio_slices or not has_groq_key:
+        transcript = _demo_transcript(min(max(10.0, float(duration or 45.0)), 60.0))
+        with cache_path.open("w", encoding="utf-8") as f:
+            json.dump(transcript, f, separators=(",", ":"))
+        return transcript
+
+    client = Groq(api_key=api_key)
+    stt_models = get_stt_models_chain()
+    model_used = stt_models[0] if stt_models else "whisper-large-v3-turbo"
+    all_text_parts: List[str] = []
+    all_words: List[Dict[str, Any]] = []
+    all_segments: List[Dict[str, Any]] = []
+
+    for sl in audio_slices:
+        raw_path = sl.get("path")
+        if not raw_path:
+            continue
+        slice_path = Path(raw_path)
+        if not slice_path.exists() or slice_path.stat().st_size < 500:
+            continue
+        base_offset = float(sl.get("start_offset", 0.0) or 0.0)
+        try:
+            if slice_path.stat().st_size > MAX_GROQ_AUDIO_BYTES:
+                txt, words, segments, model_used = _transcribe_audio_chunked(
+                    client, slice_path, stt_models
+                )
+                for w in words:
+                    w["start"] = round(float(w["start"]) + base_offset, 3)
+                    w["end"] = round(float(w["end"]) + base_offset, 3)
+                for seg in segments:
+                    seg["start"] = round(float(seg["start"]) + base_offset, 3)
+                    seg["end"] = round(float(seg["end"]) + base_offset, 3)
+            else:
+                audio_bytes = slice_path.read_bytes()
+                try:
+                    raw_dict, model_used = _transcribe_single_bytes_with_fallback(
+                        client, slice_path.name, audio_bytes, stt_models
+                    )
+                    txt, words, segments = _raw_dict_to_words_segments(
+                        raw_dict, offset_sec=base_offset
+                    )
+                except Exception as exc:
+                    if _is_payload_too_large_error(exc):
+                        txt, words, segments, model_used = _transcribe_audio_chunked(
+                            client, slice_path, stt_models
+                        )
+                        for w in words:
+                            w["start"] = round(float(w["start"]) + base_offset, 3)
+                            w["end"] = round(float(w["end"]) + base_offset, 3)
+                        for seg in segments:
+                            seg["start"] = round(float(seg["start"]) + base_offset, 3)
+                            seg["end"] = round(float(seg["end"]) + base_offset, 3)
+                    else:
+                        raise
+            if txt:
+                all_text_parts.append(txt)
+            all_words.extend(words)
+            all_segments.extend(segments)
+        except Exception:
+            continue
+
+    if not all_words and not all_segments:
+        transcript = _demo_transcript(min(max(10.0, float(duration or 45.0)), 60.0))
+        with cache_path.open("w", encoding="utf-8") as f:
+            json.dump(transcript, f, separators=(",", ":"))
+        return transcript
+
+    all_words.sort(key=lambda w: float(w.get("start", 0.0)))
+    all_segments.sort(key=lambda s: float(s.get("start", 0.0)))
+    transcript = {
+        "text": " ".join(all_text_parts).strip(),
+        "words": all_words,
+        "segments": all_segments,
+        "source": "groq_whisper_slices",
+        "model_used": model_used,
+    }
+    with cache_path.open("w", encoding="utf-8") as f:
+        json.dump(transcript, f, separators=(",", ":"))
+    return transcript
+
+
 def load_cached_transcript(project_id: str, transcripts_dir: Path) -> Optional[Dict[str, Any]]:
     cache_path = transcripts_dir / f"{project_id}.json"
     if not cache_path.exists():

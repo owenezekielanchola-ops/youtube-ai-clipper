@@ -1,10 +1,13 @@
 import asyncio
+import bisect
 import json
 import math
 import os
+import re
 import shutil
 import struct
 import subprocess
+import sys
 from typing import Any, Dict, List, Optional, Tuple
 import urllib.request
 import uuid
@@ -13,6 +16,29 @@ from pathlib import Path
 import yt_dlp
 
 from schemas import ClipItem
+
+
+class IngestValidationError(ValueError):
+    """Raised when a YouTube URL cannot or should not be ingested as requested."""
+
+
+MAX_FULL_DOWNLOAD_DURATION_SEC = 3600.0        # 1h max for full-video download
+LONG_VIDEO_SLICE_THRESHOLD_SEC = 1800.0        # 30m threshold for targeted audio slices & clip caps
+MAX_CLIP_ONLY_SINGLE_DURATION_SEC = 180.0      # Safety cap per clip on >30m VODs (unless explicit range)
+MAX_CLIP_ONLY_TOTAL_DURATION_SEC = 360.0       # Safety cap total downloaded clip duration on >30m VODs
+
+
+def _bisect_by_start(items: List[Dict[str, Any]], target: float) -> int:
+    if sys.version_info >= (3, 10):
+        return bisect.bisect_left(items, target, key=lambda item: float(item.get("start", 0.0)))
+    lo, hi = 0, len(items)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if float(items[mid].get("start", 0.0)) < target:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
 
 
 def ensure_ffmpeg_available() -> str:
@@ -377,8 +403,6 @@ def _probe_media_duration(media_path: Path, ffmpeg_bin: Optional[str] = None) ->
             encoding="utf-8",
             errors="replace",
         )
-        import re
-
         m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", res.stderr or "")
         if m:
             hrs, mins, secs = int(m.group(1)), int(m.group(2)), float(m.group(3))
@@ -445,6 +469,369 @@ def _ensure_mp4_file(source_file: Path, target_mp4: Path, ffmpeg_bin: str) -> No
     source_file.unlink(missing_ok=True)
 
 
+def _format_duration_hms(seconds: float) -> str:
+    total = max(0, int(round(seconds)))
+    hrs, rem = divmod(total, 3600)
+    mins, secs = divmod(rem, 60)
+    if hrs > 0:
+        return f"{hrs}h {mins:02d}m"
+    if mins > 0:
+        return f"{mins}m {secs:02d}s" if secs > 0 else f"{mins}m"
+    return f"{secs}s"
+
+
+def _check_live_or_unready(info: Dict[str, Any]) -> None:
+    live_status = str(info.get("live_status") or "").lower()
+    if live_status == "is_upcoming":
+        raise IngestValidationError(
+            "This YouTube livestream is scheduled (upcoming) and has not aired yet."
+        )
+    if bool(info.get("is_live")) or live_status == "is_live":
+        raise IngestValidationError(
+            "This YouTube livestream is currently LIVE. Wait until the stream ends "
+            "(and VOD processing finishes), then paste the link with a clip prompt like "
+            "'find only the interesting part'."
+        )
+
+
+def _extract_youtube_chapters(info: Dict[str, Any]) -> List[Dict[str, Any]]:
+    raw_chapters = info.get("chapters") or []
+    chapters: List[Dict[str, Any]] = []
+    if not isinstance(raw_chapters, list):
+        return chapters
+    for ch in raw_chapters:
+        if not isinstance(ch, dict):
+            continue
+        title = str(ch.get("title") or "").strip()
+        if not title:
+            continue
+        try:
+            st = max(0.0, float(ch.get("start_time", 0.0)))
+            et = float(ch.get("end_time", st))
+        except (TypeError, ValueError):
+            continue
+        if et > st:
+            chapters.append(
+                {
+                    "start_time": round(st, 2),
+                    "end_time": round(et, 2),
+                    "title": title[:120],
+                }
+            )
+    return chapters
+
+
+def _parse_hms_token(token: str) -> Optional[float]:
+    parts = token.strip().split(":")
+    try:
+        nums = [int(p) for p in parts]
+    except ValueError:
+        return None
+    if len(nums) == 3:
+        h, m, s = nums
+        if h < 0 or m < 0 or s < 0 or m >= 60 or s >= 60:
+            return None
+        return float(h * 3600 + m * 60 + s)
+    if len(nums) == 2:
+        m, s = nums
+        if m < 0 or s < 0 or s >= 60:
+            return None
+        return float(m * 60 + s)
+    return None
+
+
+def parse_explicit_clip_range(
+    prompt: str, duration: float = 0.0
+) -> Optional[Tuple[float, float]]:
+    if not prompt:
+        return None
+    match = re.search(
+        r"(?:from\s+)?(\d{1,2}:\d{2}(?::\d{2})?)\s*(?:to|-|–|—|until)\s*(\d{1,2}:\d{2}(?::\d{2})?)",
+        prompt,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    start = _parse_hms_token(match.group(1))
+    end = _parse_hms_token(match.group(2))
+    if start is None or end is None or end <= start:
+        return None
+    if duration > 0:
+        if start >= duration:
+            return None
+        end = min(float(duration), end)
+    span = end - start
+    if span < 3.0 or span > 600.0:
+        return None
+    return round(start, 2), round(end, 2)
+
+
+def _merge_time_windows(windows: List[Tuple[float, float]], gap_sec: float = 10.0) -> List[Tuple[float, float]]:
+    if not windows:
+        return []
+    ordered = sorted((round(s, 2), round(e, 2)) for s, e in windows if e > s)
+    merged: List[Tuple[float, float]] = [ordered[0]]
+    for s, e in ordered[1:]:
+        prev_s, prev_e = merged[-1]
+        if s <= prev_e + gap_sec:
+            merged[-1] = (prev_s, max(prev_e, e))
+        else:
+            merged.append((s, e))
+    return merged
+
+
+def _select_long_video_audio_windows(
+    duration: float, raw_heatmap: Any, initial_prompt: str
+) -> List[Tuple[float, float]]:
+    explicit = parse_explicit_clip_range(initial_prompt, duration)
+    if explicit is not None:
+        rs, re_val = explicit
+        return [(round(max(0.0, rs - 15.0), 2), round(min(duration, re_val + 15.0), 2))]
+
+    lower_prompt = (initial_prompt or "").lower()
+    is_start_focused = any(
+        w in lower_prompt for w in ("first", "intro", "beginning", "start", "opening")
+    )
+    if is_start_focused:
+        return [(0.0, round(min(duration, 240.0), 2))]
+
+    valid_pts = [
+        pt
+        for pt in (raw_heatmap if isinstance(raw_heatmap, list) else [])
+        if isinstance(pt, dict) and "start_time" in pt
+    ]
+    if valid_pts:
+        sorted_pts = sorted(valid_pts, key=lambda p: float(p.get("value", 0.0)), reverse=True)
+        min_sep = max(120.0, duration * 0.04)
+        chosen_centers: List[float] = []
+        for sep in (min_sep, 60.0):
+            for pt in sorted_pts:
+                st = float(pt.get("start_time", 0.0))
+                et = float(pt.get("end_time", st))
+                center = (st + max(st, et)) * 0.5
+                if any(abs(center - c) < sep for c in chosen_centers):
+                    continue
+                chosen_centers.append(center)
+                if len(chosen_centers) >= 5:
+                    break
+            if len(chosen_centers) >= 3:
+                break
+        if chosen_centers:
+            peak_windows = [
+                (max(0.0, c - 25.0), min(duration, c + 50.0))
+                for c in chosen_centers
+            ]
+            return _merge_time_windows(peak_windows)
+
+    even_windows = [
+        (max(0.0, duration * frac - 60.0), min(duration, duration * frac + 60.0))
+        for frac in (0.10, 0.35, 0.65, 0.88)
+    ]
+    return _merge_time_windows(even_windows)
+
+
+def _ffmpeg_http_input_args(
+    url: str, http_headers: Optional[Dict[str, str]]
+) -> List[str]:
+    low = url.lower()
+    if not (low.startswith("http://") or low.startswith("https://")):
+        return []
+    args = ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "3"]
+    if isinstance(http_headers, dict) and http_headers:
+        header_lines = "".join(
+            f"{k}: {v}\r\n"
+            for k, v in http_headers.items()
+            if k and v is not None and str(v).strip()
+        )
+        if header_lines:
+            args.extend(["-headers", header_lines])
+    return args
+
+
+def _pick_direct_audio_url(
+    info: Dict[str, Any],
+) -> Tuple[Optional[str], Optional[Dict[str, str]]]:
+    formats = info.get("formats") or []
+    if not isinstance(formats, list):
+        return None, None
+    audio_only = [
+        f
+        for f in formats
+        if isinstance(f, dict)
+        and f.get("url")
+        and f.get("vcodec") in (None, "none")
+        and f.get("acodec") not in (None, "none")
+    ]
+    candidates = audio_only or [
+        f
+        for f in formats
+        if isinstance(f, dict)
+        and f.get("url")
+        and f.get("acodec") not in (None, "none")
+    ]
+    if not candidates:
+        return None, None
+
+    def _rank(f: Dict[str, Any]) -> Tuple[int, int, float]:
+        proto = str(f.get("protocol") or "").lower()
+        is_direct = 0 if proto in ("https", "http") else 1
+        ext = str(f.get("ext") or "").lower()
+        acodec = str(f.get("acodec") or "").lower()
+        is_m4a = 0 if (ext == "m4a" or "mp4a" in acodec) else 1
+        abr = float(f.get("abr") or f.get("tbr") or 999.0)
+        return (is_direct, is_m4a, abs(abr - 64.0) if audio_only else abr)
+
+    candidates.sort(key=_rank)
+    chosen = candidates[0]
+    headers = chosen.get("http_headers") or info.get("http_headers")
+    return str(chosen["url"]), headers if isinstance(headers, dict) else None
+
+
+def _download_audio_slices(
+    youtube_url: str,
+    project_id: str,
+    downloads_dir: Path,
+    windows: List[Tuple[float, float]],
+    ffmpeg_bin: str,
+    direct_audio_url: Optional[str] = None,
+    direct_audio_headers: Optional[Dict[str, str]] = None,
+) -> List[Dict[str, Any]]:
+    slices: List[Dict[str, Any]] = []
+    last_err: Optional[str] = None
+    for idx, (win_s, win_e) in enumerate(windows):
+        span_dur = max(5.0, win_e - win_s)
+        print(
+            f"[Ingest] Downloading audio slice {idx + 1}/{len(windows)} "
+            f"({win_s:.0f}s -> {win_e:.0f}s)...",
+            flush=True,
+        )
+        raw_tmpl = (downloads_dir / f"_raw_slice_{project_id}_{idx}.%(ext)s").as_posix()
+        slice_mp3 = downloads_dir / f"_slice_{project_id}_{idx}.mp3"
+        try:
+            got_slice = False
+            if direct_audio_url:
+                try:
+                    fast_cmd = [
+                        ffmpeg_bin,
+                        "-nostdin",
+                        "-y",
+                        *_ffmpeg_http_input_args(direct_audio_url, direct_audio_headers),
+                        "-ss",
+                        str(win_s),
+                        "-t",
+                        str(span_dur),
+                        "-i",
+                        direct_audio_url,
+                        "-vn",
+                        "-ac",
+                        "1",
+                        "-ar",
+                        "16000",
+                        "-b:a",
+                        "24k",
+                        slice_mp3.resolve().as_posix(),
+                    ]
+                    fast_proc = subprocess.run(
+                        fast_cmd,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
+                        timeout=max(75, int(span_dur * 0.6)),
+                    )
+                    if (
+                        fast_proc.returncode == 0
+                        and slice_mp3.exists()
+                        and slice_mp3.stat().st_size >= 1500
+                    ):
+                        got_slice = True
+                    else:
+                        err_tail = (
+                            fast_proc.stderr.decode("utf-8", errors="replace").strip().splitlines()[-1]
+                            if fast_proc.stderr
+                            else f"exit {fast_proc.returncode}"
+                        )
+                        print(
+                            f"[Ingest] Direct slice {idx + 1} FFmpeg fallback ({err_tail})",
+                            flush=True,
+                        )
+                        slice_mp3.unlink(missing_ok=True)
+                except Exception as fast_exc:
+                    print(
+                        f"[Ingest] Direct slice {idx + 1} FFmpeg fallback ({fast_exc})",
+                        flush=True,
+                    )
+                    slice_mp3.unlink(missing_ok=True)
+
+            if not got_slice:
+                ydl_opts: Dict[str, Any] = _apply_ytdlp_common_opts({
+                    "format": "bestaudio[abr<=64]/bestaudio/worst/best",
+                    "ffmpeg_location": str(Path(ffmpeg_bin).parent),
+                    "outtmpl": raw_tmpl,
+                    "download_ranges": yt_dlp.utils.download_range_func(None, [(win_s, win_e)]),
+                    "noplaylist": True,
+                    "quiet": True,
+                    "no_warnings": True,
+                })
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([youtube_url])
+
+                raw_candidates = [
+                    p
+                    for p in sorted(downloads_dir.glob(f"_raw_slice_{project_id}_{idx}.*"))
+                    if p.is_file() and p.suffix.lower() not in {".part", ".ytdl"}
+                ]
+                if not raw_candidates:
+                    last_err = f"No downloaded slice file found for slice {idx + 1}"
+                    print(f"[Ingest] Slice {idx + 1} failed: {last_err}", flush=True)
+                    continue
+                raw_file = raw_candidates[0]
+                subprocess.run(
+                    [
+                        ffmpeg_bin,
+                        "-nostdin",
+                        "-y",
+                        "-i",
+                        raw_file.resolve().as_posix(),
+                        "-vn",
+                        "-ac",
+                        "1",
+                        "-ar",
+                        "16000",
+                        "-b:a",
+                        "24k",
+                        slice_mp3.resolve().as_posix(),
+                    ],
+                    check=True,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    timeout=60,
+                )
+
+            probed_dur = _probe_media_duration(slice_mp3, ffmpeg_bin)
+            slices.append(
+                {
+                    "path": slice_mp3,
+                    "start_offset": round(win_s, 2),
+                    "end_offset": round(win_e, 2),
+                    "duration": round(float(probed_dur or span_dur), 2),
+                }
+            )
+        except Exception as exc:
+            last_err = str(exc)
+            print(f"[Ingest] Slice {idx + 1} failed: {exc}", flush=True)
+            slice_mp3.unlink(missing_ok=True)
+        finally:
+            for tmp in downloads_dir.glob(f"_raw_slice_{project_id}_{idx}.*"):
+                tmp.unlink(missing_ok=True)
+
+    if not slices:
+        raise RuntimeError(
+            f"Failed to download any audio slices for {project_id}: {last_err or 'unknown error'}"
+        )
+    return slices
+
+
 def _download_youtube_sync(youtube_url: str, project_id: str, downloads_dir: Path) -> Dict[str, Any]:
     downloads_dir = downloads_dir.resolve()
     downloads_dir.mkdir(parents=True, exist_ok=True)
@@ -465,6 +852,24 @@ def _download_youtube_sync(youtube_url: str, project_id: str, downloads_dir: Pat
             "audio_peaks": audio_peaks,
             "is_demo": True,
         }
+
+    # Probe metadata first to block live/upcoming streams and >1h full downloads
+    probe_opts: Dict[str, Any] = _apply_ytdlp_common_opts({
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+    })
+    with yt_dlp.YoutubeDL(probe_opts) as ydl:
+        probe_info = ydl.extract_info(youtube_url, download=False)
+    _check_live_or_unready(probe_info)
+    probe_dur = float(probe_info.get("duration") or 0.0)
+    if probe_dur > MAX_FULL_DOWNLOAD_DURATION_SEC:
+        raise IngestValidationError(
+            f"This video is {_format_duration_hms(probe_dur)} long (> 1 hour). "
+            "Full-video download is disabled for long videos/VODs — enter a clip prompt "
+            "(e.g. 'find only the interesting part') and click 'Clip & Load' so only "
+            "the matching clip(s) are downloaded."
+        )
 
     # Strictly cap YouTube resolution at <= 1080p MP4 for 8GB RAM constraint
     ffmpeg_bin = _find_ffmpeg()
@@ -567,7 +972,7 @@ def _extract_youtube_json3_transcript(info: Dict[str, Any]) -> Optional[Dict[str
             chosen_url,
             headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
         )
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=30) as resp:
             payload = json.loads(resp.read().decode("utf-8", errors="replace"))
     except Exception:
         return None
@@ -659,15 +1064,24 @@ def extract_youtube_audio_and_meta(
         "no_warnings": True,
     })
 
+    print("[Ingest] Probing YouTube metadata...", flush=True)
     with yt_dlp.YoutubeDL(meta_opts) as ydl:
         info = ydl.extract_info(youtube_url, download=False)
 
+    _check_live_or_unready(info)
     title = info.get("title") or "YouTube Video"
     thumbnail = info.get("thumbnail") or ""
     duration = float(info.get("duration") or 0.0)
     raw_heatmap = info.get("heatmap") or []
+    chapters = _extract_youtube_chapters(info)
 
     yt_transcript = _extract_youtube_json3_transcript(info)
+    print(
+        f"[Ingest] Probed '{title[:48]}' ({_format_duration_hms(duration)}) | "
+        f"captions={'yes (' + str(len(yt_transcript.get('segments', []))) + ' segs)' if yt_transcript else 'no'} | "
+        f"heatmap={len(raw_heatmap) if isinstance(raw_heatmap, list) else 0} pts",
+        flush=True,
+    )
     if yt_transcript is not None:
         effective_duration = duration
         if effective_duration <= 0 and yt_transcript.get("segments"):
@@ -677,15 +1091,48 @@ def extract_youtube_audio_and_meta(
         return {
             "project_id": project_id,
             "audio_path": None,
+            "audio_slices": [],
             "prefetched_transcript": yt_transcript,
             "title": title,
             "thumbnail": thumbnail,
             "duration": effective_duration or 60.0,
             "full_duration": effective_duration or 60.0,
+            "transcribed_window_duration": effective_duration or 60.0,
             "heatmap": heatmap,
+            "chapters": chapters,
         }
 
-    # No YouTube captions available: download a capped compressed audio slice for Groq Whisper
+    # No YouTube captions available:
+    # For >30m VODs, download targeted peak/evenly-spaced audio slices instead of blind [0..20m] only.
+    if duration > LONG_VIDEO_SLICE_THRESHOLD_SEC:
+        windows = _select_long_video_audio_windows(duration, raw_heatmap, initial_prompt)
+        direct_audio_url, direct_audio_headers = _pick_direct_audio_url(info)
+        slices = _download_audio_slices(
+            youtube_url,
+            project_id,
+            downloads_dir,
+            windows,
+            ffmpeg_bin,
+            direct_audio_url=direct_audio_url,
+            direct_audio_headers=direct_audio_headers,
+        )
+        transcribed_window_duration = round(sum(float(s["duration"]) for s in slices), 2)
+        heatmap = _normalize_heatmap(raw_heatmap, [0.4, 0.7, 0.9, 0.6, 0.5], duration)
+        return {
+            "project_id": project_id,
+            "audio_path": None,
+            "audio_slices": slices,
+            "prefetched_transcript": None,
+            "title": title,
+            "thumbnail": thumbnail,
+            "duration": duration,
+            "full_duration": duration,
+            "transcribed_window_duration": transcribed_window_duration,
+            "heatmap": heatmap,
+            "chapters": chapters,
+        }
+
+    # Short/medium captionless video (<= 30m): download capped compressed audio slice for Groq Whisper
     lower_prompt = (initial_prompt or "").lower()
     is_start_focused = any(
         w in lower_prompt for w in ("first", "intro", "beginning", "start", "opening")
@@ -768,26 +1215,41 @@ def extract_youtube_audio_and_meta(
     return {
         "project_id": project_id,
         "audio_path": full_mp3_path,
+        "audio_slices": [],
         "prefetched_transcript": None,
         "title": title,
         "thumbnail": thumbnail,
         "duration": effective_duration,
         "full_duration": full_duration,
+        "transcribed_window_duration": effective_duration,
         "heatmap": heatmap,
+        "chapters": chapters,
     }
 
 
 def normalize_clip_windows(
-    clip_ranges: List[Dict[str, Any]], full_duration: float
+    clip_ranges: List[Dict[str, Any]],
+    full_duration: float,
+    max_clip_duration: Optional[float] = None,
+    max_total_duration: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     max_dur = max(4.0, float(full_duration or 60.0))
     normalized: List[Dict[str, Any]] = []
+    running_total = 0.0
     for idx, raw in enumerate(clip_ranges):
         s = max(0.0, float(raw.get("source_start", 0.0)))
         e = float(raw.get("source_end", s + 25.0))
         if s >= max_dur:
             s = max(0.0, max_dur - 15.0)
         e = min(max_dur, max(s + 4.0, e))
+        if max_clip_duration is not None and (e - s) > max_clip_duration:
+            e = min(max_dur, s + max_clip_duration)
+        if max_total_duration is not None:
+            remaining = max_total_duration - running_total
+            if remaining < 4.0:
+                break
+            if (e - s) > remaining:
+                e = min(max_dur, s + remaining)
         if e - s < 2.0:
             continue
         item: Dict[str, Any] = {
@@ -800,12 +1262,15 @@ def normalize_clip_windows(
         if raw.get("actual_duration") is not None:
             item["actual_duration"] = raw["actual_duration"]
         normalized.append(item)
+        running_total += e - s
     if not normalized:
-        end_default = min(max_dur, 30.0)
+        cap_default = min(max_dur, 30.0)
+        if max_clip_duration is not None:
+            cap_default = min(cap_default, max_clip_duration)
         normalized.append(
             {
                 "source_start": 0.0,
-                "source_end": round(max(4.0, end_default), 2),
+                "source_end": round(max(4.0, cap_default), 2),
                 "title": "Opening Highlight",
                 "reason": "Default highlight segment",
                 "virality_score": 8.0,
@@ -820,6 +1285,7 @@ def download_youtube_clip_segments(
     downloads_dir: Path,
     clip_ranges: List[Dict[str, Any]],
     full_duration: float,
+    allow_long_clips: bool = False,
 ) -> Dict[str, Any]:
     """
     Low-storage Stage 2: downloads ONLY the AI-selected [source_start, source_end]
@@ -831,51 +1297,211 @@ def download_youtube_clip_segments(
     ffmpeg_bin = _find_ffmpeg()
     js_runtimes = _discover_js_runtimes()
 
-    normalized_ranges = normalize_clip_windows(clip_ranges, full_duration)
+    cap_single = (
+        MAX_CLIP_ONLY_SINGLE_DURATION_SEC
+        if (full_duration > LONG_VIDEO_SLICE_THRESHOLD_SEC and not allow_long_clips)
+        else None
+    )
+    cap_total = (
+        MAX_CLIP_ONLY_TOTAL_DURATION_SEC
+        if (full_duration > LONG_VIDEO_SLICE_THRESHOLD_SEC and not allow_long_clips)
+        else None
+    )
+    normalized_ranges = normalize_clip_windows(
+        clip_ranges,
+        full_duration,
+        max_clip_duration=cap_single,
+        max_total_duration=cap_total,
+    )
     seg_files: List[Path] = []
+    seg_already_encoded: List[bool] = []
     concat_list_path = downloads_dir / f"_concat_{project_id}.txt"
     video_path = downloads_dir / f"{project_id}.mp4"
     audio_path = downloads_dir / f"{project_id}.mp3"
 
     try:
-        for idx, seg in enumerate(normalized_ranges):
-            s = float(seg["source_start"])
-            e = float(seg["source_end"])
-            seg_tmpl = (downloads_dir / f"_seg_{project_id}_{idx}.%(ext)s").as_posix()
-            ydl_opts: Dict[str, Any] = _apply_ytdlp_common_opts({
+        # Resolve direct stream URLs once so FFmpeg can use fast -ss input seeking (no 24h full-stream decode)
+        stream_specs: List[Tuple[str, Optional[Dict[str, str]]]] = []
+        try:
+            probe_opts = _apply_ytdlp_common_opts({
                 "format": (
                     "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/"
                     "best[height<=720][ext=mp4]/best[height<=720]"
                 ),
-                "merge_output_format": "mp4",
-                "download_ranges": yt_dlp.utils.download_range_func(None, [(s, e)]),
-                "force_keyframes_at_cuts": True,
-                "ffmpeg_location": str(Path(ffmpeg_bin).parent),
-                "outtmpl": seg_tmpl,
                 "noplaylist": True,
                 "quiet": True,
                 "no_warnings": True,
             })
+            with yt_dlp.YoutubeDL(probe_opts) as ydl:
+                s_info = ydl.extract_info(youtube_url, download=False)
+            top_headers = s_info.get("http_headers") if isinstance(s_info.get("http_headers"), dict) else None
+            req_fmts = s_info.get("requested_formats") or []
+            if len(req_fmts) >= 2 and req_fmts[0].get("url") and req_fmts[1].get("url"):
+                stream_specs = [
+                    (
+                        str(req_fmts[0]["url"]),
+                        req_fmts[0].get("http_headers") if isinstance(req_fmts[0].get("http_headers"), dict) else top_headers,
+                    ),
+                    (
+                        str(req_fmts[1]["url"]),
+                        req_fmts[1].get("http_headers") if isinstance(req_fmts[1].get("http_headers"), dict) else top_headers,
+                    ),
+                ]
+            elif s_info.get("url"):
+                stream_specs = [(str(s_info["url"]), top_headers)]
+        except Exception:
+            stream_specs = []
 
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([youtube_url])
-
-            candidates = sorted(downloads_dir.glob(f"_seg_{project_id}_{idx}.*"))
-            media_candidates = [
-                c for c in candidates if c.suffix.lower() in {".mp4", ".mkv", ".webm"}
-            ]
-            if not media_candidates:
-                raise FileNotFoundError(
-                    f"Downloaded clip segment {idx} ({s}s-{e}s) not found for {project_id}"
-                )
+        for idx, seg in enumerate(normalized_ranges):
+            s = float(seg["source_start"])
+            e = float(seg["source_end"])
+            span_dur = max(1.0, e - s)
+            print(
+                f"[Ingest] Downloading clip {idx + 1}/{len(normalized_ranges)} "
+                f"({s:.1f}s -> {e:.1f}s)...",
+                flush=True,
+            )
             seg_mp4 = downloads_dir / f"_seg_{project_id}_{idx}.mp4"
-            _ensure_mp4_file(media_candidates[0], seg_mp4, ffmpeg_bin)
+            got_seg = False
+
+            if stream_specs:
+                try:
+                    if len(stream_specs) == 2:
+                        u0, h0 = stream_specs[0]
+                        u1, h1 = stream_specs[1]
+                        ff_cmd = [
+                            ffmpeg_bin,
+                            "-nostdin",
+                            "-y",
+                            *_ffmpeg_http_input_args(u0, h0),
+                            "-ss",
+                            str(s),
+                            "-t",
+                            str(span_dur),
+                            "-i",
+                            u0,
+                            *_ffmpeg_http_input_args(u1, h1),
+                            "-ss",
+                            str(s),
+                            "-t",
+                            str(span_dur),
+                            "-i",
+                            u1,
+                            "-map",
+                            "0:v:0",
+                            "-map",
+                            "1:a:0",
+                            "-c:v",
+                            "libx264",
+                            "-preset",
+                            "veryfast",
+                            "-threads",
+                            "2",
+                            "-pix_fmt",
+                            "yuv420p",
+                            "-c:a",
+                            "aac",
+                            "-b:a",
+                            "128k",
+                            "-movflags",
+                            "+faststart",
+                            seg_mp4.resolve().as_posix(),
+                        ]
+                    else:
+                        u0, h0 = stream_specs[0]
+                        ff_cmd = [
+                            ffmpeg_bin,
+                            "-nostdin",
+                            "-y",
+                            *_ffmpeg_http_input_args(u0, h0),
+                            "-ss",
+                            str(s),
+                            "-t",
+                            str(span_dur),
+                            "-i",
+                            u0,
+                            "-c:v",
+                            "libx264",
+                            "-preset",
+                            "veryfast",
+                            "-threads",
+                            "2",
+                            "-pix_fmt",
+                            "yuv420p",
+                            "-c:a",
+                            "aac",
+                            "-b:a",
+                            "128k",
+                            "-movflags",
+                            "+faststart",
+                            seg_mp4.resolve().as_posix(),
+                        ]
+                    ff_res = subprocess.run(
+                        ff_cmd,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
+                        timeout=120,
+                    )
+                    if ff_res.returncode == 0 and seg_mp4.exists() and seg_mp4.stat().st_size > 10000:
+                        got_seg = True
+                    else:
+                        err_tail = (
+                            ff_res.stderr.decode("utf-8", errors="replace").strip().splitlines()[-1]
+                            if ff_res.stderr
+                            else f"exit {ff_res.returncode}"
+                        )
+                        print(
+                            f"[Ingest] Direct clip {idx + 1} FFmpeg fallback ({err_tail})",
+                            flush=True,
+                        )
+                        seg_mp4.unlink(missing_ok=True)
+                except Exception as seg_exc:
+                    print(
+                        f"[Ingest] Direct clip {idx + 1} FFmpeg fallback ({seg_exc})",
+                        flush=True,
+                    )
+                    seg_mp4.unlink(missing_ok=True)
+
+            if not got_seg:
+                seg_tmpl = (downloads_dir / f"_seg_{project_id}_{idx}.%(ext)s").as_posix()
+                ydl_opts: Dict[str, Any] = _apply_ytdlp_common_opts({
+                    "format": (
+                        "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/"
+                        "best[height<=720][ext=mp4]/best[height<=720]"
+                    ),
+                    "merge_output_format": "mp4",
+                    "download_ranges": yt_dlp.utils.download_range_func(None, [(s, e)]),
+                    "force_keyframes_at_cuts": full_duration <= LONG_VIDEO_SLICE_THRESHOLD_SEC,
+                    "ffmpeg_location": str(Path(ffmpeg_bin).parent),
+                    "outtmpl": seg_tmpl,
+                    "noplaylist": True,
+                    "quiet": True,
+                    "no_warnings": True,
+                })
+
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([youtube_url])
+
+                candidates = sorted(downloads_dir.glob(f"_seg_{project_id}_{idx}.*"))
+                media_candidates = [
+                    c for c in candidates if c.suffix.lower() in {".mp4", ".mkv", ".webm"}
+                ]
+                if not media_candidates:
+                    raise FileNotFoundError(
+                        f"Downloaded clip segment {idx} ({s}s-{e}s) not found for {project_id}"
+                    )
+                _ensure_mp4_file(media_candidates[0], seg_mp4, ffmpeg_bin)
+
             probed_seg_dur = _probe_media_duration(seg_mp4, ffmpeg_bin)
             if probed_seg_dur and probed_seg_dur > 0:
                 seg["actual_duration"] = round(probed_seg_dur, 2)
             seg_files.append(seg_mp4)
+            seg_already_encoded.append(got_seg)
 
-        if len(seg_files) == 1:
+        if len(seg_files) == 1 and seg_already_encoded and seg_already_encoded[0]:
+            seg_files[0].replace(video_path)
+        elif len(seg_files) == 1:
             subprocess.run(
                 [
                     ffmpeg_bin,
@@ -1003,8 +1629,15 @@ def remap_clips_and_transcript_for_segments(
         )
 
         clip_word_texts: List[str] = []
-        for w in orig_words:
+        word_iter = (
+            orig_words[_bisect_by_start(orig_words, max(0.0, orig_start - 5.0)) :]
+            if len(orig_words) > 256
+            else orig_words
+        )
+        for w in word_iter:
             ws = float(w.get("start", 0.0))
+            if len(orig_words) > 256 and ws > orig_end + 5.0:
+                break
             we = float(w.get("end", ws + 0.1))
             mid = (ws + we) * 0.5
             if mid < orig_start or mid > orig_end:
@@ -1023,8 +1656,15 @@ def remap_clips_and_transcript_for_segments(
                 clip_word_texts.append(word_str)
 
         matched_seg_count = 0
-        for s_item in orig_segments:
+        seg_iter = (
+            orig_segments[_bisect_by_start(orig_segments, max(0.0, orig_start - 30.0)) :]
+            if len(orig_segments) > 256
+            else orig_segments
+        )
+        for s_item in seg_iter:
             ss = float(s_item.get("start", 0.0))
+            if len(orig_segments) > 256 and ss >= orig_end + 5.0:
+                break
             se = float(s_item.get("end", ss + 0.5))
             if se <= orig_start or ss >= orig_end:
                 continue

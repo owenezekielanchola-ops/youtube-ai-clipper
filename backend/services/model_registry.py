@@ -1,4 +1,5 @@
 import os
+import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -64,6 +65,8 @@ EXCLUDED_GEMINI_TOKENS = (
     "robotics",
     "computer-use",
     "aqa",
+    "argon",
+    "carbon",
 )
 
 
@@ -201,11 +204,23 @@ def resolve_stt_models(live_groq_ids: List[str]) -> List[str]:
     return ordered or list(DEFAULT_STT_MODELS)
 
 
+def _extract_gemini_version(model_id: str) -> tuple[int, int]:
+    low = model_id.lower()
+    if low in {"gemini-flash-latest", "gemini-pro-latest"}:
+        return (2, 4)
+    m = re.search(r"gemini-(\d+)(?:\.(\d+))?", low)
+    if m:
+        return (int(m.group(1)), int(m.group(2) or 0))
+    return (0, 0)
+
+
 def resolve_gemini_models(live_gemini_ids: List[str]) -> List[str]:
     """
-    Orders Gemini multimodal models:
-    1. gemini-2.5-flash (Primary)
-    2. gemini-2.5-pro / gemini-2.0-flash (Backups)
+    Orders Gemini multimodal models dynamically so newer releases (e.g. Gemini 3/4+)
+    are automatically adopted while prioritizing fast flash -> pro -> remaining backups:
+    1. Highest stable non-lite Flash (e.g. gemini-3-flash, gemini-2.5-flash)
+    2. Highest stable Pro (e.g. gemini-3-pro, gemini-2.5-pro)
+    3. Older / preview / lite / latest aliases as fallback
     """
     if not live_gemini_ids:
         return list(DEFAULT_GEMINI_MODELS)
@@ -219,28 +234,18 @@ def resolve_gemini_models(live_gemini_ids: List[str]) -> List[str]:
     if not candidates:
         return list(DEFAULT_GEMINI_MODELS)
 
-    ordered: List[str] = []
-    preferred_prefixes = (
-        "gemini-2.5-flash",
-        "gemini-2.5-pro",
-        "gemini-2.0-flash",
-    )
-    for pref in preferred_prefixes:
-        # Prefer exact match first, then non-lite variants
-        exact = [m for m in candidates if m.lower() == pref]
-        for m in exact:
-            _append_unique(ordered, m)
-        non_lite = [
-            m
-            for m in candidates
-            if m.lower().startswith(pref) and "lite" not in m.lower()
-        ]
-        for m in non_lite:
-            _append_unique(ordered, m)
+    def _rank_key(model_id: str) -> tuple[int, int, int, int, int, int, str]:
+        low = model_id.lower()
+        major, minor = _extract_gemini_version(low)
+        is_preview_or_exp = 1 if ("preview" in low or "exp" in low) else 0
+        is_lite = 1 if "lite" in low else 0
+        is_flash = 0 if "flash" in low else (1 if "pro" in low else 2)
+        is_exact = 0 if re.fullmatch(r"gemini-\d+(?:\.\d+)?-(?:flash|pro)", low) else 1
+        return (-major, -minor, is_preview_or_exp, is_lite, is_flash, is_exact, low)
 
-    for m in candidates:
-        if m.lower().startswith(("gemini-2.5", "gemini-2.0")):
-            _append_unique(ordered, m)
+    ordered: List[str] = []
+    for m in sorted(candidates, key=_rank_key):
+        _append_unique(ordered, m)
 
     return ordered or list(DEFAULT_GEMINI_MODELS)
 
@@ -407,6 +412,38 @@ class ModelRegistry:
     def get_vision_models_chain(self) -> List[str]:
         return list(self.get_state()["vision_models_chain"])
 
+    def report_failure(self, provider: str, model_id: str, error_text: str = "") -> None:
+        """
+        Demotes a failing/deprecated model to the back of its active chain immediately
+        so subsequent calls don't waste latency retrying dead models first, and triggers
+        a live rescan on the next call when a model is retired/404/decommissioned.
+        """
+        err_low = (error_text or "").lower()
+        looks_retired = any(
+            tok in err_low
+            for tok in (
+                "decommission",
+                "deprecated",
+                "not_found",
+                "404",
+                "does not exist",
+                "not found",
+                "unsupported model",
+            )
+        )
+        with self._lock:
+            if provider == "gemini":
+                chains = [self.gemini_models_chain, self.vision_models_chain]
+            else:
+                chains = [self.tool_models_chain, self.router_models_chain, self.stt_models_chain]
+            for chain in chains:
+                if model_id in chain and len(chain) > 1:
+                    chain.remove(model_id)
+                    chain.append(model_id)
+            if looks_retired:
+                # Force fresh API discovery on next registry read
+                self.last_refreshed_at = 0.0
+
 
 model_registry = ModelRegistry()
 
@@ -439,3 +476,7 @@ def get_gemini_models_chain() -> List[str]:
 
 def get_vision_models_chain() -> List[str]:
     return model_registry.get_vision_models_chain()
+
+
+def report_model_failure(provider: str, model_id: str, exc: Optional[BaseException] = None) -> None:
+    model_registry.report_failure(provider, model_id, str(exc) if exc else "")

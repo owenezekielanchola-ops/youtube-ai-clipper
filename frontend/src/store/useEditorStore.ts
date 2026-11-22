@@ -1,19 +1,40 @@
 import { create } from 'zustand';
 import { temporal } from 'zundo';
+import { buildCampaignAssistantNotice, getCampaignById } from '../config/campaigns';
 import type {
   AiActionLogItem,
   AiChatMessage,
   AspectRatio,
   CachedTranscript,
   CaptionItem,
+  CaptionPosition,
+  CaptionPreset,
   ChangeCaptionStyleArgs,
   ClipItem,
+  DrawingItem,
+  DrawingPoint,
+  DrawingTool,
   HighlightClipInput,
   ModelStatus,
+  OverlayStyle,
   ProjectState,
+  SfxAsset,
+  SfxClipItem,
   TimeRange,
   ToolCall,
+  VideoCropRect,
+  ZoomEasing,
+  ZoomEffectItem,
+  ZoomKind,
 } from '../types/editor';
+
+export const DEFAULT_OVERLAY_STYLE: OverlayStyle = {
+  position: 'bottom-left',
+  textColor: '#FFFFFF',
+  backgroundColor: '#000000',
+  showBackground: true,
+  fontSize: 24,
+};
 
 export const API_BASE = 'http://localhost:8000';
 
@@ -25,11 +46,13 @@ function recalculateTimeline(clips: ClipItem[]): ClipItem[] {
   return clips.map((clip) => {
     const start = Math.max(0, Number(clip.sourceStart.toFixed(3)));
     const end = Math.max(start + 0.1, Number(clip.sourceEnd.toFixed(3)));
-    const duration = Number((end - start).toFixed(3));
+    const speed = Math.max(0.25, Math.min(4.0, clip.speed ?? 1.0));
+    const duration = Number(((end - start) / speed).toFixed(3));
     const updated: ClipItem = {
       ...clip,
       sourceStart: start,
       sourceEnd: end,
+      speed,
       timelineStart: Number(cursor.toFixed(3)),
       duration,
     };
@@ -149,10 +172,17 @@ function createEmptyProject(): ProjectState {
       selectedClipIds: [],
       selectedTimeRange: null,
       targetAspectRatio: '16:9',
+      activeCampaignId: null,
+      overlayText: null,
+      overlayStyle: { ...DEFAULT_OVERLAY_STYLE },
+      crop: null,
     },
     tracks: {
       clips: [],
       captions: [],
+      zooms: [],
+      drawings: [],
+      sfx: [],
     },
     captionStyle: {
       preset: 'karaoke',
@@ -204,6 +234,15 @@ export interface EditorStoreState {
   isRefreshingModels: boolean;
   pendingYoutubeUrl: string;
   ingestPrompt: string;
+  activeDrawTool: DrawingTool | null;
+  drawColor: string;
+  drawStrokeWidth: number;
+  isCropMode: boolean;
+  selectedZoomId: string | null;
+  selectedDrawingId: string | null;
+  selectedSfxId: string | null;
+  sfxLibrary: SfxAsset[];
+  isLoadingSfx: boolean;
 
   // Playback & UI setters (excluded from undo history via zundo partialize)
   setPlayheadPosition: (pos: number) => void;
@@ -214,6 +253,16 @@ export interface EditorStoreState {
   setStatusBanner: (msg: string | null) => void;
   setPendingYoutubeUrl: (url: string) => void;
   setIngestPrompt: (prompt: string) => void;
+  setActiveDrawTool: (tool: DrawingTool | null) => void;
+  setDrawColor: (color: string) => void;
+  setDrawStrokeWidth: (width: number) => void;
+  setIsCropMode: (val: boolean) => void;
+  setSelectedZoomId: (id: string | null) => void;
+  setSelectedDrawingId: (id: string | null) => void;
+  setSelectedSfxId: (id: string | null) => void;
+  setActiveCampaign: (campaignId: string | null) => void;
+  setOverlayText: (text: string | null) => void;
+  updateOverlayStyle: (patch: Partial<OverlayStyle>) => void;
   loadProjectState: (project: ProjectState, transcript?: CachedTranscript | null) => void;
   setIsIngesting: (val: boolean) => void;
   setIsAiThinking: (val: boolean) => void;
@@ -251,6 +300,22 @@ export interface EditorStoreState {
   ) => void;
   change_caption_style: (args: ChangeCaptionStyleArgs) => void;
   change_video_format: (aspect_ratio: AspectRatio) => void;
+  set_clip_speed: (clip_id: string, speed: number) => void;
+  set_range_speed: (start_time: number, end_time: number, speed: number) => void;
+  add_zoom_effect: (item: Omit<ZoomEffectItem, 'id'>) => string;
+  update_zoom_effect: (
+    id: string,
+    patch: Partial<Omit<ZoomEffectItem, 'id'>>,
+  ) => void;
+  delete_zoom_effect: (id: string) => void;
+  add_drawing: (item: Omit<DrawingItem, 'id'>) => string;
+  update_drawing: (id: string, patch: Partial<Omit<DrawingItem, 'id'>>) => void;
+  delete_drawing: (id: string) => void;
+  add_sfx_clip: (item: Omit<SfxClipItem, 'id'>) => string;
+  update_sfx_clip: (id: string, patch: Partial<Omit<SfxClipItem, 'id'>>) => void;
+  delete_sfx_clip: (id: string) => void;
+  set_video_crop: (crop: VideoCropRect | null) => void;
+  reset_video_crop: () => void;
 
   // AI Tool Dispatcher
   applyAiToolCalls: (
@@ -264,6 +329,13 @@ export interface EditorStoreState {
   removeDetectedPauses: (minGap?: number) => Promise<void>;
   fetchModelStatus: () => Promise<void>;
   forceRefreshModels: () => Promise<void>;
+  fetchSfxLibrary: () => Promise<void>;
+  uploadSfxFiles: (files: FileList | File[], tags?: string[]) => Promise<SfxAsset[]>;
+  updateSfxAssetMeta: (
+    sfxId: string,
+    patch: { name?: string; tags?: string[]; description?: string },
+  ) => Promise<void>;
+  deleteSfxAssetFromLibrary: (sfxId: string) => Promise<void>;
 }
 
 export const useEditorStore = create<EditorStoreState>()(
@@ -289,9 +361,47 @@ export const useEditorStore = create<EditorStoreState>()(
       isRefreshingModels: false,
       pendingYoutubeUrl: '',
       ingestPrompt: '',
+      activeDrawTool: null,
+      drawColor: '#EF4444',
+      drawStrokeWidth: 6,
+      isCropMode: false,
+      selectedZoomId: null,
+      selectedDrawingId: null,
+      selectedSfxId: null,
+      sfxLibrary: [],
+      isLoadingSfx: false,
 
       setPendingYoutubeUrl: (url) => set({ pendingYoutubeUrl: url }),
       setIngestPrompt: (prompt) => set({ ingestPrompt: prompt }),
+      setActiveDrawTool: (tool) =>
+        set((state) => ({
+          activeDrawTool: tool,
+          ...(tool ? { isCropMode: false, isPlaying: false } : {}),
+          ...(tool ? {} : { isPlaying: state.isPlaying }),
+        })),
+      setDrawColor: (color) => set({ drawColor: color }),
+      setDrawStrokeWidth: (width) =>
+        set({ drawStrokeWidth: Math.max(2, Math.min(24, width)) }),
+      setIsCropMode: (val) =>
+        set((state) => ({
+          isCropMode: val,
+          ...(val ? { activeDrawTool: null, isPlaying: false } : { isPlaying: state.isPlaying }),
+        })),
+      setSelectedZoomId: (id) =>
+        set({
+          selectedZoomId: id,
+          ...(id ? { selectedDrawingId: null, selectedSfxId: null } : {}),
+        }),
+      setSelectedDrawingId: (id) =>
+        set({
+          selectedDrawingId: id,
+          ...(id ? { selectedZoomId: null, selectedSfxId: null } : {}),
+        }),
+      setSelectedSfxId: (id) =>
+        set({
+          selectedSfxId: id,
+          ...(id ? { selectedZoomId: null, selectedDrawingId: null } : {}),
+        }),
 
       fetchModelStatus: async () => {
         try {
@@ -370,11 +480,93 @@ export const useEditorStore = create<EditorStoreState>()(
 
       setStatusBanner: (msg) => set({ statusBanner: msg }),
 
+      setActiveCampaign: (campaignId) =>
+        set((state) => {
+          const campaign = getCampaignById(campaignId);
+          const hasLoadedClips = state.project.tracks.clips.length > 0;
+          const nextMessages = [...state.aiMessages];
+          if (campaign && hasLoadedClips) {
+            const notice = buildCampaignAssistantNotice(campaign, state.project.projectName);
+            const alreadyPosted = nextMessages.some(
+              (m) => m.role === 'assistant' && m.copyableCaption === notice.copyableCaption,
+            );
+            if (!alreadyPosted) {
+              nextMessages.push({
+                id: `a_campaign_${Date.now()}`,
+                role: 'assistant',
+                content: notice.content,
+                campaignLabel: campaign.label,
+                copyableCaption: notice.copyableCaption,
+              });
+            }
+          }
+          return {
+            project: {
+              ...state.project,
+              workspaceState: {
+                ...state.project.workspaceState,
+                activeCampaignId: campaign ? campaign.id : null,
+                overlayText: campaign ? campaign.overlayText : null,
+              },
+            },
+            aiMessages: nextMessages,
+            statusBanner: campaign
+              ? `${campaign.label} enabled — editing rules & "${campaign.overlayText}" overlay will auto-apply.`
+              : 'Campaign mode turned off.',
+          };
+        }),
+
+      setOverlayText: (text) =>
+        set((state) => ({
+          project: {
+            ...state.project,
+            workspaceState: {
+              ...state.project.workspaceState,
+              overlayText: text && text.trim() ? text.trim() : null,
+            },
+          },
+        })),
+
+      updateOverlayStyle: (patch) =>
+        set((state) => ({
+          project: {
+            ...state.project,
+            workspaceState: {
+              ...state.project.workspaceState,
+              overlayStyle: {
+                ...(state.project.workspaceState.overlayStyle ?? DEFAULT_OVERLAY_STYLE),
+                ...patch,
+              },
+            },
+          },
+        })),
+
       loadProjectState: (project, transcript = null) =>
         set({
-          project,
+          project: {
+            ...project,
+            workspaceState: {
+              ...project.workspaceState,
+              overlayStyle:
+                project.workspaceState?.overlayStyle ?? { ...DEFAULT_OVERLAY_STYLE },
+              crop: project.workspaceState?.crop ?? null,
+            },
+            tracks: {
+              ...project.tracks,
+              clips: recalculateTimeline(project.tracks?.clips ?? []),
+              captions: project.tracks?.captions ?? [],
+              zooms: project.tracks?.zooms ?? [],
+              drawings: project.tracks?.drawings ?? [],
+              sfx: project.tracks?.sfx ?? [],
+            },
+          },
           transcript,
           isPlaying: false,
+          isCropMode: false,
+          activeDrawTool: null,
+          selectedZoomId: null,
+          selectedDrawingId: null,
+          selectedSfxId: null,
         }),
 
       setIsIngesting: (val) => set({ isIngesting: val }),
@@ -458,11 +650,12 @@ export const useEditorStore = create<EditorStoreState>()(
               continue;
             }
             const clipEndTl = clip.timelineStart + clip.duration;
+            const clipSpeed = Math.max(0.25, Math.min(4.0, clip.speed ?? 1));
             // Support either timeline timestamp inside clip OR source timestamp fallback
             let offset = split_timestamp - clip.timelineStart;
             if (split_timestamp <= clip.timelineStart || split_timestamp >= clipEndTl) {
               if (split_timestamp > clip.sourceStart && split_timestamp < clip.sourceEnd) {
-                offset = split_timestamp - clip.sourceStart;
+                offset = (split_timestamp - clip.sourceStart) / clipSpeed;
               }
             }
 
@@ -471,13 +664,14 @@ export const useEditorStore = create<EditorStoreState>()(
               continue;
             }
 
-            const splitSource = Number((clip.sourceStart + offset).toFixed(3));
+            const splitSource = Number((clip.sourceStart + offset * clipSpeed).toFixed(3));
             const rightId = makeId('clip');
             newlyCreatedId = rightId;
 
             nextClips.push({
               ...clip,
               sourceEnd: splitSource,
+              speed: clipSpeed,
               title: `${clip.title} (A)`,
             });
             nextClips.push({
@@ -486,7 +680,8 @@ export const useEditorStore = create<EditorStoreState>()(
               sourceStart: splitSource,
               sourceEnd: clip.sourceEnd,
               timelineStart: 0,
-              duration: clip.sourceEnd - splitSource,
+              duration: (clip.sourceEnd - splitSource) / clipSpeed,
+              speed: clipSpeed,
               viralityScore: clip.viralityScore,
               reason: clip.reason,
             });
@@ -562,11 +757,16 @@ export const useEditorStore = create<EditorStoreState>()(
           const c1 = clips[firstIdx];
           const c2 = clips[secondIdx];
 
-          // Only merge truly contiguous source clips (or directly adjacent if overlapping/close)
+          // Only merge truly contiguous source clips with matching playback speeds
           if (c2.sourceStart < c1.sourceStart || c2.sourceStart - c1.sourceEnd > 0.5) {
             return {
               statusBanner:
                 'Can only merge adjacent clips that are contiguous in the source video.',
+            };
+          }
+          if (Math.abs((c1.speed ?? 1) - (c2.speed ?? 1)) > 0.01) {
+            return {
+              statusBanner: 'Can only merge clips that have the same speed.',
             };
           }
 
@@ -957,17 +1157,76 @@ export const useEditorStore = create<EditorStoreState>()(
       change_caption_style: (args) =>
         set((state) => {
           const cur = state.project.captionStyle;
+          const rawArgs = args as ChangeCaptionStyleArgs & Record<string, unknown>;
+          const colorMap: Record<string, string> = {
+            black: '#000000',
+            white: '#FFFFFF',
+            yellow: '#FACC15',
+            gold: '#FACC15',
+            red: '#EF4444',
+            crimson: '#DC2626',
+            blue: '#38BDF8',
+            sky: '#38BDF8',
+            navy: '#1E3A8A',
+            green: '#22C55E',
+            lime: '#84CC16',
+            emerald: '#10B981',
+            orange: '#F97316',
+            amber: '#F59E0B',
+            pink: '#EC4899',
+            rose: '#F43F5E',
+            magenta: '#D946EF',
+            purple: '#A855F7',
+            violet: '#8B5CF6',
+            cyan: '#06B6D4',
+            teal: '#14B8A6',
+            aqua: '#06B6D4',
+            gray: '#94A3B8',
+            grey: '#94A3B8',
+            silver: '#CBD5E1',
+            brown: '#92400E',
+          };
+          const normColor = (val: unknown, fallback: string): string => {
+            if (typeof val !== 'string' || !val.trim()) return fallback;
+            const t = val.trim();
+            const mapped = colorMap[t.toLowerCase()];
+            if (mapped) return mapped;
+            const hex = t.replace('#', '');
+            if (/^[0-9a-fA-F]{3}$/.test(hex)) {
+              return `#${hex[0]}${hex[0]}${hex[1]}${hex[1]}${hex[2]}${hex[2]}`.toUpperCase();
+            }
+            if (/^[0-9a-fA-F]{6}$/.test(hex)) {
+              return `#${hex.toUpperCase()}`;
+            }
+            return fallback;
+          };
+          const nextTextCol = normColor(
+            rawArgs.text_color ?? rawArgs.textColor ?? rawArgs.color,
+            cur.textColor,
+          );
+          const nextHlCol = normColor(
+            rawArgs.highlight_color ?? rawArgs.highlightColor,
+            cur.highlightColor,
+          );
+          const rawFontSize = Number(rawArgs.font_size ?? rawArgs.fontSize ?? cur.fontSize);
           return {
             project: {
               ...state.project,
               captionStyle: {
-                preset: args.preset ?? cur.preset,
-                fontFamily: args.font_family ?? cur.fontFamily,
-                fontSize: args.font_size ?? cur.fontSize,
-                textColor: args.text_color ?? cur.textColor,
-                highlightColor: args.highlight_color ?? cur.highlightColor,
-                position: args.position ?? cur.position,
-                isBold: args.is_bold ?? cur.isBold,
+                preset: (rawArgs.preset as CaptionPreset | undefined) ?? cur.preset,
+                fontFamily: String(
+                  rawArgs.font_family ?? rawArgs.fontFamily ?? cur.fontFamily,
+                ),
+                fontSize: Number.isFinite(rawFontSize)
+                  ? Math.max(14, Math.min(64, Math.round(rawFontSize)))
+                  : cur.fontSize,
+                textColor: nextTextCol,
+                highlightColor: nextHlCol,
+                position: (rawArgs.position as CaptionPosition | undefined) ?? cur.position,
+                isBold:
+                  typeof (rawArgs.is_bold ?? rawArgs.isBold) === 'boolean'
+                    ? Boolean(rawArgs.is_bold ?? rawArgs.isBold)
+                    : cur.isBold,
               },
             },
           };
@@ -985,7 +1244,389 @@ export const useEditorStore = create<EditorStoreState>()(
           },
         })),
 
-      // Shared AI Tool Call Dispatcher -> executes the exact same 13 functions
+      // 14. Speed controls
+      set_clip_speed: (clip_id, speed) =>
+        set((state) => {
+          const clamped = Math.max(0.25, Math.min(4.0, Number(speed) || 1));
+          const updated = state.project.tracks.clips.map((c) =>
+            c.id === clip_id ? { ...c, speed: clamped } : c,
+          );
+          return {
+            project: {
+              ...state.project,
+              tracks: {
+                ...state.project.tracks,
+                clips: recalculateTimeline(updated),
+              },
+            },
+          };
+        }),
+
+      set_range_speed: (start_time, end_time, speed) =>
+        set((state) => {
+          const sTl = Math.max(0, start_time);
+          const eTl = Math.max(sTl + 0.1, end_time);
+          const clamped = Math.max(0.25, Math.min(4.0, Number(speed) || 1));
+          const nextClips: ClipItem[] = [];
+          const selectedNewIds: string[] = [];
+
+          for (const clip of state.project.tracks.clips) {
+            const cStart = clip.timelineStart;
+            const cEnd = clip.timelineStart + clip.duration;
+            const spd = Math.max(0.25, Math.min(4.0, clip.speed ?? 1));
+            if (eTl <= cStart + 0.05 || sTl >= cEnd - 0.05) {
+              nextClips.push(clip);
+              continue;
+            }
+            const cutStartSrc =
+              sTl > cStart + 0.15
+                ? Number((clip.sourceStart + (sTl - cStart) * spd).toFixed(3))
+                : clip.sourceStart;
+            const cutEndSrc =
+              eTl < cEnd - 0.15
+                ? Number((clip.sourceStart + (eTl - cStart) * spd).toFixed(3))
+                : clip.sourceEnd;
+
+            if (cutStartSrc > clip.sourceStart + 0.05) {
+              nextClips.push({
+                ...clip,
+                id: makeId('clip'),
+                sourceEnd: cutStartSrc,
+                speed: spd,
+              });
+            }
+            const midId = makeId('clip');
+            selectedNewIds.push(midId);
+            nextClips.push({
+              ...clip,
+              id: midId,
+              sourceStart: cutStartSrc,
+              sourceEnd: cutEndSrc,
+              speed: clamped,
+            });
+            if (cutEndSrc < clip.sourceEnd - 0.05) {
+              nextClips.push({
+                ...clip,
+                id: makeId('clip'),
+                sourceStart: cutEndSrc,
+                speed: spd,
+              });
+            }
+          }
+
+          return {
+            project: {
+              ...state.project,
+              workspaceState: {
+                ...state.project.workspaceState,
+                selectedClipIds:
+                  selectedNewIds.length > 0
+                    ? selectedNewIds
+                    : state.project.workspaceState.selectedClipIds,
+              },
+              tracks: {
+                ...state.project.tracks,
+                clips: recalculateTimeline(nextClips),
+              },
+            },
+          };
+        }),
+
+      // 15. Zoom effects
+      add_zoom_effect: (item) => {
+        const id = makeId('zoom');
+        const start = Math.max(0, Number(item.start.toFixed(3)));
+        const end = Math.max(start + 0.25, Number(item.end.toFixed(3)));
+        const newZoom: ZoomEffectItem = {
+          ...item,
+          id,
+          start,
+          end,
+          startScale: Math.max(1.0, Math.min(3.0, item.startScale ?? 1.0)),
+          endScale: Math.max(1.0, Math.min(3.0, item.endScale ?? 1.35)),
+          focusX: Math.max(0.0, Math.min(1.0, item.focusX ?? 0.5)),
+          focusY: Math.max(0.0, Math.min(1.0, item.focusY ?? 0.5)),
+        };
+        set((state) => ({
+          selectedZoomId: id,
+          selectedDrawingId: null,
+          selectedSfxId: null,
+          project: {
+            ...state.project,
+            tracks: {
+              ...state.project.tracks,
+              zooms: [...(state.project.tracks.zooms ?? []), newZoom].sort(
+                (a, b) => a.start - b.start,
+              ),
+            },
+          },
+        }));
+        return id;
+      },
+
+      update_zoom_effect: (id, patch) =>
+        set((state) => ({
+          project: {
+            ...state.project,
+            tracks: {
+              ...state.project.tracks,
+              zooms: (state.project.tracks.zooms ?? []).map((z) => {
+                if (z.id !== id) return z;
+                const nextStart =
+                  patch.start !== undefined ? Math.max(0, Number(patch.start.toFixed(3))) : z.start;
+                const nextEnd =
+                  patch.end !== undefined
+                    ? Math.max(nextStart + 0.2, Number(patch.end.toFixed(3)))
+                    : Math.max(nextStart + 0.2, z.end);
+                return {
+                  ...z,
+                  ...patch,
+                  start: nextStart,
+                  end: nextEnd,
+                };
+              }),
+            },
+          },
+        })),
+
+      delete_zoom_effect: (id) =>
+        set((state) => ({
+          selectedZoomId: state.selectedZoomId === id ? null : state.selectedZoomId,
+          project: {
+            ...state.project,
+            tracks: {
+              ...state.project.tracks,
+              zooms: (state.project.tracks.zooms ?? []).filter((z) => z.id !== id),
+            },
+          },
+        })),
+
+      // 16. Drawing overlays
+      add_drawing: (item) => {
+        const id = makeId('draw');
+        const start = Math.max(0, Number(item.start.toFixed(3)));
+        const end = Math.max(start + 0.25, Number(item.end.toFixed(3)));
+        const newDrawing: DrawingItem = {
+          ...item,
+          id,
+          start,
+          end,
+          strokeWidth: Math.max(2, Math.min(24, item.strokeWidth ?? 6)),
+          opacity: Math.max(0.1, Math.min(1.0, item.opacity ?? 1.0)),
+        };
+        set((state) => ({
+          selectedDrawingId: id,
+          selectedZoomId: null,
+          selectedSfxId: null,
+          project: {
+            ...state.project,
+            tracks: {
+              ...state.project.tracks,
+              drawings: [...(state.project.tracks.drawings ?? []), newDrawing].sort(
+                (a, b) => a.start - b.start,
+              ),
+            },
+          },
+        }));
+        return id;
+      },
+
+      update_drawing: (id, patch) =>
+        set((state) => ({
+          project: {
+            ...state.project,
+            tracks: {
+              ...state.project.tracks,
+              drawings: (state.project.tracks.drawings ?? []).map((d) => {
+                if (d.id !== id) return d;
+                const nextStart =
+                  patch.start !== undefined ? Math.max(0, Number(patch.start.toFixed(3))) : d.start;
+                const nextEnd =
+                  patch.end !== undefined
+                    ? Math.max(nextStart + 0.2, Number(patch.end.toFixed(3)))
+                    : Math.max(nextStart + 0.2, d.end);
+                return {
+                  ...d,
+                  ...patch,
+                  start: nextStart,
+                  end: nextEnd,
+                };
+              }),
+            },
+          },
+        })),
+
+      delete_drawing: (id) =>
+        set((state) => ({
+          selectedDrawingId: state.selectedDrawingId === id ? null : state.selectedDrawingId,
+          project: {
+            ...state.project,
+            tracks: {
+              ...state.project.tracks,
+              drawings: (state.project.tracks.drawings ?? []).filter((d) => d.id !== id),
+            },
+          },
+        })),
+
+      // 17. SFX timeline clips
+      add_sfx_clip: (item) => {
+        const id = makeId('sfxclip');
+        const matchedAsset = get().sfxLibrary.find((a) => a.id === item.assetId);
+        const maxSourceDur =
+          matchedAsset && matchedAsset.duration > 0 ? matchedAsset.duration : null;
+        const start = Math.max(0, Number(item.start.toFixed(3)));
+        let trimStart = Math.max(0, Number((item.trimStart ?? 0).toFixed(3)));
+        if (maxSourceDur !== null) {
+          trimStart = Math.min(Math.max(0, maxSourceDur - 0.15), trimStart);
+        }
+        let duration = Math.max(0.15, Number((item.duration || 1.5).toFixed(3)));
+        if (maxSourceDur !== null) {
+          duration = Math.min(Math.max(0.15, maxSourceDur - trimStart), duration);
+        }
+        const volume = Math.max(0, Math.min(2.0, Number((item.volume ?? 0.85).toFixed(2))));
+        const newSfx: SfxClipItem = {
+          ...item,
+          id,
+          start,
+          duration: Number(duration.toFixed(3)),
+          trimStart: Number(trimStart.toFixed(3)),
+          volume,
+        };
+        set((state) => ({
+          selectedSfxId: id,
+          selectedZoomId: null,
+          selectedDrawingId: null,
+          project: {
+            ...state.project,
+            tracks: {
+              ...state.project.tracks,
+              sfx: [...(state.project.tracks.sfx ?? []), newSfx].sort(
+                (a, b) => a.start - b.start,
+              ),
+            },
+          },
+        }));
+        return id;
+      },
+
+      update_sfx_clip: (id, patch) =>
+        set((state) => ({
+          project: {
+            ...state.project,
+            tracks: {
+              ...state.project.tracks,
+              sfx: (state.project.tracks.sfx ?? []).map((sc) => {
+                if (sc.id !== id) return sc;
+                const matchedAsset = state.sfxLibrary.find((a) => a.id === sc.assetId);
+                const maxSourceDur =
+                  matchedAsset && matchedAsset.duration > 0 ? matchedAsset.duration : null;
+                const nextStart =
+                  patch.start !== undefined
+                    ? Math.max(0, Number(patch.start.toFixed(3)))
+                    : sc.start;
+                let nextTrimStart =
+                  patch.trimStart !== undefined
+                    ? Math.max(0, Number(patch.trimStart.toFixed(3)))
+                    : Math.max(0, sc.trimStart ?? 0);
+                if (maxSourceDur !== null) {
+                  nextTrimStart = Math.min(Math.max(0, maxSourceDur - 0.15), nextTrimStart);
+                }
+                let nextDur =
+                  patch.duration !== undefined
+                    ? Math.max(0.15, Number(patch.duration.toFixed(3)))
+                    : Math.max(0.15, sc.duration);
+                if (maxSourceDur !== null) {
+                  nextDur = Math.min(Math.max(0.15, maxSourceDur - nextTrimStart), nextDur);
+                }
+                const nextVol =
+                  patch.volume !== undefined
+                    ? Math.max(0, Math.min(2.0, Number(patch.volume.toFixed(2))))
+                    : sc.volume;
+                return {
+                  ...sc,
+                  ...patch,
+                  start: nextStart,
+                  trimStart: Number(nextTrimStart.toFixed(3)),
+                  duration: Number(nextDur.toFixed(3)),
+                  volume: nextVol,
+                };
+              }),
+            },
+          },
+        })),
+
+      delete_sfx_clip: (id) =>
+        set((state) => ({
+          selectedSfxId: state.selectedSfxId === id ? null : state.selectedSfxId,
+          project: {
+            ...state.project,
+            tracks: {
+              ...state.project.tracks,
+              sfx: (state.project.tracks.sfx ?? []).filter((sc) => sc.id !== id),
+            },
+          },
+        })),
+
+      // 18. Source video crop rectangle
+      set_video_crop: (crop) =>
+        set((state) => {
+          if (!crop) {
+            return {
+              project: {
+                ...state.project,
+                workspaceState: {
+                  ...state.project.workspaceState,
+                  crop: null,
+                },
+              },
+            };
+          }
+          const x = Math.max(0, Math.min(0.9, Number((crop.x ?? 0).toFixed(4))));
+          const y = Math.max(0, Math.min(0.9, Number((crop.y ?? 0).toFixed(4))));
+          const w = Math.max(0.1, Math.min(1 - x, Number((crop.w ?? 1).toFixed(4))));
+          const h = Math.max(0.1, Math.min(1 - y, Number((crop.h ?? 1).toFixed(4))));
+          const isFullFrame = x <= 0.005 && y <= 0.005 && w >= 0.99 && h >= 0.99;
+          const hasTimeWindow =
+            crop.start != null &&
+            crop.end != null &&
+            Number.isFinite(crop.start) &&
+            Number.isFinite(crop.end) &&
+            Number(crop.end) > Number(crop.start) + 0.1;
+          const nextCrop: VideoCropRect | null = isFullFrame
+            ? null
+            : hasTimeWindow
+              ? {
+                  x,
+                  y,
+                  w,
+                  h,
+                  start: Math.max(0, Number(Number(crop.start).toFixed(2))),
+                  end: Math.max(0.2, Number(Number(crop.end).toFixed(2))),
+                }
+              : { x, y, w, h };
+          return {
+            project: {
+              ...state.project,
+              workspaceState: {
+                ...state.project.workspaceState,
+                crop: nextCrop,
+              },
+            },
+          };
+        }),
+
+      reset_video_crop: () =>
+        set((state) => ({
+          project: {
+            ...state.project,
+            workspaceState: {
+              ...state.project.workspaceState,
+              crop: null,
+            },
+          },
+        })),
+
+      // Shared AI Tool Call Dispatcher -> executes the exact same 21 functions
       applyAiToolCalls: (toolCalls, autoCaptions) => {
         const actions: AiActionLogItem[] = [];
         const store = get();
@@ -1095,13 +1736,258 @@ export const useEditorStore = create<EditorStoreState>()(
               }
               case 'change_caption_style': {
                 store.change_caption_style(args as ChangeCaptionStyleArgs);
-                summary = `Updated caption style${args.preset ? ` (${String(args.preset)})` : ''}`;
+                const details: string[] = [];
+                if (args.preset) details.push(String(args.preset));
+                if (args.text_color || args.color)
+                  details.push(`text ${String(args.text_color || args.color)}`);
+                if (args.highlight_color)
+                  details.push(`highlight ${String(args.highlight_color)}`);
+                if (args.position) details.push(String(args.position));
+                summary = `Updated caption style${details.length > 0 ? ` (${details.join(', ')})` : ''}`;
                 break;
               }
               case 'change_video_format': {
                 const ratio = (args.aspect_ratio as AspectRatio) || '16:9';
                 store.change_video_format(ratio);
                 summary = `Changed format to ${ratio}`;
+                break;
+              }
+              case 'set_clip_speed': {
+                const spd = Math.max(0.25, Math.min(4.0, Number(args.speed ?? 1)));
+                if (args.start_time != null && args.end_time != null) {
+                  const st = Number(args.start_time);
+                  const en = Number(args.end_time);
+                  store.set_range_speed(st, en, spd);
+                  summary = `Set ${st.toFixed(1)}s–${en.toFixed(1)}s speed to ${spd}x`;
+                } else {
+                  const liveProj = get().project;
+                  const targetClipId =
+                    (args.clip_id as string | undefined) ||
+                    liveProj.workspaceState.selectedClipIds[0] ||
+                    liveProj.tracks.clips[0]?.id;
+                  if (targetClipId) {
+                    store.set_clip_speed(String(targetClipId), spd);
+                    summary = `Set clip speed to ${spd}x`;
+                  } else {
+                    summary = 'No active clip to change speed';
+                  }
+                }
+                break;
+              }
+              case 'add_zoom_effect': {
+                const kind = (args.kind as ZoomKind) || 'punch_in';
+                const playheadNow = get().project.workspaceState.playheadPosition;
+                const start = Number(args.start ?? playheadNow ?? 0);
+                const end = Number(args.end ?? start + 2.0);
+                const startScale = Number(
+                  args.start_scale ?? args.startScale ?? (kind === 'zoom_out' ? 1.4 : 1.0),
+                );
+                const endScale = Number(
+                  args.end_scale ?? args.endScale ?? (kind === 'zoom_out' ? 1.0 : 1.4),
+                );
+                const focusX = Number(args.focus_x ?? args.focusX ?? 0.5);
+                const focusY = Number(args.focus_y ?? args.focusY ?? 0.5);
+                const easing =
+                  (args.easing as ZoomEasing) ||
+                  (kind === 'punch_in' ? 'instant' : 'ease_in_out');
+                store.add_zoom_effect({
+                  start,
+                  end,
+                  kind,
+                  startScale,
+                  endScale,
+                  focusX,
+                  focusY,
+                  easing,
+                });
+                summary = `Added ${kind.replace('_', ' ')} (${start.toFixed(1)}s–${end.toFixed(1)}s)`;
+                break;
+              }
+              case 'delete_zoom_effect': {
+                const reqZoomId = String(args.zoom_id || '').trim();
+                const currentZooms = get().project.tracks.zooms ?? [];
+                const exactZoom = currentZooms.find((z) => z.id === reqZoomId);
+                if (exactZoom) {
+                  store.delete_zoom_effect(exactZoom.id);
+                  summary = `Removed zoom (${exactZoom.start.toFixed(1)}s–${exactZoom.end.toFixed(1)}s)`;
+                } else if (currentZooms.length > 0) {
+                  const fallbackZoom = currentZooms[currentZooms.length - 1];
+                  store.delete_zoom_effect(fallbackZoom.id);
+                  summary = `Removed zoom (${fallbackZoom.start.toFixed(1)}s–${fallbackZoom.end.toFixed(1)}s)`;
+                } else {
+                  summary = 'No active zoom to remove';
+                }
+                break;
+              }
+              case 'add_drawing': {
+                const tool = (args.tool as DrawingTool) || 'arrow';
+                const playheadNow = get().project.workspaceState.playheadPosition;
+                const start = Number(args.start ?? playheadNow ?? 0);
+                const end = Number(args.end ?? start + 2.5);
+                const rawPts = Array.isArray(args.points) ? args.points : [];
+                const parsedPts: DrawingPoint[] = rawPts
+                  .map((pt) => {
+                    const obj = pt as { x?: unknown; y?: unknown };
+                    return {
+                      x: Math.max(0, Math.min(1, Number(obj?.x ?? 0.5))),
+                      y: Math.max(0, Math.min(1, Number(obj?.y ?? 0.5))),
+                    };
+                  })
+                  .filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y));
+                const points =
+                  parsedPts.length >= 2
+                    ? parsedPts
+                    : [
+                        { x: 0.25, y: 0.28 },
+                        { x: 0.5, y: 0.48 },
+                      ];
+                const color = String(args.color || '#EF4444');
+                const strokeWidth = Number(args.stroke_width ?? args.strokeWidth ?? 6);
+                const opacity = Number(args.opacity ?? 1.0);
+                store.add_drawing({
+                  start,
+                  end,
+                  tool,
+                  points,
+                  color,
+                  strokeWidth,
+                  opacity,
+                });
+                summary = `Drew ${tool} (${start.toFixed(1)}s–${end.toFixed(1)}s)`;
+                break;
+              }
+              case 'delete_drawing': {
+                const reqDrawId = String(args.drawing_id || '').trim();
+                const curDrawings = get().project.tracks.drawings ?? [];
+                const exactDraw = curDrawings.find((d) => d.id === reqDrawId);
+                if (exactDraw) {
+                  store.delete_drawing(exactDraw.id);
+                  summary = `Deleted ${exactDraw.tool} drawing`;
+                } else if (curDrawings.length > 0) {
+                  const fallbackDraw = curDrawings[curDrawings.length - 1];
+                  store.delete_drawing(fallbackDraw.id);
+                  summary = `Deleted ${fallbackDraw.tool} drawing`;
+                } else {
+                  summary = 'No active drawing to delete';
+                }
+                break;
+              }
+              case 'add_sfx_clip': {
+                const lib = get().sfxLibrary;
+                const reqAssetId = String(args.asset_id || '').trim();
+                const reqQuery = String(args.sfx_name || args.name || '').trim().toLowerCase();
+                let asset = lib.find((a) => a.id === reqAssetId);
+                if (!asset && reqQuery) {
+                  asset =
+                    lib.find(
+                      (a) =>
+                        a.name.toLowerCase().includes(reqQuery) ||
+                        a.tags.some((t) => reqQuery.includes(t.toLowerCase())),
+                    ) ?? undefined;
+                }
+                if (!asset && lib.length > 0 && !args.url) {
+                  asset = lib[0];
+                }
+                const resolvedUrl = String(args.url || asset?.url || '').trim();
+                const resolvedAssetId = asset?.id || reqAssetId || makeId('asset');
+                const resolvedName = String(
+                  args.name || args.sfx_name || asset?.name || 'Custom SFX',
+                );
+                const resolvedDur = Number(args.duration ?? asset?.duration ?? 1.5);
+                const trimStart = Number(args.trim_start ?? args.trimStart ?? 0);
+                const playheadNow = get().project.workspaceState.playheadPosition;
+                const start = Number(args.start ?? playheadNow ?? 0);
+                const volume = Number(args.volume ?? 0.85);
+                if (resolvedUrl) {
+                  store.add_sfx_clip({
+                    assetId: resolvedAssetId,
+                    name: resolvedName,
+                    url: resolvedUrl,
+                    start,
+                    duration: resolvedDur,
+                    trimStart,
+                    volume,
+                  });
+                  summary = `Added SFX '${resolvedName}' at ${start.toFixed(1)}s`;
+                } else {
+                  summary = 'No custom MP3 SFX uploaded yet';
+                }
+                break;
+              }
+              case 'trim_sfx_clip': {
+                const reqSfxId = String(args.sfx_id || '').trim();
+                const reqSfxName = String(args.sfx_name || args.name || '')
+                  .trim()
+                  .toLowerCase();
+                const curSfx = get().project.tracks.sfx ?? [];
+                const selectedId = get().selectedSfxId;
+                const targetSfx =
+                  curSfx.find((s) => s.id === reqSfxId) ||
+                  (reqSfxName
+                    ? curSfx.find((s) => s.name.toLowerCase().includes(reqSfxName))
+                    : undefined) ||
+                  curSfx.find((s) => s.id === selectedId) ||
+                  curSfx[curSfx.length - 1];
+                if (targetSfx) {
+                  const patch: Partial<SfxClipItem> = {};
+                  if (args.trim_start != null || args.trimStart != null) {
+                    patch.trimStart = Math.max(
+                      0,
+                      Number(args.trim_start ?? args.trimStart ?? 0),
+                    );
+                  }
+                  if (args.duration != null) {
+                    patch.duration = Math.max(0.15, Number(args.duration));
+                  }
+                  if (args.start != null) {
+                    patch.start = Math.max(0, Number(args.start));
+                  }
+                  store.update_sfx_clip(targetSfx.id, patch);
+                  summary = `Trimmed SFX '${targetSfx.name}'`;
+                } else {
+                  summary = 'No active SFX clip to trim';
+                }
+                break;
+              }
+              case 'delete_sfx_clip': {
+                const reqSfxId = String(args.sfx_id || '').trim();
+                const curSfx = get().project.tracks.sfx ?? [];
+                const exactSfx = curSfx.find((s) => s.id === reqSfxId);
+                if (exactSfx) {
+                  store.delete_sfx_clip(exactSfx.id);
+                  summary = `Deleted SFX '${exactSfx.name}'`;
+                } else if (curSfx.length > 0) {
+                  const fallbackSfx = curSfx[curSfx.length - 1];
+                  store.delete_sfx_clip(fallbackSfx.id);
+                  summary = `Deleted SFX '${fallbackSfx.name}'`;
+                } else {
+                  summary = 'No active SFX clip to delete';
+                }
+                break;
+              }
+              case 'set_video_crop': {
+                const x = Number(args.x ?? 0);
+                const y = Number(args.y ?? 0);
+                const w = Number(args.w ?? 1);
+                const h = Number(args.h ?? 1);
+                const start =
+                  args.start != null && Number.isFinite(Number(args.start))
+                    ? Number(args.start)
+                    : undefined;
+                const end =
+                  args.end != null && Number.isFinite(Number(args.end))
+                    ? Number(args.end)
+                    : undefined;
+                store.set_video_crop({ x, y, w, h, start, end });
+                const isReset = x <= 0.005 && y <= 0.005 && w >= 0.99 && h >= 0.99;
+                if (!isReset && start !== undefined && end !== undefined && end > start) {
+                  store.setPlayheadPosition(start);
+                }
+                summary = isReset
+                  ? 'Reset video crop to full frame'
+                  : start !== undefined && end !== undefined && end > start
+                    ? `Cropped frame (${Math.round(w * 100)}% x ${Math.round(h * 100)}% from ${start.toFixed(1)}s to ${end.toFixed(1)}s)`
+                    : `Cropped frame (${Math.round(w * 100)}% x ${Math.round(h * 100)}%)`;
                 break;
               }
               default:
@@ -1136,12 +2022,16 @@ export const useEditorStore = create<EditorStoreState>()(
         const effectivePrompt = (initialPrompt ?? get().ingestPrompt ?? '').trim();
         const isDemo = ['demo://sample', 'sample', 'demo'].includes(youtubeUrl.trim().toLowerCase());
         const useClipOnly = Boolean(effectivePrompt && !isDemo);
+        const prevOverlayStyle =
+          get().project.workspaceState.overlayStyle ?? DEFAULT_OVERLAY_STYLE;
+        const activeCampaign = getCampaignById(get().project.workspaceState.activeCampaignId);
+        const campaignPrefix = activeCampaign ? `[${activeCampaign.label}] ` : '';
         set({
           isIngesting: true,
           pendingYoutubeUrl: youtubeUrl,
           statusBanner: useClipOnly
-            ? `Scanning audio + transcript & downloading ONLY matching clip(s) for "${effectivePrompt}" (Low-Storage Mode)...`
-            : 'Downloading video (<=1080p) & running Groq Whisper transcription...',
+            ? `${campaignPrefix}Scanning captions/heatmap & downloading ONLY matching clip(s) for "${effectivePrompt}" (Low-Storage Mode)...`
+            : `${campaignPrefix}Downloading video (<=1080p) & running Groq Whisper transcription...`,
         });
         try {
           const resp = await fetch(`${API_BASE}/api/ingest`, {
@@ -1151,6 +2041,10 @@ export const useEditorStore = create<EditorStoreState>()(
               youtube_url: youtubeUrl,
               initial_prompt: useClipOnly ? effectivePrompt : undefined,
               clip_only: useClipOnly,
+              campaign_id: activeCampaign?.id,
+              campaign_rules: activeCampaign?.editingRules ?? [],
+              overlay_text: activeCampaign?.overlayText,
+              overlay_style: prevOverlayStyle,
             }),
           });
           if (!resp.ok) {
@@ -1166,6 +2060,7 @@ export const useEditorStore = create<EditorStoreState>()(
                 id: `u_ingest_${Date.now()}`,
                 role: 'user',
                 content: effectivePrompt,
+                campaignLabel: activeCampaign?.label,
               });
             }
             newMessages.push({
@@ -1177,13 +2072,50 @@ export const useEditorStore = create<EditorStoreState>()(
             const clipDur = Number(data.project?.sourceVideo?.originalDuration || 0);
             const savedPct =
               typeof data.storage_saved_pct === 'number' ? data.storage_saved_pct : 0;
-            nextBanner = `Smart Clip Ingest complete: downloaded only ${clipDur.toFixed(1)}s (saved ~${savedPct}% storage).`;
+            nextBanner = `${campaignPrefix}Smart Clip Ingest complete: downloaded only ${clipDur.toFixed(1)}s (saved ~${savedPct}% storage).`;
+          }
+          const loadedProject: ProjectState = {
+            ...data.project,
+            workspaceState: {
+              ...data.project.workspaceState,
+              activeCampaignId:
+                data.project?.workspaceState?.activeCampaignId ?? activeCampaign?.id ?? null,
+              overlayText:
+                data.project?.workspaceState?.overlayText ?? activeCampaign?.overlayText ?? null,
+              overlayStyle:
+                data.project?.workspaceState?.overlayStyle ?? prevOverlayStyle,
+            },
+            tracks: {
+              clips: recalculateTimeline(data.project?.tracks?.clips ?? []),
+              captions: data.project?.tracks?.captions ?? [],
+              zooms: data.project?.tracks?.zooms ?? [],
+              drawings: data.project?.tracks?.drawings ?? [],
+              sfx: data.project?.tracks?.sfx ?? [],
+            },
+          };
+          if (activeCampaign) {
+            const notice = buildCampaignAssistantNotice(
+              activeCampaign,
+              loadedProject.projectName,
+            );
+            newMessages.push({
+              id: `a_campaign_upload_${Date.now() + 2}`,
+              role: 'assistant',
+              content: notice.content,
+              campaignLabel: activeCampaign.label,
+              copyableCaption: notice.copyableCaption,
+            });
           }
           set({
-            project: data.project,
+            project: loadedProject,
             transcript: data.transcript,
             aiMessages: newMessages,
             isPlaying: false,
+            isCropMode: false,
+            activeDrawTool: null,
+            selectedZoomId: null,
+            selectedDrawingId: null,
+            selectedSfxId: null,
             statusBanner: nextBanner,
           });
           // Clear undo history on fresh ingest so undo only reverts edits on this project
@@ -1241,6 +2173,98 @@ export const useEditorStore = create<EditorStoreState>()(
           }
         }
       },
+
+      fetchSfxLibrary: async () => {
+        set({ isLoadingSfx: true });
+        try {
+          const resp = await fetch(`${API_BASE}/api/sfx`);
+          if (!resp.ok) return;
+          const data = await resp.json();
+          const items = Array.isArray(data.items) ? (data.items as SfxAsset[]) : [];
+          set({ sfxLibrary: items });
+        } catch {
+          // Ignore network glitches during background library poll
+        } finally {
+          set({ isLoadingSfx: false });
+        }
+      },
+
+      uploadSfxFiles: async (files, tags) => {
+        const list = Array.from(files);
+        if (list.length === 0) return [];
+        set({ isLoadingSfx: true });
+        const uploaded: SfxAsset[] = [];
+        try {
+          for (const file of list) {
+            const fd = new FormData();
+            fd.append('file', file);
+            if (tags && tags.length > 0) {
+              fd.append('tags', tags.join(','));
+            }
+            const resp = await fetch(`${API_BASE}/api/sfx/upload`, {
+              method: 'POST',
+              body: fd,
+            });
+            if (!resp.ok) {
+              const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+              throw new Error(err.detail || `Failed uploading ${file.name}`);
+            }
+            const data = await resp.json();
+            if (data.asset) {
+              uploaded.push(data.asset as SfxAsset);
+            }
+          }
+          await get().fetchSfxLibrary();
+          if (uploaded.length > 0) {
+            set({
+              statusBanner: `Uploaded ${uploaded.length} custom SFX file(s) to your library.`,
+            });
+          }
+          return uploaded;
+        } catch (err) {
+          set({
+            statusBanner: `SFX upload error: ${err instanceof Error ? err.message : String(err)}`,
+          });
+          return uploaded;
+        } finally {
+          set({ isLoadingSfx: false });
+        }
+      },
+
+      updateSfxAssetMeta: async (sfxId, patch) => {
+        try {
+          const resp = await fetch(`${API_BASE}/api/sfx/${encodeURIComponent(sfxId)}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(patch),
+          });
+          if (!resp.ok) return;
+          const data = await resp.json();
+          if (data.asset) {
+            const updated = data.asset as SfxAsset;
+            set((state) => ({
+              sfxLibrary: state.sfxLibrary.map((a) => (a.id === sfxId ? updated : a)),
+            }));
+          }
+        } catch {
+          // Non-fatal
+        }
+      },
+
+      deleteSfxAssetFromLibrary: async (sfxId) => {
+        try {
+          const resp = await fetch(`${API_BASE}/api/sfx/${encodeURIComponent(sfxId)}`, {
+            method: 'DELETE',
+          });
+          if (resp.ok) {
+            set((state) => ({
+              sfxLibrary: state.sfxLibrary.filter((a) => a.id !== sfxId),
+            }));
+          }
+        } catch {
+          // Non-fatal
+        }
+      },
     }),
     {
       partialize: (state) => ({ project: state.project }),
@@ -1252,7 +2276,11 @@ export const useEditorStore = create<EditorStoreState>()(
           a.projectName === b.projectName &&
           a.tracks === b.tracks &&
           a.captionStyle === b.captionStyle &&
-          a.workspaceState.targetAspectRatio === b.workspaceState.targetAspectRatio
+          a.workspaceState.targetAspectRatio === b.workspaceState.targetAspectRatio &&
+          a.workspaceState.activeCampaignId === b.workspaceState.activeCampaignId &&
+          a.workspaceState.overlayText === b.workspaceState.overlayText &&
+          a.workspaceState.overlayStyle === b.workspaceState.overlayStyle &&
+          a.workspaceState.crop === b.workspaceState.crop
         );
       },
       limit: 50,

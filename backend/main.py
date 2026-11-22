@@ -4,11 +4,11 @@ import json
 import os
 from pathlib import Path
 import re
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Optional, Set
 import uuid
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
@@ -25,14 +25,25 @@ from schemas import (
     HeatmapPoint,
     IngestRequest,
     IngestResponse,
+    OverlayStyle,
     ProjectSaveRequest,
     ProjectState,
+    ReferenceStyleRequest,
+    ReferenceStyleResponse,
+    SfxUpdateRequest,
     SourceVideo,
     SubtitleExportRequest,
     TracksState,
     WorkspaceState,
 )
-from services.ai_orchestrator import _run_gemini_viral_pipeline, process_ai_edit
+from services.ai_orchestrator import (
+    _deterministic_viral_fallback,
+    _extract_top_heatmap_peaks,
+    _format_timeline_transcript_for_llm,
+    _normalize_color_to_hex,
+    _run_gemini_viral_pipeline,
+    process_ai_edit,
+)
 from services.ass_subtitles import (
     generate_ass_subtitles,
     generate_srt_content,
@@ -44,17 +55,27 @@ from services.model_registry import (
     get_registry_state,
     refresh_models,
 )
+from services.reference_style import clone_reference_style_for_project
+from services.sfx_library import (
+    delete_sfx_asset,
+    list_sfx_assets,
+    save_uploaded_sfx,
+    update_sfx_metadata,
+)
 from services.transcription import (
     build_captions_from_transcript,
     detect_pause_gaps,
     load_cached_transcript,
     transcribe_audio_groq,
+    transcribe_audio_slices_groq,
     transcribe_voice_blob,
 )
 from services.youtube_ingest import (
+    IngestValidationError,
     download_youtube_clip_segments,
     extract_youtube_audio_and_meta,
     ingest_youtube_video,
+    parse_explicit_clip_range,
     remap_clips_and_transcript_for_segments,
 )
 
@@ -64,7 +85,7 @@ WORKSPACE_DIR = ROOT_DIR / "workspace_data"
 
 load_dotenv(BASE_DIR / ".env")
 
-for sub in ("downloads", "transcripts", "projects", "exports"):
+for sub in ("downloads", "transcripts", "projects", "exports", "sfx"):
     (WORKSPACE_DIR / sub).mkdir(parents=True, exist_ok=True)
 
 async def _periodic_model_refresh_loop() -> None:
@@ -76,8 +97,26 @@ async def _periodic_model_refresh_loop() -> None:
             pass
 
 
+def _disable_windows_quick_edit() -> None:
+    """Prevents accidental CMD clicks from entering Select mode and freezing Uvicorn."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            new_mode = (mode.value & ~0x0040) | 0x0080  # clear ENABLE_QUICK_EDIT_MODE, keep ENABLE_EXTENDED_FLAGS
+            kernel32.SetConsoleMode(handle, new_mode)
+    except Exception:
+        pass
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    _disable_windows_quick_edit()
     init_task = asyncio.create_task(asyncio.to_thread(get_registry_state, False))
     refresh_task = asyncio.create_task(_periodic_model_refresh_loop())
     try:
@@ -182,6 +221,10 @@ async def ingest_video_endpoint(req: IngestRequest) -> IngestResponse:
     try:
         initial_prompt = (req.initial_prompt or "").strip()
         is_demo_url = req.youtube_url.strip().lower() in {"demo://sample", "sample", "demo"}
+        campaign_overlay = (
+            req.overlay_text or ("LACY" if req.campaign_id == "lacy_campaign" else "")
+        ).strip() or None
+        resolved_overlay_style = req.overlay_style or OverlayStyle()
 
         if initial_prompt and req.clip_only and not is_demo_url:
             project_id = f"proj_{uuid.uuid4().hex[:8]}"
@@ -196,14 +239,26 @@ async def ingest_video_endpoint(req: IngestRequest) -> IngestResponse:
                 downloads_dir,
                 initial_prompt,
             )
-            full_duration = float(meta["duration"])
-            full_video_duration = float(meta.get("full_duration") or full_duration)
+            source_span_duration = float(meta["duration"])
+            full_video_duration = float(meta.get("full_duration") or source_span_duration)
+            transcribed_window_duration = float(
+                meta.get("transcribed_window_duration") or source_span_duration
+            )
             try:
                 if meta.get("prefetched_transcript"):
                     full_transcript = meta["prefetched_transcript"]
                     full_transcript_path.parent.mkdir(parents=True, exist_ok=True)
                     full_transcript_path.write_text(
-                        json.dumps(full_transcript, indent=2), encoding="utf-8"
+                        json.dumps(full_transcript, separators=(",", ":")),
+                        encoding="utf-8",
+                    )
+                elif meta.get("audio_slices"):
+                    full_transcript = await asyncio.to_thread(
+                        transcribe_audio_slices_groq,
+                        project_id=f"{project_id}_full",
+                        audio_slices=meta["audio_slices"],
+                        transcripts_dir=transcripts_dir,
+                        duration=full_video_duration,
                     )
                 else:
                     full_transcript = await asyncio.to_thread(
@@ -211,7 +266,7 @@ async def ingest_video_endpoint(req: IngestRequest) -> IngestResponse:
                         project_id=f"{project_id}_full",
                         audio_path=meta["audio_path"],
                         transcripts_dir=transcripts_dir,
-                        duration=full_duration,
+                        duration=source_span_duration,
                         is_demo=False,
                     )
 
@@ -223,7 +278,7 @@ async def ingest_video_endpoint(req: IngestRequest) -> IngestResponse:
                         videoUrl="",
                         title=meta["title"],
                         thumbnail=meta["thumbnail"],
-                        originalDuration=full_duration,
+                        originalDuration=source_span_duration,
                         heatmap=[HeatmapPoint(**pt) for pt in meta["heatmap"]],
                         audioPeaks=[],
                     ),
@@ -232,6 +287,9 @@ async def ingest_video_endpoint(req: IngestRequest) -> IngestResponse:
                         selectedClipIds=["clip_full"],
                         selectedTimeRange=None,
                         targetAspectRatio="16:9",
+                        activeCampaignId=req.campaign_id,
+                        overlayText=campaign_overlay,
+                        overlayStyle=resolved_overlay_style,
                     ),
                     tracks=TracksState(
                         clips=[
@@ -239,9 +297,9 @@ async def ingest_video_endpoint(req: IngestRequest) -> IngestResponse:
                                 id="clip_full",
                                 title=meta["title"][:48],
                                 sourceStart=0.0,
-                                sourceEnd=round(full_duration, 2),
+                                sourceEnd=round(source_span_duration, 2),
                                 timelineStart=0.0,
-                                duration=round(full_duration, 2),
+                                duration=round(source_span_duration, 2),
                             )
                         ],
                         captions=[],
@@ -249,12 +307,19 @@ async def ingest_video_endpoint(req: IngestRequest) -> IngestResponse:
                     captionStyle=CaptionStyle(),
                 )
 
+                print(
+                    f"[Ingest] Running AI clip discovery ({round(source_span_duration, 1)}s span, "
+                    f"{len(full_transcript.get('segments') or [])} transcript segs)...",
+                    flush=True,
+                )
                 ai_res = await asyncio.to_thread(
-                    process_ai_edit,
-                    prompt=initial_prompt,
-                    project_state=temp_project,
-                    transcripts_dir=transcripts_dir,
-                    history=[],
+                    _run_gemini_viral_pipeline,
+                    initial_prompt,
+                    temp_project,
+                    full_transcript,
+                    req.campaign_id,
+                    req.campaign_rules,
+                    meta.get("chapters"),
                 )
                 clip_ranges: List[Dict[str, Any]] = []
                 target_ratio = "16:9"
@@ -271,9 +336,15 @@ async def ingest_video_endpoint(req: IngestRequest) -> IngestResponse:
                         except (TypeError, ValueError):
                             pass
                     if isinstance(s_args.get("text_color"), str) and s_args["text_color"].strip():
-                        style_obj.textColor = s_args["text_color"].strip()
+                        style_obj.textColor = (
+                            _normalize_color_to_hex(s_args["text_color"])
+                            or s_args["text_color"].strip()
+                        )
                     if isinstance(s_args.get("highlight_color"), str) and s_args["highlight_color"].strip():
-                        style_obj.highlightColor = s_args["highlight_color"].strip()
+                        style_obj.highlightColor = (
+                            _normalize_color_to_hex(s_args["highlight_color"])
+                            or s_args["highlight_color"].strip()
+                        )
                     if s_args.get("position") in {"top", "middle", "bottom"}:
                         style_obj.position = s_args["position"]
                     if isinstance(s_args.get("is_bold"), bool):
@@ -294,31 +365,29 @@ async def ingest_video_endpoint(req: IngestRequest) -> IngestResponse:
                         _apply_style_args(caption_style, tc.arguments)
 
                 if not clip_ranges:
-                    ai_res = await asyncio.to_thread(
-                        _run_gemini_viral_pipeline,
+                    fb_res = _deterministic_viral_fallback(
                         initial_prompt,
                         temp_project,
                         full_transcript,
+                        _extract_top_heatmap_peaks(temp_project),
                     )
-                    for tc in ai_res.tool_calls:
+                    for tc in fb_res.tool_calls:
                         if tc.name == "isolate_highlight_clips" and isinstance(
                             tc.arguments.get("clips"), list
                         ):
                             clip_ranges.extend(tc.arguments["clips"])
-                        elif tc.name == "change_video_format" and tc.arguments.get(
-                            "aspect_ratio"
-                        ) in {"16:9", "9:16", "1:1"}:
-                            target_ratio = str(tc.arguments["aspect_ratio"])
-                        elif tc.name == "change_caption_style" and isinstance(tc.arguments, dict):
-                            _apply_style_args(caption_style, tc.arguments)
 
+                allow_long_clips = bool(
+                    parse_explicit_clip_range(initial_prompt, full_video_duration)
+                )
                 seg_data = await asyncio.to_thread(
                     download_youtube_clip_segments,
                     req.youtube_url,
                     project_id,
                     downloads_dir,
                     clip_ranges,
-                    full_duration,
+                    source_span_duration,
+                    allow_long_clips,
                 )
 
                 (
@@ -331,7 +400,7 @@ async def ingest_video_endpoint(req: IngestRequest) -> IngestResponse:
                     seg_data["normalized_ranges"],
                     full_transcript,
                     meta["heatmap"],
-                    full_duration,
+                    source_span_duration,
                 )
 
                 final_duration = float(seg_data["duration"] or total_clip_duration)
@@ -365,6 +434,9 @@ async def ingest_video_endpoint(req: IngestRequest) -> IngestResponse:
                         selectedClipIds=[clips[0].id] if clips else [],
                         selectedTimeRange=None,
                         targetAspectRatio=target_ratio,  # type: ignore[arg-type]
+                        activeCampaignId=req.campaign_id,
+                        overlayText=campaign_overlay,
+                        overlayStyle=resolved_overlay_style,
                     ),
                     tracks=TracksState(
                         clips=clips,
@@ -376,11 +448,16 @@ async def ingest_video_endpoint(req: IngestRequest) -> IngestResponse:
                 proj_file = WORKSPACE_DIR / "projects" / f"{project.projectId}.json"
                 proj_file.write_text(project.model_dump_json(indent=2), encoding="utf-8")
 
+                scan_note = (
+                    f"sampled {round(transcribed_window_duration, 1)}s peak audio slices; "
+                    if meta.get("audio_slices")
+                    else ""
+                )
                 return IngestResponse(
                     project=project,
                     transcript=remapped_transcript,
                     ai_message=(
-                        f"{ai_res.message} (Low-storage clip ingest: downloaded "
+                        f"{ai_res.message} (Low-storage clip ingest: {scan_note}downloaded "
                         f"{round(final_duration, 1)}s of {round(full_video_duration, 1)}s total, "
                         f"saved ~{storage_saved_pct}% storage.)"
                     ),
@@ -391,6 +468,9 @@ async def ingest_video_endpoint(req: IngestRequest) -> IngestResponse:
                 full_transcript_path.unlink(missing_ok=True)
                 if meta.get("audio_path"):
                     Path(meta["audio_path"]).unlink(missing_ok=True)
+                for sl in meta.get("audio_slices") or []:
+                    if isinstance(sl, dict) and sl.get("path"):
+                        Path(sl["path"]).unlink(missing_ok=True)
 
         ingest_data = await ingest_youtube_video(
             req.youtube_url, WORKSPACE_DIR, base_url="http://localhost:8000"
@@ -405,6 +485,11 @@ async def ingest_video_endpoint(req: IngestRequest) -> IngestResponse:
         )
 
         duration = float(ingest_data["duration"])
+        full_captions = (
+            build_captions_from_transcript(transcript)
+            if (req.campaign_id and transcript)
+            else []
+        )
         project = ProjectState(
             projectId=ingest_data["project_id"],
             projectName=req.project_name or ingest_data["title"],
@@ -422,6 +507,9 @@ async def ingest_video_endpoint(req: IngestRequest) -> IngestResponse:
                 selectedClipIds=["clip_1"],
                 selectedTimeRange=None,
                 targetAspectRatio="16:9",
+                activeCampaignId=req.campaign_id,
+                overlayText=campaign_overlay,
+                overlayStyle=resolved_overlay_style,
             ),
             tracks=TracksState(
                 clips=[
@@ -434,7 +522,7 @@ async def ingest_video_endpoint(req: IngestRequest) -> IngestResponse:
                         duration=round(duration, 2),
                     )
                 ],
-                captions=[],
+                captions=full_captions,
             ),
             captionStyle=CaptionStyle(),
         )
@@ -443,8 +531,13 @@ async def ingest_video_endpoint(req: IngestRequest) -> IngestResponse:
         proj_file.write_text(project.model_dump_json(indent=2), encoding="utf-8")
 
         return IngestResponse(project=project, transcript=transcript)
+    except HTTPException:
+        raise
+    except IngestValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         clean_err = re.sub(r"\x1b\[[0-9;]*m", "", str(exc)).strip()
+        print(f"[Ingest] ERROR: {clean_err}", flush=True)
         raise HTTPException(status_code=500, detail=f"Ingest failed: {clean_err}") from exc
 
 
@@ -458,9 +551,106 @@ async def ai_edit_endpoint(req: AiEditRequest) -> AiEditResponse:
             project_state=req.project_state,
             transcripts_dir=WORKSPACE_DIR / "transcripts",
             history=req.history,
+            campaign_id=req.campaign_id,
+            campaign_rules=req.campaign_rules,
+            sfx_dir=WORKSPACE_DIR / "sfx",
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"AI edit error: {exc}") from exc
+
+
+@app.post("/api/reference-style", response_model=ReferenceStyleResponse)
+async def reference_style_endpoint(req: ReferenceStyleRequest) -> ReferenceStyleResponse:
+    ref_url = req.reference_url.strip()
+    if not ref_url:
+        raise HTTPException(status_code=400, detail="reference_url is required.")
+    try:
+        safe_id = _sanitize_project_id(req.project_state.projectId)
+    except Exception:
+        safe_id = req.project_state.projectId
+
+    transcript = load_cached_transcript(safe_id, WORKSPACE_DIR / "transcripts")
+    sfx_assets = await asyncio.to_thread(list_sfx_assets, WORKSPACE_DIR / "sfx")
+    tl_text = _format_timeline_transcript_for_llm(
+        transcript, req.project_state.tracks.clips, max_segments=40, max_chars=3500
+    )
+    try:
+        profile, tool_calls, auto_captions, summary_msg, route_label = await asyncio.to_thread(
+            clone_reference_style_for_project,
+            ref_url,
+            req.project_state,
+            transcript,
+            sfx_assets,
+            WORKSPACE_DIR / "downloads",
+            req.custom_instruction,
+            tl_text,
+        )
+        return ReferenceStyleResponse(
+            profile=profile,
+            message=summary_msg,
+            tool_calls=tool_calls,
+            auto_captions=auto_captions,
+            route_used=route_label,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Reference style analysis failed: {exc}") from exc
+
+
+@app.get("/api/sfx")
+async def list_sfx_endpoint() -> Dict[str, Any]:
+    assets = await asyncio.to_thread(list_sfx_assets, WORKSPACE_DIR / "sfx")
+    return {"items": [a.model_dump() for a in assets]}
+
+
+@app.post("/api/sfx/upload")
+async def upload_sfx_endpoint(
+    file: UploadFile = File(...),
+    name: Optional[str] = Form(None),
+    tags: Optional[str] = Form(None),
+    description: Optional[str] = Form(""),
+) -> Dict[str, Any]:
+    raw = await file.read()
+    parsed_tags: Optional[List[str]] = None
+    if tags is not None and tags.strip():
+        parsed_tags = [t.strip() for t in tags.split(",") if t.strip()]
+    try:
+        asset = await asyncio.to_thread(
+            save_uploaded_sfx,
+            WORKSPACE_DIR / "sfx",
+            file.filename or "sfx.mp3",
+            raw,
+            name=name,
+            tags=parsed_tags,
+            description=description or "",
+        )
+        return {"asset": asset.model_dump()}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"SFX upload failed: {exc}") from exc
+
+
+@app.patch("/api/sfx/{sfx_id}")
+async def update_sfx_endpoint(sfx_id: str, req: SfxUpdateRequest) -> Dict[str, Any]:
+    updated = await asyncio.to_thread(
+        update_sfx_metadata,
+        WORKSPACE_DIR / "sfx",
+        sfx_id,
+        name=req.name,
+        tags=req.tags,
+        description=req.description,
+    )
+    if updated is None:
+        raise HTTPException(status_code=404, detail="SFX asset not found.")
+    return {"asset": updated.model_dump()}
+
+
+@app.delete("/api/sfx/{sfx_id}")
+async def delete_sfx_endpoint(sfx_id: str) -> Dict[str, str]:
+    deleted = await asyncio.to_thread(delete_sfx_asset, WORKSPACE_DIR / "sfx", sfx_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="SFX asset not found.")
+    return {"status": "deleted", "id": sfx_id}
 
 
 @app.post("/api/auto-captions")

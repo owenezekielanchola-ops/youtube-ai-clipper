@@ -1,6 +1,21 @@
 export type AspectRatio = '16:9' | '9:16' | '1:1';
 export type CaptionPreset = 'karaoke' | 'bold_social' | 'yellow_highlight' | 'minimal';
 export type CaptionPosition = 'top' | 'middle' | 'bottom';
+export type OverlayPosition =
+  | 'bottom-left'
+  | 'bottom-center'
+  | 'bottom-right'
+  | 'top-left'
+  | 'top-center'
+  | 'top-right';
+
+export interface OverlayStyle {
+  position: OverlayPosition;
+  textColor: string;
+  backgroundColor: string;
+  showBackground: boolean;
+  fontSize: number;
+}
 
 export interface WordTimestamp {
   word: string;
@@ -25,8 +40,69 @@ export interface ClipItem {
   sourceEnd: number;
   timelineStart: number;
   duration: number;
+  speed?: number;
   viralityScore?: number;
   reason?: string;
+}
+
+export type ZoomKind = 'zoom_in' | 'zoom_out' | 'punch_in';
+export type ZoomEasing = 'instant' | 'linear' | 'ease_in_out';
+
+export interface ZoomEffectItem {
+  id: string;
+  start: number;
+  end: number;
+  kind: ZoomKind;
+  startScale: number;
+  endScale: number;
+  focusX: number;
+  focusY: number;
+  easing: ZoomEasing;
+}
+
+export type DrawingTool =
+  | 'freehand'
+  | 'line'
+  | 'arrow'
+  | 'circle'
+  | 'rect'
+  | 'highlight';
+
+export interface DrawingPoint {
+  x: number;
+  y: number;
+}
+
+export interface DrawingItem {
+  id: string;
+  start: number;
+  end: number;
+  tool: DrawingTool;
+  points: DrawingPoint[];
+  color: string;
+  strokeWidth: number;
+  opacity: number;
+}
+
+export interface SfxAsset {
+  id: string;
+  name: string;
+  filename: string;
+  url: string;
+  duration: number;
+  tags: string[];
+  description?: string;
+}
+
+export interface SfxClipItem {
+  id: string;
+  assetId: string;
+  name: string;
+  url: string;
+  start: number;
+  duration: number;
+  trimStart?: number;
+  volume: number;
 }
 
 export interface HeatmapPoint {
@@ -49,16 +125,32 @@ export interface TimeRange {
   end: number;
 }
 
+export interface VideoCropRect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  start?: number;
+  end?: number;
+}
+
 export interface WorkspaceState {
   playheadPosition: number;
   selectedClipIds: string[];
   selectedTimeRange: TimeRange | null;
   targetAspectRatio: AspectRatio;
+  activeCampaignId?: string | null;
+  overlayText?: string | null;
+  overlayStyle?: OverlayStyle;
+  crop?: VideoCropRect | null;
 }
 
 export interface TracksState {
   clips: ClipItem[];
   captions: CaptionItem[];
+  zooms?: ZoomEffectItem[];
+  drawings?: DrawingItem[];
+  sfx?: SfxClipItem[];
 }
 
 export interface CaptionStyle {
@@ -107,6 +199,8 @@ export interface AiChatMessage {
   role: 'user' | 'assistant';
   content: string;
   routeUsed?: string;
+  campaignLabel?: string;
+  copyableCaption?: string;
   actions?: AiActionLogItem[];
 }
 

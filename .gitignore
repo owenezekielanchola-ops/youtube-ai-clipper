@@ -14,12 +14,17 @@ workspace_data/**/*
 !workspace_data/**/.gitkeep
 workspace_data/**/*.mp4
 workspace_data/**/*.mp3
+workspace_data/**/*.wav
+workspace_data/**/*.ogg
+workspace_data/**/*.m4a
 workspace_data/**/*.ass
 workspace_data/**/*.srt
 workspace_data/**/*.vtt
 workspace_data/**/*.json
 workspace_data/**/_tmp_*/
 workspace_data/.bin/
+!workspace_data/sfx/*.mp3
+!workspace_data/sfx/library.json
 
 # Python
 __pycache__/
