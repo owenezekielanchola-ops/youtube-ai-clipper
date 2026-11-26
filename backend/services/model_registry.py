@@ -460,6 +460,7 @@ class ModelRegistry:
 
     def __init__(self, refresh_interval_seconds: int = REFRESH_INTERVAL_SECONDS) -> None:
         self._lock = threading.Lock()
+        self._refresh_lock = threading.Lock()
         self.refresh_interval_seconds = refresh_interval_seconds
         self.last_refreshed_at: float = 0.0
         self.last_refreshed_iso: Optional[str] = None
@@ -514,7 +515,7 @@ class ModelRegistry:
             return [], None
         api_key = os.getenv("GEMINI_API_KEY", "").strip()
         try:
-            client = genai.Client(api_key=api_key)
+            client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=8000))
             models = list(client.models.list())
             ids: List[str] = []
             for m in models:
@@ -535,71 +536,77 @@ class ModelRegistry:
             return [], None
         return fetch_nvidia_model_ids(timeout=8.0)
 
-    def refresh_now(self, reload_env: bool = True, clear_cooldowns: bool = False) -> Dict[str, Any]:
-        with self._lock:
-            if reload_env and ENV_PATH.exists():
-                load_dotenv(ENV_PATH, override=True)
+    def refresh_now(
+        self, reload_env: bool = True, clear_cooldowns: bool = False, force_refresh: bool = True
+    ) -> Dict[str, Any]:
+        with self._refresh_lock:
+            with self._lock:
+                if not force_refresh and not self._needs_refresh_locked():
+                    return self._snapshot_locked()
+                if reload_env and ENV_PATH.exists():
+                    load_dotenv(ENV_PATH, override=True)
 
-            # Clear stale bans if an API key actually changed; only clear rate-limit cooldowns on manual refresh
-            for prov, env_name in (
-                ("groq", "GROQ_API_KEY"),
-                ("gemini", "GEMINI_API_KEY"),
-                ("nvidia", "NVIDIA_API_KEY"),
-            ):
-                raw_k = os.getenv(env_name, "").strip()
-                fp = hashlib.sha256(raw_k.encode("utf-8")).hexdigest()[:12] if raw_k else ""
-                if fp != self._api_key_fingerprints.get(prov):
-                    self._api_key_fingerprints[prov] = fp
-                    for cache in (self.dead_models_until, self.cooldown_until):
-                        for k in [k for k in cache if k.startswith(f"{prov}:")]:
-                            cache.pop(k, None)
+                for prov, env_name in (
+                    ("groq", "GROQ_API_KEY"),
+                    ("gemini", "GEMINI_API_KEY"),
+                    ("nvidia", "NVIDIA_API_KEY"),
+                ):
+                    raw_k = os.getenv(env_name, "").strip()
+                    fp = hashlib.sha256(raw_k.encode("utf-8")).hexdigest()[:12] if raw_k else ""
+                    if fp != self._api_key_fingerprints.get(prov):
+                        self._api_key_fingerprints[prov] = fp
+                        for cache in (self.dead_models_until, self.cooldown_until):
+                            for k in [k for k in cache if k.startswith(f"{prov}:")]:
+                                cache.pop(k, None)
 
-            if clear_cooldowns:
-                self.cooldown_until.clear()
-            self.groq_configured = _is_key_configured(
-                "GROQ_API_KEY", "your_groq_api_key_here"
-            )
-            self.gemini_configured = _is_key_configured(
-                "GEMINI_API_KEY", "your_gemini_api_key_here"
-            )
-            self.nvidia_configured = is_nvidia_configured()
+                if clear_cooldowns:
+                    self.cooldown_until.clear()
+                self.groq_configured = _is_key_configured(
+                    "GROQ_API_KEY", "your_groq_api_key_here"
+                )
+                self.gemini_configured = _is_key_configured(
+                    "GEMINI_API_KEY", "your_gemini_api_key_here"
+                )
+                self.nvidia_configured = is_nvidia_configured()
 
+            # Network discovery runs OUTSIDE self._lock so inference threads never block
             live_groq, groq_err = self._fetch_groq_models()
             live_gemini, gemini_err = self._fetch_gemini_models()
             live_nvidia, nvidia_err = self._fetch_nvidia_models()
 
-            self.available_groq_models = live_groq
-            self.available_gemini_models = live_gemini
-            self.available_nvidia_models = live_nvidia
-            self.groq_refresh_error = groq_err
-            self.gemini_refresh_error = gemini_err
-            self.nvidia_refresh_error = nvidia_err
+            with self._lock:
+                self.available_groq_models = live_groq
+                self.available_gemini_models = live_gemini
+                self.available_nvidia_models = live_nvidia
+                self.groq_refresh_error = groq_err
+                self.gemini_refresh_error = gemini_err
+                self.nvidia_refresh_error = nvidia_err
 
-            self.tool_models_chain = resolve_tool_models(live_groq)
-            self.router_models_chain = resolve_router_models(live_groq)
-            self.stt_models_chain = resolve_stt_models(live_groq)
-            self.gemini_models_chain = resolve_gemini_models(live_gemini)
-            nv_fast, nv_vision = resolve_nvidia_models(live_nvidia)
-            self.nvidia_fast_models_chain = nv_fast
-            self.nvidia_vision_models_chain = nv_vision
+                self.tool_models_chain = resolve_tool_models(live_groq)
+                self.router_models_chain = resolve_router_models(live_groq)
+                self.stt_models_chain = resolve_stt_models(live_groq)
+                self.gemini_models_chain = resolve_gemini_models(live_gemini)
+                nv_fast, nv_vision = resolve_nvidia_models(live_nvidia)
+                self.nvidia_fast_models_chain = nv_fast
+                self.nvidia_vision_models_chain = nv_vision
 
-            vision_chain: List[str] = []
-            for m in self.gemini_models_chain:
-                _append_unique(vision_chain, m)
-            for m in self.nvidia_vision_models_chain:
-                _append_unique(vision_chain, m)
-            for m in self.tool_models_chain:
-                if "qwen" in m.lower() or "gpt-oss-120b" in m.lower():
+                vision_chain: List[str] = []
+                for m in self.gemini_models_chain:
                     _append_unique(vision_chain, m)
-            self.vision_models_chain = vision_chain
+                for m in self.nvidia_vision_models_chain:
+                    _append_unique(vision_chain, m)
+                for m in self.tool_models_chain:
+                    if "qwen" in m.lower() or "gpt-oss-120b" in m.lower():
+                        _append_unique(vision_chain, m)
+                self.vision_models_chain = vision_chain
 
-            now = time.time()
-            self.last_refreshed_at = now
-            self.last_refreshed_iso = datetime.fromtimestamp(
-                now, tz=timezone.utc
-            ).isoformat()
+                now = time.time()
+                self.last_refreshed_at = now
+                self.last_refreshed_iso = datetime.fromtimestamp(
+                    now, tz=timezone.utc
+                ).isoformat()
 
-            return self._snapshot_locked()
+                return self._snapshot_locked()
 
     def _needs_refresh_locked(self) -> bool:
         if self.last_refreshed_at <= 0.0:
@@ -675,12 +682,12 @@ class ModelRegistry:
 
     def get_state(self, force_refresh: bool = False) -> Dict[str, Any]:
         if force_refresh:
-            return self.refresh_now(reload_env=True, clear_cooldowns=True)
+            return self.refresh_now(reload_env=True, clear_cooldowns=True, force_refresh=True)
         with self._lock:
             needs = self._needs_refresh_locked()
             if not needs:
                 return self._snapshot_locked()
-        return self.refresh_now(reload_env=True, clear_cooldowns=False)
+        return self.refresh_now(reload_env=True, clear_cooldowns=False, force_refresh=False)
 
     def get_tool_models_chain(self) -> List[str]:
         return list(self.get_state()["tool_models_chain"])
@@ -760,6 +767,7 @@ class ModelRegistry:
         )
         with self._lock:
             key = f"{provider}:{model_id}"
+            self.model_latencies_ms.pop(key, None)
             if looks_retired:
                 # Ban broken / unprovisioned 404 catalog entries for 1 hour so auto-rescan doesn't re-promote them
                 self.dead_models_until[key] = time.time() + 3600.0
@@ -767,6 +775,8 @@ class ModelRegistry:
                 self.cooldown_until[key] = time.time() + 60.0
             elif looks_auth_error:
                 self.cooldown_until[key] = time.time() + 300.0
+            else:
+                self.cooldown_until[key] = time.time() + 15.0
 
             if provider == "gemini":
                 chains = [self.gemini_models_chain, self.vision_models_chain]

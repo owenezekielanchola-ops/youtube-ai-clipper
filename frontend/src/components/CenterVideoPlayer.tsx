@@ -21,6 +21,7 @@ import {
 } from 'lucide-react';
 import { DEFAULT_OVERLAY_STYLE, useEditorStore } from '../store/useEditorStore';
 import type {
+  AudioEditItem,
   ClipItem,
   DrawingPoint,
   DrawingTool,
@@ -119,7 +120,9 @@ function mapTimelineToSource(
   for (let i = 0; i < clips.length; i++) {
     const c = clips[i];
     const isLast = i === clips.length - 1;
-    const endBoundary = c.timelineStart + c.duration;
+    const endBoundary = isLast
+      ? c.timelineStart + c.duration
+      : clips[i + 1].timelineStart;
     const withinUpper = isLast
       ? timelinePos <= endBoundary + 0.001
       : timelinePos < endBoundary;
@@ -131,6 +134,27 @@ function mapTimelineToSource(
   }
   const last = clips[clips.length - 1];
   return { clip: last, sourceTime: last.sourceEnd, index: clips.length - 1 };
+}
+
+function getVideoAudioGainAtTime(
+  audioEdits: AudioEditItem[],
+  tlPos: number,
+): { gain: number; activeEdit: AudioEditItem | null } {
+  for (let i = audioEdits.length - 1; i >= 0; i--) {
+    const ae = audioEdits[i];
+    if (tlPos >= ae.start && tlPos < ae.end) {
+      const gain = ae.muted ? 0 : Math.max(0, Math.min(2, ae.volume ?? 1));
+      return { gain, activeEdit: ae };
+    }
+  }
+  for (let i = audioEdits.length - 1; i >= 0; i--) {
+    const ae = audioEdits[i];
+    if (tlPos >= ae.start && tlPos <= ae.end) {
+      const gain = ae.muted ? 0 : Math.max(0, Math.min(2, ae.volume ?? 1));
+      return { gain, activeEdit: ae };
+    }
+  }
+  return { gain: 1, activeEdit: null };
 }
 
 function computeActiveZoom(
@@ -165,15 +189,19 @@ function renderSvgDrawing(
   strokeWidth: number,
   opacity: number,
   isSelected = false,
+  vbW = 1000,
+  vbH = 1000,
 ) {
   if (points.length === 0) return null;
   const sw = Math.max(2, strokeWidth * 2.2);
-  const p0 = { x: points[0].x * 1000, y: points[0].y * 1000 };
+  const p0 = { x: points[0].x * vbW, y: points[0].y * vbH };
   const last = points[points.length - 1];
-  const p1 = { x: last.x * 1000, y: last.y * 1000 };
+  const p1 = { x: last.x * vbW, y: last.y * vbH };
 
   if (tool === 'freehand' || tool === 'highlight') {
-    const ptsStr = points.map((pt) => `${(pt.x * 1000).toFixed(1)},${(pt.y * 1000).toFixed(1)}`).join(' ');
+    const ptsStr = points
+      .map((pt) => `${(pt.x * vbW).toFixed(1)},${(pt.y * vbH).toFixed(1)}`)
+      .join(' ');
     return (
       <polyline
         key={key}
@@ -300,6 +328,7 @@ export const CenterVideoPlayer: React.FC = () => {
   const svgRef = useRef<SVGSVGElement | null>(null);
   const cropContainerRef = useRef<HTMLDivElement | null>(null);
   const rafRef = useRef<number | null>(null);
+  const lastTickPlayheadRef = useRef<number>(0);
   const sfxAudiosRef = useRef<Map<string, HTMLAudioElement>>(new Map());
   const [isMuted, setIsMuted] = useState(false);
   const isMutedRef = useRef(isMuted);
@@ -337,6 +366,18 @@ export const CenterVideoPlayer: React.FC = () => {
 
   const clips = project.tracks.clips;
   const playhead = project.workspaceState.playheadPosition;
+  const activeAudioState = useMemo(
+    () => getVideoAudioGainAtTime(project.tracks.audioEdits ?? [], playhead),
+    [project.tracks.audioEdits, playhead],
+  );
+  const effectiveVideoMuted = isMuted || activeAudioState.gain <= 0.001;
+
+  useEffect(() => {
+    const v = videoRef.current;
+    if (!v) return;
+    v.muted = effectiveVideoMuted;
+    v.volume = Math.min(1, Math.max(0, activeAudioState.gain));
+  }, [effectiveVideoMuted, activeAudioState.gain]);
   const totalDuration = useMemo(
     () => clips.reduce((acc, c) => acc + c.duration, 0),
     [clips],
@@ -362,9 +403,9 @@ export const CenterVideoPlayer: React.FC = () => {
   // Play / Pause control + Virtual Playback Controller across edited EDL clips
   useEffect(() => {
     const video = videoRef.current;
-    if (!video || clips.length === 0) return;
+    if (!video) return;
 
-    if (!isPlaying) {
+    if (!isPlaying || clips.length === 0) {
       video.pause();
       stopAllSfx();
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
@@ -425,6 +466,9 @@ export const CenterVideoPlayer: React.FC = () => {
             if (audio.readyState >= 1 && Math.abs(audio.currentTime - offset) > 0.35) {
               audio.currentTime = offset;
             }
+            if (audio.paused && audio.readyState >= 1) {
+              audio.play().catch(() => {});
+            }
           }
         }
       }
@@ -436,16 +480,30 @@ export const CenterVideoPlayer: React.FC = () => {
       }
     };
 
-    const startMap = mapTimelineToSource(clips, playhead);
+    const syncVideoAudioAtTime = (headPos: number) => {
+      const st = useEditorStore.getState();
+      const { gain } = getVideoAudioGainAtTime(st.project.tracks.audioEdits ?? [], headPos);
+      video.muted = isMutedRef.current || gain <= 0.001;
+      video.volume = Math.min(1, Math.max(0, gain));
+    };
+
+    const startState = useEditorStore.getState();
+    const startClips = startState.project.tracks.clips;
+    let initHead = startState.project.workspaceState.playheadPosition;
+    const startTotalDur = startClips.reduce((acc, c) => acc + c.duration, 0);
+    const startMap = mapTimelineToSource(startClips, initHead);
     if (startMap) {
       video.playbackRate = Math.max(0.25, Math.min(4.0, startMap.clip.speed ?? 1));
-      if (playhead >= totalDuration - 0.05) {
+      if (initHead >= startTotalDur - 0.05) {
+        initHead = 0;
         setPlayheadPosition(0);
-        video.currentTime = clips[0].sourceStart;
+        video.currentTime = startClips[0].sourceStart;
       } else if (Math.abs(video.currentTime - startMap.sourceTime) > 0.15) {
         video.currentTime = startMap.sourceTime;
       }
     }
+    syncVideoAudioAtTime(initHead);
+    lastTickPlayheadRef.current = initHead;
 
     video.play().catch(() => {
       setIsPlaying(false);
@@ -466,6 +524,7 @@ export const CenterVideoPlayer: React.FC = () => {
       const curHead = storeState.project.workspaceState.playheadPosition;
       const mapped = mapTimelineToSource(curClips, curHead);
       if (!mapped) {
+        v.pause();
         stopAllSfx();
         storeState.setIsPlaying(false);
         return;
@@ -477,30 +536,37 @@ export const CenterVideoPlayer: React.FC = () => {
         v.playbackRate = clipSpeed;
       }
       const srcTime = v.currentTime;
+      const externalSeek = Math.abs(curHead - lastTickPlayheadRef.current) > 0.15;
 
       // Recover if <video> is outside current clip bounds or playhead jumped externally (e.g. +/-2s)
       if (
+        externalSeek ||
         srcTime < clip.sourceStart - 0.25 ||
         srcTime > clip.sourceEnd + 0.25 ||
         Math.abs(srcTime - mapped.sourceTime) > Math.max(0.45, 0.35 * clipSpeed)
       ) {
         v.currentTime = mapped.sourceTime;
+        lastTickPlayheadRef.current = curHead;
+        syncVideoAudioAtTime(curHead);
         syncSfxAtTime(curHead);
-      } else if (srcTime >= clip.sourceEnd - 0.03) {
+      } else if (v.ended || srcTime >= clip.sourceEnd - 0.03) {
         // Reached end of current virtual clip -> jump seamlessly to next clip or stop
         const nextClip = curClips[index + 1];
         if (nextClip) {
           v.playbackRate = Math.max(0.25, Math.min(4.0, nextClip.speed ?? 1));
           v.currentTime = nextClip.sourceStart;
+          if (v.paused) v.play().catch(() => {});
+          lastTickPlayheadRef.current = nextClip.timelineStart;
           storeState.setPlayheadPosition(nextClip.timelineStart);
+          syncVideoAudioAtTime(nextClip.timelineStart);
           syncSfxAtTime(nextClip.timelineStart);
         } else {
           v.pause();
           stopAllSfx();
+          const finalDur = curClips.reduce((acc, c) => acc + c.duration, 0);
+          lastTickPlayheadRef.current = finalDur;
           storeState.setIsPlaying(false);
-          storeState.setPlayheadPosition(
-            curClips.reduce((acc, c) => acc + c.duration, 0),
-          );
+          storeState.setPlayheadPosition(finalDur);
           return;
         }
       } else {
@@ -510,7 +576,9 @@ export const CenterVideoPlayer: React.FC = () => {
             Math.max(0, srcTime - clip.sourceStart) / clipSpeed
           ).toFixed(3),
         );
+        lastTickPlayheadRef.current = newHead;
         storeState.setPlayheadPosition(newHead);
+        syncVideoAudioAtTime(newHead);
         syncSfxAtTime(newHead);
       }
 
@@ -522,15 +590,14 @@ export const CenterVideoPlayer: React.FC = () => {
       stopAllSfx();
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
     };
-  }, [isPlaying]);
+  }, [isPlaying, isCropMode, project.sourceVideo.videoUrl, clips.length === 0]);
 
-  // Active caption at current source time
+  // Active caption at current source time (preferring TTS-ready intro_hook over regular subtitles)
   const activeCaption = useMemo(() => {
-    return (
-      project.tracks.captions.find(
-        (c) => currentSourceTime >= c.start && currentSourceTime <= c.end,
-      ) ?? null
+    const matches = project.tracks.captions.filter(
+      (c) => currentSourceTime >= c.start && currentSourceTime <= c.end,
     );
+    return matches.find((c) => c.captionKind === 'intro_hook') ?? matches[0] ?? null;
   }, [project.tracks.captions, currentSourceTime]);
 
   const overlayText = project.workspaceState.overlayText?.trim() || '';
@@ -677,7 +744,8 @@ export const CenterVideoPlayer: React.FC = () => {
 
   const handleQuickZoom = (kind: ZoomEffectItem['kind']) => {
     if (clips.length === 0) return;
-    const endPos = Math.max(playhead + 0.6, Math.min(totalDuration, playhead + 2.5));
+    const endPos = Math.min(totalDuration, Math.max(playhead + 0.6, Math.min(totalDuration, playhead + 2.5)));
+    if (endPos - playhead < 0.2) return;
     add_zoom_effect({
       start: playhead,
       end: endPos,
@@ -719,9 +787,10 @@ export const CenterVideoPlayer: React.FC = () => {
   const renderCaptionContent = () => {
     if (!activeCaption) return null;
 
+    const cleanWord = (w: string) => w.replace(/[^\p{L}\p{N}']/gu, '').toLowerCase();
     const hlSet = new Set(
       activeCaption.highlightedWords
-        .map((w) => w.replace(/[^\w']/g, '').toLowerCase())
+        .map(cleanWord)
         .filter(Boolean),
     );
 
@@ -736,7 +805,7 @@ export const CenterVideoPlayer: React.FC = () => {
       return (
         <span className="inline-flex flex-wrap justify-center gap-x-1.5 gap-y-0.5 leading-tight">
           {activeCaption.words.map((w, idx) => {
-            const clean = w.word.replace(/[^\w']/g, '').toLowerCase();
+            const clean = cleanWord(w.word);
             const isManualHl = clean !== '' && hlSet.has(clean);
             const isActiveWord =
               currentSourceTime >= w.start && currentSourceTime <= w.end + 0.1;
@@ -778,7 +847,7 @@ export const CenterVideoPlayer: React.FC = () => {
               .split(/\s+/)
               .filter(Boolean)
               .map((tok, idx) => {
-                const clean = tok.replace(/[^\w']/g, '').toLowerCase();
+                const clean = cleanWord(tok);
                 const isHl = clean !== '' && hlSet.has(clean);
                 const wordColor = isHl ? normHighlightColor : normTextColor;
                 return (
@@ -1018,81 +1087,82 @@ export const CenterVideoPlayer: React.FC = () => {
         >
           {project.sourceVideo.videoUrl ? (
             isCropMode ? (
-              <div
-                ref={cropContainerRef}
-                style={{ width: `${uncropFit.wPct}%`, height: `${uncropFit.hPct}%` }}
-                className="relative overflow-hidden select-none"
-              >
-                <video
-                  ref={videoRef}
-                  src={project.sourceVideo.videoUrl}
-                  muted={isMuted}
-                  playsInline
-                  preload="metadata"
-                  onLoadedMetadata={(e) => {
-                    const v = e.currentTarget;
-                    if (v.videoWidth > 0 && v.videoHeight > 0) {
-                      setNaturalDims({ w: v.videoWidth, h: v.videoHeight });
-                    }
-                    if (Math.abs(v.currentTime - currentSourceTime) > 0.08) {
-                      v.currentTime = currentSourceTime;
-                    }
-                  }}
-                  className="w-full h-full object-fill"
-                />
-                {/* Interactive Crop Frame */}
+              <>
                 <div
-                  onMouseDown={(e) => startCropDrag(e, 'move')}
-                  style={{
-                    left: `${activeCrop.x * 100}%`,
-                    top: `${activeCrop.y * 100}%`,
-                    width: `${activeCrop.w * 100}%`,
-                    height: `${activeCrop.h * 100}%`,
-                  }}
-                  className="absolute border-2 border-amber-400 shadow-[0_0_0_9999px_rgba(0,0,0,0.62)] cursor-move z-20"
+                  ref={cropContainerRef}
+                  style={{ width: `${uncropFit.wPct}%`, height: `${uncropFit.hPct}%` }}
+                  className="relative overflow-hidden select-none"
                 >
-                  {/* Grid thirds */}
-                  <div className="absolute inset-0 pointer-events-none grid grid-cols-3 grid-rows-3 opacity-35">
-                    {Array.from({ length: 9 }).map((_, idx) => (
-                      <div key={idx} className="border border-white/25" />
-                    ))}
+                  <video
+                    ref={videoRef}
+                    src={project.sourceVideo.videoUrl}
+                    muted={effectiveVideoMuted}
+                    playsInline
+                    preload="metadata"
+                    onLoadedMetadata={(e) => {
+                      const v = e.currentTarget;
+                      if (v.videoWidth > 0 && v.videoHeight > 0) {
+                        setNaturalDims({ w: v.videoWidth, h: v.videoHeight });
+                      }
+                      if (Math.abs(v.currentTime - currentSourceTime) > 0.08) {
+                        v.currentTime = currentSourceTime;
+                      }
+                    }}
+                    className="w-full h-full object-fill"
+                  />
+                  {/* Interactive Crop Frame */}
+                  <div
+                    onMouseDown={(e) => startCropDrag(e, 'move')}
+                    style={{
+                      left: `${activeCrop.x * 100}%`,
+                      top: `${activeCrop.y * 100}%`,
+                      width: `${activeCrop.w * 100}%`,
+                      height: `${activeCrop.h * 100}%`,
+                    }}
+                    className="absolute border-2 border-amber-400 shadow-[0_0_0_9999px_rgba(0,0,0,0.62)] cursor-move z-20"
+                  >
+                    {/* Grid thirds */}
+                    <div className="absolute inset-0 pointer-events-none grid grid-cols-3 grid-rows-3 opacity-35">
+                      {Array.from({ length: 9 }).map((_, idx) => (
+                        <div key={idx} className="border border-white/25" />
+                      ))}
+                    </div>
+                    {/* Corner & edge resize handles inset inside border so overflow-hidden never clips at 100% bounds */}
+                    <div
+                      onMouseDown={(e) => startCropDrag(e, 'nw')}
+                      className="absolute top-0 left-0 w-3.5 h-3.5 bg-amber-400 border border-zinc-950 rounded-sm cursor-nwse-resize"
+                    />
+                    <div
+                      onMouseDown={(e) => startCropDrag(e, 'ne')}
+                      className="absolute top-0 right-0 w-3.5 h-3.5 bg-amber-400 border border-zinc-950 rounded-sm cursor-nesw-resize"
+                    />
+                    <div
+                      onMouseDown={(e) => startCropDrag(e, 'sw')}
+                      className="absolute bottom-0 left-0 w-3.5 h-3.5 bg-amber-400 border border-zinc-950 rounded-sm cursor-nesw-resize"
+                    />
+                    <div
+                      onMouseDown={(e) => startCropDrag(e, 'se')}
+                      className="absolute bottom-0 right-0 w-3.5 h-3.5 bg-amber-400 border border-zinc-950 rounded-sm cursor-nwse-resize"
+                    />
+                    <div
+                      onMouseDown={(e) => startCropDrag(e, 'n')}
+                      className="absolute top-0 left-1/2 -translate-x-1/2 w-6 h-2 bg-amber-400 rounded-full cursor-ns-resize"
+                    />
+                    <div
+                      onMouseDown={(e) => startCropDrag(e, 's')}
+                      className="absolute bottom-0 left-1/2 -translate-x-1/2 w-6 h-2 bg-amber-400 rounded-full cursor-ns-resize"
+                    />
+                    <div
+                      onMouseDown={(e) => startCropDrag(e, 'w')}
+                      className="absolute top-1/2 left-0 -translate-y-1/2 w-2 h-6 bg-amber-400 rounded-full cursor-ew-resize"
+                    />
+                    <div
+                      onMouseDown={(e) => startCropDrag(e, 'e')}
+                      className="absolute top-1/2 right-0 -translate-y-1/2 w-2 h-6 bg-amber-400 rounded-full cursor-ew-resize"
+                    />
                   </div>
-                  {/* Corner & edge resize handles */}
-                  <div
-                    onMouseDown={(e) => startCropDrag(e, 'nw')}
-                    className="absolute -top-1.5 -left-1.5 w-3.5 h-3.5 bg-amber-400 border border-zinc-950 rounded-sm cursor-nwse-resize"
-                  />
-                  <div
-                    onMouseDown={(e) => startCropDrag(e, 'ne')}
-                    className="absolute -top-1.5 -right-1.5 w-3.5 h-3.5 bg-amber-400 border border-zinc-950 rounded-sm cursor-nesw-resize"
-                  />
-                  <div
-                    onMouseDown={(e) => startCropDrag(e, 'sw')}
-                    className="absolute -bottom-1.5 -left-1.5 w-3.5 h-3.5 bg-amber-400 border border-zinc-950 rounded-sm cursor-nesw-resize"
-                  />
-                  <div
-                    onMouseDown={(e) => startCropDrag(e, 'se')}
-                    className="absolute -bottom-1.5 -right-1.5 w-3.5 h-3.5 bg-amber-400 border border-zinc-950 rounded-sm cursor-nwse-resize"
-                  />
-                  <div
-                    onMouseDown={(e) => startCropDrag(e, 'n')}
-                    className="absolute -top-1 left-1/2 -translate-x-1/2 w-6 h-2 bg-amber-400 rounded-full cursor-ns-resize"
-                  />
-                  <div
-                    onMouseDown={(e) => startCropDrag(e, 's')}
-                    className="absolute -bottom-1 left-1/2 -translate-x-1/2 w-6 h-2 bg-amber-400 rounded-full cursor-ns-resize"
-                  />
-                  <div
-                    onMouseDown={(e) => startCropDrag(e, 'w')}
-                    className="absolute top-1/2 -left-1 -translate-y-1/2 w-2 h-6 bg-amber-400 rounded-full cursor-ew-resize"
-                  />
-                  <div
-                    onMouseDown={(e) => startCropDrag(e, 'e')}
-                    className="absolute top-1/2 -right-1 -translate-y-1/2 w-2 h-6 bg-amber-400 rounded-full cursor-ew-resize"
-                  />
                 </div>
-
-                {/* Crop Floating Controls */}
+                {/* Crop Floating Controls positioned outside crop frame */}
                 <div className="absolute bottom-2.5 left-1/2 -translate-x-1/2 z-30 flex items-center gap-2 bg-[#151922]/95 border border-[#272f40] rounded-xl px-3 py-1.5 text-xs shadow-xl">
                   <span className="font-mono text-slate-300 tabular-nums">
                     {Math.round(activeCrop.w * 100)}% × {Math.round(activeCrop.h * 100)}%
@@ -1112,7 +1182,7 @@ export const CenterVideoPlayer: React.FC = () => {
                     Done
                   </button>
                 </div>
-              </div>
+              </>
             ) : (
               <div
                 style={{
@@ -1128,7 +1198,7 @@ export const CenterVideoPlayer: React.FC = () => {
                   <video
                     ref={videoRef}
                     src={project.sourceVideo.videoUrl}
-                    muted={isMuted}
+                    muted={effectiveVideoMuted}
                     playsInline
                     preload="metadata"
                     onLoadedMetadata={(e) => {
@@ -1141,7 +1211,7 @@ export const CenterVideoPlayer: React.FC = () => {
                       }
                     }}
                     onClick={() => {
-                      if (!activeDrawTool) setIsPlaying(!isPlaying);
+                      if (!activeDrawTool && clips.length > 0) setIsPlaying(!isPlaying);
                     }}
                     style={{
                       width: `${100 / playbackCrop.w}%`,
@@ -1200,94 +1270,99 @@ export const CenterVideoPlayer: React.FC = () => {
           )}
 
           {/* Interactive SVG Drawing Overlay Layer (hidden while editing crop handles) */}
-          {!isCropMode && (
-            <svg
-              ref={svgRef}
-              viewBox="0 0 1000 1000"
-              preserveAspectRatio="none"
-              onPointerDown={(e) => {
-                if (!activeDrawTool || clips.length === 0) return;
-                const pt = getNormPoint(e.clientX, e.clientY);
-                if (!pt) return;
-                e.currentTarget.setPointerCapture(e.pointerId);
-                setDraftPoints([pt, pt]);
-              }}
-              onPointerMove={(e) => {
-                if (!activeDrawTool || !draftPoints) return;
-                const pt = getNormPoint(e.clientX, e.clientY);
-                if (!pt) return;
-                if (activeDrawTool === 'freehand' || activeDrawTool === 'highlight') {
-                  const lastPt = draftPoints[draftPoints.length - 1];
-                  if (Math.hypot(pt.x - lastPt.x, pt.y - lastPt.y) > 0.006) {
-                    setDraftPoints([...draftPoints, pt]);
+          {!isCropMode && (() => {
+            const vbW = targetRatio === '9:16' ? 900 : targetRatio === '1:1' ? 1000 : 1600;
+            const vbH = targetRatio === '9:16' ? 1600 : targetRatio === '1:1' ? 1000 : 900;
+            return (
+              <svg
+                ref={svgRef}
+                viewBox={`0 0 ${vbW} ${vbH}`}
+                preserveAspectRatio="xMidYMid meet"
+                onPointerDown={(e) => {
+                  if (!activeDrawTool || clips.length === 0) return;
+                  const pt = getNormPoint(e.clientX, e.clientY);
+                  if (!pt) return;
+                  e.currentTarget.setPointerCapture(e.pointerId);
+                  setDraftPoints([pt, pt]);
+                }}
+                onPointerMove={(e) => {
+                  if (!activeDrawTool || !draftPoints) return;
+                  const pt = getNormPoint(e.clientX, e.clientY);
+                  if (!pt) return;
+                  if (activeDrawTool === 'freehand' || activeDrawTool === 'highlight') {
+                    const lastPt = draftPoints[draftPoints.length - 1];
+                    if (Math.hypot(pt.x - lastPt.x, pt.y - lastPt.y) > 0.006) {
+                      setDraftPoints([...draftPoints, pt]);
+                    }
+                  } else {
+                    setDraftPoints([draftPoints[0], pt]);
                   }
-                } else {
-                  setDraftPoints([draftPoints[0], pt]);
-                }
-              }}
-              onPointerUp={(e) => {
-                if (!activeDrawTool || !draftPoints) return;
-                if (e.currentTarget.hasPointerCapture(e.pointerId)) {
-                  e.currentTarget.releasePointerCapture(e.pointerId);
-                }
-                const pts = draftPoints;
-                setDraftPoints(null);
-                if (pts.length >= 2) {
-                  const span = Math.hypot(
-                    pts[pts.length - 1].x - pts[0].x,
-                    pts[pts.length - 1].y - pts[0].y,
-                  );
-                  if (span > 0.015 || pts.length > 3) {
-                    const endPos = Math.max(
-                      playhead + 0.5,
-                      Math.min(Math.max(totalDuration, playhead + 2.5), playhead + 2.5),
+                }}
+                onPointerCancel={() => setDraftPoints(null)}
+                onPointerUp={(e) => {
+                  if (!activeDrawTool || !draftPoints) return;
+                  if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+                    e.currentTarget.releasePointerCapture(e.pointerId);
+                  }
+                  const pts = draftPoints;
+                  setDraftPoints(null);
+                  if (pts.length >= 2) {
+                    const span = Math.hypot(
+                      pts[pts.length - 1].x - pts[0].x,
+                      pts[pts.length - 1].y - pts[0].y,
                     );
-                    add_drawing({
-                      start: playhead,
-                      end: endPos,
-                      tool: activeDrawTool,
-                      points: pts,
-                      color: drawColor,
-                      strokeWidth:
-                        activeDrawTool === 'highlight'
-                          ? Math.max(drawStrokeWidth * 2, 16)
-                          : drawStrokeWidth,
-                      opacity: activeDrawTool === 'highlight' ? 0.45 : 1.0,
-                    });
+                    if (span > 0.015 || pts.length > 3) {
+                      const clampedEnd = Math.min(totalDuration, playhead + 2.5);
+                      const endPos = Math.min(totalDuration, Math.max(playhead + 0.5, clampedEnd));
+                      if (endPos - playhead >= 0.2) {
+                        add_drawing({
+                          start: playhead,
+                          end: endPos,
+                          tool: activeDrawTool,
+                          points: pts,
+                          color: drawColor,
+                          strokeWidth: drawStrokeWidth,
+                          opacity: activeDrawTool === 'highlight' ? 0.45 : 1.0,
+                        });
+                      }
+                    }
                   }
-                }
-              }}
-              className={`absolute inset-0 w-full h-full z-10 ${
-                activeDrawTool
-                  ? 'pointer-events-auto cursor-crosshair touch-none'
-                  : 'pointer-events-none'
-              }`}
-            >
-              {visibleDrawings.map((d) =>
-                renderSvgDrawing(
-                  d.id,
-                  d.tool,
-                  d.points,
-                  d.color,
-                  d.strokeWidth,
-                  d.opacity,
-                  d.id === selectedDrawingId,
-                ),
-              )}
-              {draftPoints &&
-                activeDrawTool &&
-                renderSvgDrawing(
-                  'draft_stroke',
-                  activeDrawTool,
-                  draftPoints,
-                  drawColor,
-                  activeDrawTool === 'highlight'
-                    ? Math.max(drawStrokeWidth * 2, 16)
-                    : drawStrokeWidth,
-                  activeDrawTool === 'highlight' ? 0.45 : 1.0,
+                }}
+                className={`absolute inset-0 w-full h-full z-10 ${
+                  activeDrawTool
+                    ? 'pointer-events-auto cursor-crosshair touch-none'
+                    : 'pointer-events-none'
+                }`}
+              >
+                {visibleDrawings.map((d) =>
+                  renderSvgDrawing(
+                    d.id,
+                    d.tool,
+                    d.points,
+                    d.color,
+                    d.strokeWidth,
+                    d.opacity,
+                    d.id === selectedDrawingId,
+                    vbW,
+                    vbH,
+                  ),
                 )}
-            </svg>
-          )}
+                {draftPoints &&
+                  activeDrawTool &&
+                  renderSvgDrawing(
+                    'draft_stroke',
+                    activeDrawTool,
+                    draftPoints,
+                    drawColor,
+                    drawStrokeWidth,
+                    activeDrawTool === 'highlight' ? 0.45 : 1.0,
+                    false,
+                    vbW,
+                    vbH,
+                  )}
+              </svg>
+            );
+          })()}
 
           {/* Aspect Ratio Badge */}
           <div className="absolute top-2.5 left-2.5 px-2 py-0.5 rounded bg-black/75 border border-white/15 text-[10px] font-mono text-zinc-200 pointer-events-none">
@@ -1352,6 +1427,19 @@ export const CenterVideoPlayer: React.FC = () => {
           {activeMapping && activeMapping.clip.speed != null && activeMapping.clip.speed !== 1 && (
             <span className="px-1.5 py-0.5 rounded bg-indigo-500/15 border border-indigo-400/30 text-indigo-300 text-[11px] font-sans font-medium">
               {activeMapping.clip.speed}x
+            </span>
+          )}
+          {activeAudioState.activeEdit && Math.abs(activeAudioState.gain - 1) > 0.01 && (
+            <span
+              className={`px-1.5 py-0.5 rounded border text-[11px] font-sans font-medium ${
+                activeAudioState.gain <= 0.001
+                  ? 'bg-rose-500/15 border-rose-400/40 text-rose-300'
+                  : 'bg-amber-500/15 border-amber-400/40 text-amber-200'
+              }`}
+            >
+              {activeAudioState.gain <= 0.001
+                ? 'Audio Muted'
+                : `Audio ${Math.round(activeAudioState.gain * 100)}%`}
             </span>
           )}
         </div>

@@ -30,10 +30,12 @@ from schemas import (
     ProjectState,
     ReferenceStyleRequest,
     ReferenceStyleResponse,
+    SfxAsset,
     SfxUpdateRequest,
     SourceVideo,
     SubtitleExportRequest,
     TracksState,
+    TtsGenerateRequest,
     WorkspaceState,
 )
 from services.ai_orchestrator import (
@@ -61,6 +63,10 @@ from services.sfx_library import (
     list_sfx_assets,
     save_uploaded_sfx,
     update_sfx_metadata,
+)
+from services.tts_service import (
+    list_tts_voices,
+    synthesize_tts_to_sfx_asset,
 )
 from services.transcription import (
     build_captions_from_transcript,
@@ -386,7 +392,7 @@ async def ingest_video_endpoint(req: IngestRequest) -> IngestResponse:
                     project_id,
                     downloads_dir,
                     clip_ranges,
-                    source_span_duration,
+                    full_video_duration,
                     allow_long_clips,
                 )
 
@@ -400,7 +406,7 @@ async def ingest_video_endpoint(req: IngestRequest) -> IngestResponse:
                     seg_data["normalized_ranges"],
                     full_transcript,
                     meta["heatmap"],
-                    source_span_duration,
+                    full_video_duration,
                 )
 
                 final_duration = float(seg_data["duration"] or total_clip_duration)
@@ -544,6 +550,8 @@ async def ingest_video_endpoint(req: IngestRequest) -> IngestResponse:
 @app.post("/ai-edit", response_model=AiEditResponse)
 @app.post("/api/ai-edit", response_model=AiEditResponse)
 async def ai_edit_endpoint(req: AiEditRequest) -> AiEditResponse:
+    if req.project_state.projectId and req.project_state.projectId != "proj_empty":
+        _sanitize_project_id(req.project_state.projectId)
     try:
         return await asyncio.to_thread(
             process_ai_edit,
@@ -565,10 +573,7 @@ async def reference_style_endpoint(req: ReferenceStyleRequest) -> ReferenceStyle
     ref_url = req.reference_url.strip()
     if not ref_url:
         raise HTTPException(status_code=400, detail="reference_url is required.")
-    try:
-        safe_id = _sanitize_project_id(req.project_state.projectId)
-    except Exception:
-        safe_id = req.project_state.projectId
+    safe_id = _sanitize_project_id(req.project_state.projectId)
 
     transcript = load_cached_transcript(safe_id, WORKSPACE_DIR / "transcripts")
     sfx_assets = await asyncio.to_thread(list_sfx_assets, WORKSPACE_DIR / "sfx")
@@ -586,13 +591,22 @@ async def reference_style_endpoint(req: ReferenceStyleRequest) -> ReferenceStyle
             req.custom_instruction,
             tl_text,
             req.deep_think,
+            WORKSPACE_DIR / "sfx",
         )
+        raw_gen = profile.get("generated_assets") or []
+        generated_assets: List[SfxAsset] = [
+            a if isinstance(a, SfxAsset) else SfxAsset(**a)
+            for a in raw_gen
+            if isinstance(a, (dict, SfxAsset))
+        ]
         return ReferenceStyleResponse(
             profile=profile,
             message=summary_msg,
             tool_calls=tool_calls,
             auto_captions=auto_captions,
             route_used=route_label,
+            requires_confirmation=True,
+            generated_assets=generated_assets,
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Reference style analysis failed: {exc}") from exc
@@ -655,6 +669,33 @@ async def delete_sfx_endpoint(sfx_id: str) -> Dict[str, str]:
     return {"status": "deleted", "id": sfx_id}
 
 
+@app.get("/api/tts/voices")
+async def list_tts_voices_endpoint() -> Dict[str, Any]:
+    return await asyncio.to_thread(list_tts_voices)
+
+
+@app.post("/api/tts/generate")
+async def generate_tts_endpoint(req: TtsGenerateRequest) -> Dict[str, Any]:
+    clean = req.text.strip()
+    if not clean:
+        raise HTTPException(status_code=400, detail="Text is required for TTS generation.")
+    try:
+        asset = await asyncio.to_thread(
+            synthesize_tts_to_sfx_asset,
+            WORKSPACE_DIR / "sfx",
+            clean,
+            voice=req.voice,
+            model=req.model,
+            speed=req.speed,
+            name=req.name,
+        )
+        return {"asset": asset.model_dump()}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"TTS generation failed: {exc}") from exc
+
+
 @app.post("/api/auto-captions")
 async def auto_captions_endpoint(req: AutoCaptionsRequest) -> Dict[str, Any]:
     safe_id = _sanitize_project_id(req.project_id)
@@ -690,14 +731,17 @@ async def voice_transcribe_endpoint(file: UploadFile = File(...)) -> Dict[str, s
 @app.post("/export", response_model=ExportResponse)
 @app.post("/api/export", response_model=ExportResponse)
 async def export_video_endpoint(req: ExportRequest) -> ExportResponse:
+    safe_pid = _sanitize_project_id(req.project_state.projectId)
+    safe_state = req.project_state.model_copy(update={"projectId": safe_pid})
+
     async def on_progress(pct: int, status_msg: str) -> None:
         await progress_manager.broadcast(
-            {"progress": pct, "status": status_msg, "projectId": req.project_state.projectId}
+            {"progress": pct, "status": status_msg, "projectId": safe_pid}
         )
 
     try:
         files = await render_project_video(
-            project_state=req.project_state,
+            project_state=safe_state,
             export_mode=req.export_mode,
             workspace_dir=WORKSPACE_DIR,
             progress_cb=on_progress,
@@ -802,4 +846,6 @@ async def websocket_progress(websocket: WebSocket) -> None:
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
+        pass
+    finally:
         progress_manager.disconnect(websocket)

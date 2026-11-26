@@ -104,6 +104,12 @@ def race_ai_candidates(
                 _submit_cand(valid_cands[next_idx])
                 next_idx += 1
 
+        if in_flight and isinstance(last_error, TimeoutError):
+            for cand, _ in in_flight.values():
+                provider = str(cand.get("provider") or "unknown")
+                model = str(cand.get("model") or cand.get("name") or "unknown")
+                report_model_failure(provider, model, str(last_error))
+
         if last_error is not None:
             raise last_error
         raise RuntimeError(f"All {len(valid_cands)} candidates failed for {label}")

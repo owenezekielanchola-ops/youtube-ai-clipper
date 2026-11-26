@@ -146,5 +146,49 @@
       "cooked"
     ],
     "description": "Deep dramatic bell toll / Taco Bell / Undertaker bong for savage roasts, 'he is cooked' doom moments, or brutal punchlines."
+  },
+  "tts_3da1d55b.mp3": {
+    "id": "sfx_52b503c3",
+    "name": "Intro Hook TTS",
+    "duration": 3.53,
+    "tags": [
+      "voiceover",
+      "tts",
+      "excited"
+    ],
+    "description": "TTS.ai (kokoro/excited): You won't believe what happens next in GTA 6!"
+  },
+  "tts_dc97ebae.mp3": {
+    "id": "sfx_7277732b",
+    "name": "Intro Hook TTS",
+    "duration": 5.98,
+    "tags": [
+      "voiceover",
+      "tts",
+      "af_bella"
+    ],
+    "description": "TTS.ai (kokoro/af_bella): Get ready for the wildest marathon in GTA 6 \u2013 watch as the chaos unfolds!"
+  },
+  "tts_186b3af2.mp3": {
+    "id": "sfx_a2832526",
+    "name": "Intro Hook TTS",
+    "duration": 8.43,
+    "tags": [
+      "voiceover",
+      "tts",
+      "af_bella"
+    ],
+    "description": "TTS.ai (kokoro/af_bella): Get ready for the intense action in GTA 6 Day 4! Watch as the situation escalates into a major confrontation."
+  },
+  "tts_0de0a609.mp3": {
+    "id": "sfx_e33c46de",
+    "name": "TTS: Let's take a look carefully.",
+    "duration": 2.13,
+    "tags": [
+      "voiceover",
+      "tts",
+      "am_adam"
+    ],
+    "description": "TTS.ai (kokoro/am_adam): Let's take a look carefully."
   }
 }

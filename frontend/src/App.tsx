@@ -21,7 +21,7 @@ export function App() {
         >
           <div className="flex items-center gap-2 min-w-0">
             <Info className="w-3.5 h-3.5 text-amber-300 shrink-0" />
-            <span className="break-words" title={statusBanner}>
+            <span className="break-words select-text" title={statusBanner}>
               {statusBanner}
             </span>
           </div>

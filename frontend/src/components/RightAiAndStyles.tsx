@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
+  AudioLines,
   Bot,
   Brain,
   Check,
@@ -22,13 +23,25 @@ import {
   Square,
   Undo2,
   Volume2,
+  VolumeX,
   Wand2,
+  X,
 } from 'lucide-react';
-import { getCampaignById } from '../config/campaigns';
+import {
+  buildPostEditCampaignChecklist,
+  getCampaignById,
+} from '../config/campaigns';
 import { API_BASE, DEFAULT_OVERLAY_STYLE, useEditorStore } from '../store/useEditorStore';
-import type { CaptionPosition, CaptionPreset, OverlayPosition } from '../types/editor';
+import type {
+  CaptionPosition,
+  CaptionPreset,
+  OverlayPosition,
+  SfxAsset,
+} from '../types/editor';
 
 const QUICK_PROMPTS = [
+  'Add a TTS-ready intro hook caption & AI voiceover explaining what happens next',
+  'Mute the video audio from 2s to 5s',
   'Find the funniest viral moment and make a 9:16 Short with karaoke captions',
   'Zoom to the creator when he gets a reaction',
   'What are they doing? List the funny parts',
@@ -44,7 +57,9 @@ export const RightAiAndStyles: React.FC = () => {
   const isAiThinking = useEditorStore((s) => s.isAiThinking);
   const setIsAiThinking = useEditorStore((s) => s.setIsAiThinking);
   const appendAiMessage = useEditorStore((s) => s.appendAiMessage);
+  const updateAiMessage = useEditorStore((s) => s.updateAiMessage);
   const applyAiToolCalls = useEditorStore((s) => s.applyAiToolCalls);
+  const fetchSfxLibrary = useEditorStore((s) => s.fetchSfxLibrary);
   const change_caption_style = useEditorStore((s) => s.change_caption_style);
   const setStatusBanner = useEditorStore((s) => s.setStatusBanner);
   const modelStatus = useEditorStore((s) => s.modelStatus);
@@ -60,12 +75,16 @@ export const RightAiAndStyles: React.FC = () => {
   const selectedZoomId = useEditorStore((s) => s.selectedZoomId);
   const selectedDrawingId = useEditorStore((s) => s.selectedDrawingId);
   const selectedSfxId = useEditorStore((s) => s.selectedSfxId);
+  const selectedAudioEditId = useEditorStore((s) => s.selectedAudioEditId);
   const update_zoom_effect = useEditorStore((s) => s.update_zoom_effect);
   const delete_zoom_effect = useEditorStore((s) => s.delete_zoom_effect);
   const update_drawing = useEditorStore((s) => s.update_drawing);
   const delete_drawing = useEditorStore((s) => s.delete_drawing);
   const update_sfx_clip = useEditorStore((s) => s.update_sfx_clip);
   const delete_sfx_clip = useEditorStore((s) => s.delete_sfx_clip);
+  const update_audio_edit = useEditorStore((s) => s.update_audio_edit);
+  const delete_audio_edit = useEditorStore((s) => s.delete_audio_edit);
+  const split_audio_at = useEditorStore((s) => s.split_audio_at);
   const sfxLibrary = useEditorStore((s) => s.sfxLibrary);
   const isCropMode = useEditorStore((s) => s.isCropMode);
   const setIsCropMode = useEditorStore((s) => s.setIsCropMode);
@@ -87,6 +106,8 @@ export const RightAiAndStyles: React.FC = () => {
     (project.tracks.drawings ?? []).find((d) => d.id === selectedDrawingId) ?? null;
   const selectedSfx =
     (project.tracks.sfx ?? []).find((s) => s.id === selectedSfxId) ?? null;
+  const selectedAudioEdit =
+    (project.tracks.audioEdits ?? []).find((a) => a.id === selectedAudioEditId) ?? null;
   const selectedSfxAsset = selectedSfx
     ? sfxLibrary.find((a) => a.id === selectedSfx.assetId) ?? null
     : null;
@@ -94,7 +115,8 @@ export const RightAiAndStyles: React.FC = () => {
   const sfxSourceDur = selectedSfx
     ? Math.max(
         sfxTrimStart + selectedSfx.duration,
-        selectedSfxAsset?.duration ?? sfxTrimStart + selectedSfx.duration,
+        selectedSfx.sourceDuration ?? 0,
+        selectedSfxAsset?.duration ?? 0,
       )
     : 1.5;
   const [copiedMsgId, setCopiedMsgId] = useState<string | null>(null);
@@ -104,6 +126,7 @@ export const RightAiAndStyles: React.FC = () => {
   const [refInstruction, setRefInstruction] = useState('');
   const [isCloningStyle, setIsCloningStyle] = useState(false);
   const [isPreviewingSfx, setIsPreviewingSfx] = useState(false);
+  const [isTranscribing, setIsTranscribing] = useState(false);
 
   const [activeTab, setActiveTab] = useState<'ai' | 'styles'>('ai');
   const lastActionMsgId = [...aiMessages]
@@ -112,8 +135,11 @@ export const RightAiAndStyles: React.FC = () => {
 
   const sfxPreviewAudioRef = useRef<HTMLAudioElement | null>(null);
   const sfxPreviewTimerRef = useRef<number | null>(null);
+  const recordingStreamRef = useRef<MediaStream | null>(null);
+  const copyTimerRef = useRef<number | null>(null);
+  const submitAiPromptRef = useRef<(promptText: string) => Promise<void>>(async () => {});
 
-  const stopPreviewSfx = () => {
+  const clearSfxPreviewResources = () => {
     if (sfxPreviewTimerRef.current !== null) {
       window.clearTimeout(sfxPreviewTimerRef.current);
       sfxPreviewTimerRef.current = null;
@@ -122,6 +148,10 @@ export const RightAiAndStyles: React.FC = () => {
       sfxPreviewAudioRef.current.pause();
       sfxPreviewAudioRef.current = null;
     }
+  };
+
+  const stopPreviewSfx = () => {
+    clearSfxPreviewResources();
     setIsPreviewingSfx(false);
   };
 
@@ -130,13 +160,29 @@ export const RightAiAndStyles: React.FC = () => {
   }, [selectedSfxId]);
 
   useEffect(() => {
+    if (activeTab !== 'styles') {
+      stopPreviewSfx();
+    }
+  }, [activeTab]);
+
+  useEffect(() => {
     void fetchModelStatus();
     const intervalId = window.setInterval(() => {
       void forceRefreshModels();
     }, 24 * 60 * 60 * 1000);
     return () => {
       window.clearInterval(intervalId);
-      stopPreviewSfx();
+      clearSfxPreviewResources();
+      if (copyTimerRef.current !== null) {
+        window.clearTimeout(copyTimerRef.current);
+        copyTimerRef.current = null;
+      }
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+        mediaRecorderRef.current.onstop = null;
+        mediaRecorderRef.current.stop();
+      }
+      recordingStreamRef.current?.getTracks().forEach((t) => t.stop());
+      recordingStreamRef.current = null;
     };
   }, [fetchModelStatus, forceRefreshModels]);
 
@@ -151,8 +197,12 @@ export const RightAiAndStyles: React.FC = () => {
     audio.volume = Math.min(1, Math.max(0, selectedSfx.volume));
     sfxPreviewAudioRef.current = audio;
     setIsPreviewingSfx(true);
-    audio.onended = () => stopPreviewSfx();
-    audio.onerror = () => stopPreviewSfx();
+    audio.onended = () => {
+      if (sfxPreviewAudioRef.current === audio) stopPreviewSfx();
+    };
+    audio.onerror = () => {
+      if (sfxPreviewAudioRef.current === audio) stopPreviewSfx();
+    };
 
     const startOffset = sfxTrimStart;
     const playDurMs = Math.max(150, Math.round(selectedSfx.duration * 1000));
@@ -164,10 +214,12 @@ export const RightAiAndStyles: React.FC = () => {
         .then(() => {
           if (sfxPreviewAudioRef.current !== audio) return;
           sfxPreviewTimerRef.current = window.setTimeout(() => {
-            stopPreviewSfx();
+            if (sfxPreviewAudioRef.current === audio) stopPreviewSfx();
           }, playDurMs);
         })
-        .catch(() => stopPreviewSfx());
+        .catch(() => {
+          if (sfxPreviewAudioRef.current === audio) stopPreviewSfx();
+        });
     };
 
     if (startOffset > 0.02 && audio.readyState < 1) {
@@ -180,8 +232,45 @@ export const RightAiAndStyles: React.FC = () => {
   const [isRecording, setIsRecording] = useState(false);
   const [isChatExpanded, setIsChatExpanded] = useState(false);
   const [deepThink, setDeepThink] = useState(false);
-  const [showQuickPrompts, setShowQuickPrompts] = useState(false);
+  const [showQuickPrompts, setShowQuickPrompts] = useState(true);
   const [copiedTextId, setCopiedTextId] = useState<string | null>(null);
+  const [numDrafts, setNumDrafts] = useState<Record<string, string>>({});
+  const [overlayTextDraft, setOverlayTextDraft] = useState<string | null>(null);
+
+  const copyToClipboardSafe = (text: string, onSuccess: () => void) => {
+    const done = () => {
+      onSuccess();
+      if (copyTimerRef.current !== null) {
+        window.clearTimeout(copyTimerRef.current);
+      }
+      copyTimerRef.current = window.setTimeout(() => {
+        setCopiedTextId(null);
+        setCopiedMsgId(null);
+        copyTimerRef.current = null;
+      }, 1800);
+    };
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard
+        .writeText(text)
+        .then(done)
+        .catch(() => setStatusBanner('Could not copy text to clipboard.'));
+      return;
+    }
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      if (ok) done();
+      else setStatusBanner('Could not copy text to clipboard.');
+    } catch {
+      setStatusBanner('Clipboard access is unavailable.');
+    }
+  };
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
@@ -191,19 +280,21 @@ export const RightAiAndStyles: React.FC = () => {
   useEffect(() => {
     if (activeTab !== 'ai') return;
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
-  }, [aiMessages.length, isAiThinking, activeTab]);
+  }, [aiMessages.length, isAiThinking, isCloningStyle, activeTab]);
 
   const submitAiPrompt = async (promptText: string) => {
     const trimmed = promptText.trim();
-    if (!trimmed || isAiThinking || isIngesting) return;
+    if (!trimmed || isAiThinking || isCloningStyle || isIngesting) return;
 
     if (!project.sourceVideo.videoUrl && pendingYoutubeUrl.trim()) {
       setPromptInput('');
+      setShowQuickPrompts(false);
       await ingestYoutubeUrl(pendingYoutubeUrl.trim(), trimmed);
       return;
     }
 
     const liveState = useEditorStore.getState();
+    const reqProjectId = liveState.project.projectId;
     const active = getCampaignById(liveState.project.workspaceState.activeCampaignId);
 
     appendAiMessage({
@@ -213,10 +304,11 @@ export const RightAiAndStyles: React.FC = () => {
       campaignLabel: active?.label,
     });
     setPromptInput('');
+    setShowQuickPrompts(false);
     setIsAiThinking(true);
 
     try {
-      const history = aiMessages.slice(-6).map((m) => ({
+      const history = liveState.aiMessages.slice(-6).map((m) => ({
         role: m.role,
         content: m.content,
       }));
@@ -225,7 +317,7 @@ export const RightAiAndStyles: React.FC = () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           prompt: trimmed,
-          project_state: useEditorStore.getState().project,
+          project_state: liveState.project,
           history,
           campaign_id: active?.id,
           campaign_rules: active?.editingRules ?? [],
@@ -237,18 +329,59 @@ export const RightAiAndStyles: React.FC = () => {
         throw new Error(err.detail || 'AI edit failed');
       }
       const data = await resp.json();
+      if (useEditorStore.getState().project.projectId !== reqProjectId) return;
+
+      const generatedAssets = Array.isArray(data.generated_assets)
+        ? (data.generated_assets as SfxAsset[])
+        : [];
+      if (generatedAssets.length > 0) {
+        void fetchSfxLibrary();
+      }
+      const proposedCalls = Array.isArray(data.tool_calls) ? data.tool_calls : [];
+      if (data.requires_confirmation && proposedCalls.length > 0) {
+        appendAiMessage({
+          id: `a_plan_${Date.now()}`,
+          role: 'assistant',
+          content: data.message,
+          routeUsed: data.route_used,
+          generatedAssets,
+          pendingProposal: {
+            projectId: reqProjectId,
+            toolCalls: proposedCalls,
+            autoCaptions: data.auto_captions || null,
+            generatedAssets,
+            status: 'pending',
+          },
+        });
+        return;
+      }
       const executed = applyAiToolCalls(
-        data.tool_calls || [],
+        proposedCalls,
         data.auto_captions || null,
       );
+      const liveCampaign = getCampaignById(
+        useEditorStore.getState().project.workspaceState.activeCampaignId,
+      );
+      const postChecklist = liveCampaign
+        ? buildPostEditCampaignChecklist(
+            liveCampaign,
+            useEditorStore.getState().project.projectName,
+          )
+        : null;
       appendAiMessage({
         id: `a_${Date.now()}`,
         role: 'assistant',
-        content: data.message,
+        content: postChecklist
+          ? `${data.message}\n\n${postChecklist.checklistText}`
+          : data.message,
         routeUsed: data.route_used,
         actions: executed,
+        generatedAssets,
+        campaignLabel: liveCampaign?.label,
+        copyableCaption: postChecklist?.copyableCaption,
       });
     } catch (err) {
+      if (useEditorStore.getState().project.projectId !== reqProjectId) return;
       appendAiMessage({
         id: `err_${Date.now()}`,
         role: 'assistant',
@@ -258,14 +391,69 @@ export const RightAiAndStyles: React.FC = () => {
       setIsAiThinking(false);
     }
   };
+  submitAiPromptRef.current = submitAiPrompt;
+
+  const acceptPendingProposal = (msgId: string) => {
+    const curState = useEditorStore.getState();
+    const target = curState.aiMessages.find((m) => m.id === msgId);
+    const proposal = target?.pendingProposal;
+    if (!target || !proposal || proposal.status !== 'pending') return;
+    if (proposal.projectId && proposal.projectId !== curState.project.projectId) {
+      setStatusBanner('This edit plan was generated for a previous project.');
+      updateAiMessage(msgId, {
+        pendingProposal: { ...proposal, status: 'dismissed' },
+      });
+      return;
+    }
+
+    const executed = applyAiToolCalls(
+      proposal.toolCalls || [],
+      proposal.autoCaptions || null,
+    );
+    if ((proposal.generatedAssets?.length ?? 0) > 0) {
+      void fetchSfxLibrary();
+    }
+    const liveCampaign = getCampaignById(
+      useEditorStore.getState().project.workspaceState.activeCampaignId,
+    );
+    const postChecklist = liveCampaign
+      ? buildPostEditCampaignChecklist(
+          liveCampaign,
+          useEditorStore.getState().project.projectName,
+        )
+      : null;
+
+    updateAiMessage(msgId, {
+      pendingProposal: { ...proposal, status: 'accepted' },
+      actions: executed,
+      content: postChecklist
+        ? `${target.content}\n\n${postChecklist.checklistText}`
+        : target.content,
+      campaignLabel: liveCampaign?.label,
+      copyableCaption: postChecklist?.copyableCaption,
+    });
+  };
+
+  const dismissPendingProposal = (msgId: string) => {
+    const target = useEditorStore
+      .getState()
+      .aiMessages.find((m) => m.id === msgId);
+    const proposal = target?.pendingProposal;
+    if (!proposal || proposal.status !== 'pending') return;
+    updateAiMessage(msgId, {
+      pendingProposal: { ...proposal, status: 'dismissed' },
+    });
+  };
 
   const submitReferenceStyle = async () => {
     const cleanRef = refUrl.trim();
     if (!cleanRef || isCloningStyle || isAiThinking || isIngesting) return;
-    if (!project.sourceVideo.videoUrl) {
+    const liveState = useEditorStore.getState();
+    if (!liveState.project.sourceVideo.videoUrl) {
       setStatusBanner('Load or clip your source video first before cloning a reference style.');
       return;
     }
+    const reqProjectId = liveState.project.projectId;
 
     appendAiMessage({
       id: `u_ref_${Date.now()}`,
@@ -282,7 +470,7 @@ export const RightAiAndStyles: React.FC = () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           reference_url: cleanRef,
-          project_state: useEditorStore.getState().project,
+          project_state: liveState.project,
           custom_instruction: refInstruction.trim() || undefined,
           deep_think: deepThink,
         }),
@@ -292,19 +480,36 @@ export const RightAiAndStyles: React.FC = () => {
         throw new Error(err.detail || 'Reference style analysis failed');
       }
       const data = await resp.json();
-      const executed = applyAiToolCalls(
-        data.tool_calls || [],
-        data.auto_captions || null,
-      );
+      if (useEditorStore.getState().project.projectId !== reqProjectId) return;
+
+      const generatedAssets = Array.isArray(data.generated_assets)
+        ? (data.generated_assets as SfxAsset[])
+        : [];
+      if (generatedAssets.length > 0) {
+        void fetchSfxLibrary();
+      }
+      const proposedCalls = Array.isArray(data.tool_calls) ? data.tool_calls : [];
       appendAiMessage({
         id: `a_ref_${Date.now()}`,
         role: 'assistant',
         content: data.message,
         routeUsed: data.route_used,
-        actions: executed,
+        generatedAssets,
+        ...(proposedCalls.length > 0
+          ? {
+              pendingProposal: {
+                projectId: reqProjectId,
+                toolCalls: proposedCalls,
+                autoCaptions: data.auto_captions || null,
+                generatedAssets,
+                status: 'pending' as const,
+              },
+            }
+          : {}),
       });
       setRefInstruction('');
     } catch (err) {
+      if (useEditorStore.getState().project.projectId !== reqProjectId) return;
       appendAiMessage({
         id: `err_ref_${Date.now()}`,
         role: 'assistant',
@@ -324,7 +529,18 @@ export const RightAiAndStyles: React.FC = () => {
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const recorder = new MediaRecorder(stream);
+      recordingStreamRef.current = stream;
+      const preferredMime =
+        typeof MediaRecorder.isTypeSupported === 'function'
+          ? MediaRecorder.isTypeSupported('audio/webm')
+            ? 'audio/webm'
+            : MediaRecorder.isTypeSupported('audio/mp4')
+              ? 'audio/mp4'
+              : ''
+          : '';
+      const recorder = preferredMime
+        ? new MediaRecorder(stream, { mimeType: preferredMime })
+        : new MediaRecorder(stream);
       audioChunksRef.current = [];
 
       recorder.ondataavailable = (ev) => {
@@ -332,9 +548,16 @@ export const RightAiAndStyles: React.FC = () => {
       };
       recorder.onstop = async () => {
         stream.getTracks().forEach((t) => t.stop());
-        const blob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
+        if (recordingStreamRef.current === stream) {
+          recordingStreamRef.current = null;
+        }
+        const blobType = recorder.mimeType || preferredMime || 'audio/webm';
+        const blob = new Blob(audioChunksRef.current, { type: blobType });
+        if (blob.size === 0) return;
+        const ext = blobType.includes('mp4') ? 'm4a' : blobType.includes('ogg') ? 'ogg' : 'webm';
         const formData = new FormData();
-        formData.append('file', blob, 'voice.webm');
+        formData.append('file', blob, `voice.${ext}`);
+        setIsTranscribing(true);
         try {
           const resp = await fetch(`${API_BASE}/api/voice-transcribe`, {
             method: 'POST',
@@ -343,7 +566,7 @@ export const RightAiAndStyles: React.FC = () => {
           if (resp.ok) {
             const data = await resp.json();
             if (data.text) {
-              await submitAiPrompt(data.text);
+              await submitAiPromptRef.current(data.text);
             }
           } else {
             const err = await resp.json().catch(() => ({ detail: 'Voice error' }));
@@ -353,6 +576,8 @@ export const RightAiAndStyles: React.FC = () => {
           setStatusBanner(
             `Voice error: ${err instanceof Error ? err.message : String(err)}`,
           );
+        } finally {
+          setIsTranscribing(false);
         }
       };
 
@@ -377,7 +602,7 @@ export const RightAiAndStyles: React.FC = () => {
   return (
     <aside
       className={`${
-        isChatExpanded ? 'w-[520px]' : 'w-[360px] xl:w-[400px]'
+        isChatExpanded ? 'w-[520px] max-w-[45vw]' : 'w-[360px] xl:w-[400px]'
       } border-l border-[#272f40] bg-[#151922] flex flex-col min-h-0 shrink-0 transition-[width] duration-150`}
     >
       {/* Segmented Header Tabs + Panel Width Toggle */}
@@ -406,7 +631,11 @@ export const RightAiAndStyles: React.FC = () => {
           >
             <Palette className="w-3.5 h-3.5" />
             <span>Styles &amp; Tools</span>
-            {(selectedZoom || selectedDrawing || selectedSfx || hasActiveCrop) && (
+            {(selectedZoom ||
+              selectedDrawing ||
+              selectedSfx ||
+              selectedAudioEdit ||
+              hasActiveCrop) && (
               <span
                 className="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0"
                 title="Active selection or crop settings available"
@@ -445,7 +674,9 @@ export const RightAiAndStyles: React.FC = () => {
               >
                 <span
                   className={`w-2 h-2 rounded-full shrink-0 ${
-                    modelStatus?.groqConfigured || modelStatus?.nvidiaConfigured
+                    modelStatus?.groqConfigured ||
+                    modelStatus?.geminiConfigured ||
+                    modelStatus?.nvidiaConfigured
                       ? 'bg-emerald-400'
                       : 'bg-amber-400'
                   }`}
@@ -635,9 +866,9 @@ export const RightAiAndStyles: React.FC = () => {
             )}
 
             {isRefOpen && (
-              <div className="mt-2 p-2.5 rounded-xl bg-[#1c212d] border border-[#272f40] space-y-2 max-h-60 overflow-y-auto">
+              <div className="mt-2 p-2.5 rounded-xl bg-[#1c212d] border border-[#272f40] space-y-2 max-h-64 overflow-y-auto">
                 <p className="text-[11px] text-slate-400 leading-relaxed">
-                  Paste a reference YouTube Short/video. Gemini breaks down its funny beats, pacing, zooms &amp; captions and matches them onto your clip.
+                  Paste a reference YouTube Short/video and combine it with your own prompt (e.g. add TTS voiceover or intro hook). AI explains what it will do first so you can click Accept.
                 </p>
                 <input
                   type="url"
@@ -650,12 +881,18 @@ export const RightAiAndStyles: React.FC = () => {
                   type="text"
                   value={refInstruction}
                   onChange={(e) => setRefInstruction(e.target.value)}
-                  placeholder="Optional note (e.g. copy zooms & fast captions)"
+                  placeholder="Combined prompt (e.g. add TTS intro explaining GTA VI, copy zooms)"
                   className="w-full bg-[#12161f] border border-[#272f40] focus:border-sky-400 rounded-lg px-2.5 py-1.5 text-xs text-slate-200 placeholder:text-slate-500 outline-none"
                 />
                 <button
                   type="button"
-                  disabled={!refUrl.trim() || !project.sourceVideo.videoUrl || isCloningStyle}
+                  disabled={
+                    !refUrl.trim() ||
+                    !project.sourceVideo.videoUrl ||
+                    isCloningStyle ||
+                    isAiThinking ||
+                    isIngesting
+                  }
                   onClick={() => void submitReferenceStyle()}
                   className={`w-full py-2 rounded-lg disabled:opacity-40 text-slate-950 text-xs font-semibold flex items-center justify-center gap-1.5 transition cursor-pointer ${
                     deepThink
@@ -667,8 +904,8 @@ export const RightAiAndStyles: React.FC = () => {
                     <>
                       <Loader2 className="w-3.5 h-3.5 animate-spin" />
                       {deepThink
-                        ? 'Deep Thinking: analyzing reference & your clip...'
-                        : 'Analyzing Reference Style...'}
+                        ? 'Deep Thinking: explaining combined plan...'
+                        : 'Planning & Explaining Clone...'}
                     </>
                   ) : (
                     <>
@@ -678,8 +915,8 @@ export const RightAiAndStyles: React.FC = () => {
                         <Wand2 className="w-3.5 h-3.5" />
                       )}
                       {deepThink
-                        ? 'Deep Clone Style onto My Clip'
-                        : 'Clone Style onto My Clip'}
+                        ? 'Deep Plan & Preview Clone'
+                        : 'Plan & Preview Clone'}
                     </>
                   )}
                 </button>
@@ -728,11 +965,9 @@ export const RightAiAndStyles: React.FC = () => {
                     {msg.role === 'assistant' && msg.content && (
                       <button
                         type="button"
-                        onClick={() => {
-                          void navigator.clipboard?.writeText(msg.content);
-                          setCopiedTextId(msg.id);
-                          window.setTimeout(() => setCopiedTextId(null), 1500);
-                        }}
+                        onClick={() =>
+                          copyToClipboardSafe(msg.content, () => setCopiedTextId(msg.id))
+                        }
                         title="Copy AI reply"
                         aria-label="Copy AI reply"
                         className="p-1 rounded hover:bg-white/10 text-slate-400 hover:text-slate-100 transition shrink-0 cursor-pointer"
@@ -746,19 +981,87 @@ export const RightAiAndStyles: React.FC = () => {
                     )}
                   </div>
                 </div>
-                <p className="text-[13px] leading-[1.55] text-slate-100 whitespace-pre-wrap break-words">
+                <p className="text-[13px] leading-[1.55] text-slate-100 whitespace-pre-wrap break-words select-text">
                   {msg.content}
                 </p>
+
+                {msg.generatedAssets && msg.generatedAssets.length > 0 && (
+                  <div className="pt-1.5 space-y-1.5">
+                    {msg.generatedAssets.map((asset) => (
+                      <div
+                        key={asset.id}
+                        className="rounded-lg bg-[#12161f] border border-emerald-500/30 p-2 space-y-1"
+                      >
+                        <div className="flex items-center justify-between gap-2 text-[11px] text-emerald-300 font-medium">
+                          <span className="inline-flex items-center gap-1 truncate">
+                            <Volume2 className="w-3 h-3 shrink-0" />
+                            <span className="truncate">{asset.name}</span>
+                          </span>
+                          <span className="text-slate-400 shrink-0 tabular-nums">
+                            {asset.duration.toFixed(1)}s
+                          </span>
+                        </div>
+                        <audio
+                          controls
+                          preload="metadata"
+                          src={asset.url}
+                          className="w-full h-7"
+                        />
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {msg.pendingProposal && (
+                  <div className="pt-2 border-t border-[#272f40] flex flex-wrap items-center justify-between gap-2">
+                    {msg.pendingProposal.status === 'pending' ? (
+                      <>
+                        <span className="text-[11px] text-sky-300 font-medium">
+                          {msg.pendingProposal.toolCalls.length} planned edit(s) ready — apply to timeline?
+                        </span>
+                        <div className="flex items-center gap-1.5 ml-auto">
+                          <button
+                            type="button"
+                            onClick={() => dismissPendingProposal(msg.id)}
+                            className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-[#12161f] hover:bg-[#232938] border border-[#2f394e] text-slate-300 text-[11px] font-medium transition cursor-pointer"
+                          >
+                            <X className="w-3 h-3" />
+                            Cancel
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => acceptPendingProposal(msg.id)}
+                            className="inline-flex items-center gap-1 px-3 py-1 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-[11px] font-semibold transition cursor-pointer shadow-sm"
+                          >
+                            <Check className="w-3.5 h-3.5" />
+                            Accept &amp; Apply Edits
+                          </button>
+                        </div>
+                      </>
+                    ) : msg.pendingProposal.status === 'accepted' ? (
+                      <span className="inline-flex items-center gap-1 text-[11px] text-emerald-300 font-medium">
+                        <Check className="w-3 h-3" />
+                        Accepted &amp; applied to timeline
+                      </span>
+                    ) : (
+                      <span className="inline-flex items-center gap-1 text-[11px] text-slate-400">
+                        <X className="w-3 h-3" />
+                        Canceled — timeline unchanged
+                      </span>
+                    )}
+                  </div>
+                )}
 
                 {msg.copyableCaption && (
                   <div className="pt-1 flex items-center justify-end">
                     <button
                       type="button"
-                      onClick={() => {
-                        void navigator.clipboard?.writeText(msg.copyableCaption || '');
-                        setCopiedMsgId(msg.id);
-                        window.setTimeout(() => setCopiedMsgId(null), 2000);
-                      }}
+                      onClick={() =>
+                        copyToClipboardSafe(
+                          msg.copyableCaption || '',
+                          () => setCopiedMsgId(msg.id),
+                        )
+                      }
                       className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-semibold transition cursor-pointer ${
                         copiedMsgId === msg.id
                           ? 'bg-emerald-500 text-slate-950'
@@ -807,7 +1110,7 @@ export const RightAiAndStyles: React.FC = () => {
                 )}
               </div>
             ))}
-            {isAiThinking && (
+            {(isAiThinking || isCloningStyle) && (
               <div
                 className={`flex items-center gap-2 text-xs rounded-xl p-2.5 border ${
                   deepThink
@@ -821,9 +1124,11 @@ export const RightAiAndStyles: React.FC = () => {
                   }`}
                 />
                 <span>
-                  {deepThink
-                    ? 'Deep Thinking: understanding request & inspecting high-res frames...'
-                    : 'Planning visuals & executing timeline edits...'}
+                  {isCloningStyle
+                    ? 'Analyzing reference pacing & preparing preview plan...'
+                    : deepThink
+                      ? 'Deep Thinking: understanding request & inspecting high-res frames...'
+                      : 'Planning visuals & executing timeline edits...'}
                 </span>
               </div>
             )}
@@ -890,7 +1195,7 @@ export const RightAiAndStyles: React.FC = () => {
               </span>
             </div>
 
-            {(showQuickPrompts || aiMessages.length <= 1) && (
+            {showQuickPrompts && (
               <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
                 {QUICK_PROMPTS.map((qp) => (
                   <button
@@ -898,7 +1203,9 @@ export const RightAiAndStyles: React.FC = () => {
                     type="button"
                     disabled={
                       isAiThinking ||
+                      isCloningStyle ||
                       isIngesting ||
+                      isTranscribing ||
                       !(project.sourceVideo.videoUrl || pendingYoutubeUrl.trim())
                     }
                     onClick={() => submitAiPrompt(qp)}
@@ -924,7 +1231,7 @@ export const RightAiAndStyles: React.FC = () => {
                 title={showQuickPrompts ? 'Hide quick prompt suggestions' : 'Show quick prompt suggestions'}
                 aria-label="Toggle quick prompt suggestions"
                 className={`p-2 rounded-xl border transition shrink-0 cursor-pointer ${
-                  showQuickPrompts || aiMessages.length <= 1
+                  showQuickPrompts
                     ? 'bg-amber-400/15 border-amber-400/40 text-amber-300'
                     : 'bg-[#1c212d] border-[#272f40] text-slate-400 hover:text-slate-100 hover:bg-[#242b3b]'
                 }`}
@@ -933,15 +1240,24 @@ export const RightAiAndStyles: React.FC = () => {
               </button>
               <button
                 type="button"
+                disabled={isTranscribing}
                 onClick={toggleVoiceRecording}
-                title={isRecording ? 'Stop & send voice command' : 'Record voice command'}
-                className={`p-2 rounded-xl border transition shrink-0 cursor-pointer ${
+                title={
+                  isTranscribing
+                    ? 'Transcribing voice...'
+                    : isRecording
+                      ? 'Stop & send voice command'
+                      : 'Record voice command'
+                }
+                className={`p-2 rounded-xl border transition shrink-0 cursor-pointer disabled:opacity-50 ${
                   isRecording
                     ? 'bg-rose-500/20 border-rose-500 text-rose-300 animate-pulse'
                     : 'bg-[#1c212d] border-[#272f40] text-slate-300 hover:text-slate-100 hover:bg-[#242b3b]'
                 }`}
               >
-                {isRecording ? (
+                {isTranscribing ? (
+                  <Loader2 className="w-4 h-4 animate-spin text-amber-300" />
+                ) : isRecording ? (
                   <MicOff className="w-4 h-4" />
                 ) : (
                   <Mic className="w-4 h-4" />
@@ -966,7 +1282,13 @@ export const RightAiAndStyles: React.FC = () => {
               />
               <button
                 type="submit"
-                disabled={isAiThinking || isIngesting || !promptInput.trim()}
+                disabled={
+                  isAiThinking ||
+                  isCloningStyle ||
+                  isIngesting ||
+                  isTranscribing ||
+                  !promptInput.trim()
+                }
                 className="p-2 rounded-xl bg-amber-400 hover:bg-amber-300 disabled:opacity-40 text-slate-950 transition shrink-0 cursor-pointer"
                 title="Send prompt"
               >
@@ -976,8 +1298,190 @@ export const RightAiAndStyles: React.FC = () => {
           </div>
         </div>
       ) : (
-        /* Caption, Crop, Zoom, Drawing, SFX & Overlay Customizer */
+        /* Caption, Crop, Zoom, Drawing, Audio, SFX & Overlay Customizer */
         <div className="flex-1 min-h-0 overflow-y-auto p-3 space-y-3">
+          {/* Selected Video Audio Segment Inspector */}
+          {selectedAudioEdit && (() => {
+            const curVol = selectedAudioEdit.muted ? 0 : selectedAudioEdit.volume;
+            const playhead = project.workspaceState.playheadPosition;
+            const canCutHere =
+              playhead > selectedAudioEdit.start + 0.15 &&
+              playhead < selectedAudioEdit.end - 0.15;
+            return (
+              <div className="p-3 rounded-xl bg-[#1c212d] border border-rose-400/35 space-y-2.5">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-semibold text-rose-300 flex items-center gap-1.5">
+                    {selectedAudioEdit.muted ? (
+                      <VolumeX className="w-3.5 h-3.5" />
+                    ) : (
+                      <Volume2 className="w-3.5 h-3.5 text-emerald-300" />
+                    )}
+                    Video Audio Segment
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => delete_audio_edit(selectedAudioEdit.id)}
+                    className="text-[11px] text-rose-400 hover:text-rose-300 underline cursor-pointer"
+                  >
+                    Restore Normal
+                  </button>
+                </div>
+
+                <div className="grid grid-cols-4 gap-1">
+                  {[
+                    { label: 'Mute', muted: true, volume: 0 },
+                    { label: '25%', muted: false, volume: 0.25 },
+                    { label: '100%', muted: false, volume: 1.0 },
+                    { label: '150%', muted: false, volume: 1.5 },
+                  ].map((preset) => {
+                    const isMatch =
+                      preset.muted === selectedAudioEdit.muted &&
+                      Math.abs(curVol - preset.volume) < 0.03;
+                    return (
+                      <button
+                        key={preset.label}
+                        type="button"
+                        onClick={() =>
+                          update_audio_edit(selectedAudioEdit.id, {
+                            muted: preset.muted,
+                            volume: preset.volume,
+                            label: preset.muted
+                              ? 'Muted audio'
+                              : `Audio ${Math.round(preset.volume * 100)}%`,
+                          })
+                        }
+                        className={`py-1 rounded-lg text-[11px] border transition cursor-pointer ${
+                          isMatch
+                            ? preset.muted
+                              ? 'bg-rose-500 text-white border-rose-400 font-semibold'
+                              : 'bg-emerald-500 text-slate-950 border-emerald-400 font-semibold'
+                            : 'bg-[#12161f] border-[#272f40] text-slate-300 hover:border-slate-500'
+                        }`}
+                      >
+                        {preset.label}
+                      </button>
+                    );
+                  })}
+                </div>
+
+                <div className="space-y-1">
+                  <div className="flex justify-between text-[11px] text-slate-300">
+                    <span>Original Video Volume</span>
+                    <span className="font-mono text-amber-300 tabular-nums">
+                      {selectedAudioEdit.muted ? '0% (Muted)' : `${Math.round(curVol * 100)}%`}
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={0}
+                    max={2}
+                    step={0.05}
+                    value={curVol}
+                    onChange={(e) => {
+                      const nextV = Number(e.target.value);
+                      update_audio_edit(selectedAudioEdit.id, {
+                        muted: nextV <= 0.001,
+                        volume: nextV,
+                        label:
+                          nextV <= 0.001
+                            ? 'Muted audio'
+                            : `Audio ${Math.round(nextV * 100)}%`,
+                      });
+                    }}
+                    aria-label="Video audio volume"
+                    className="w-full accent-rose-400"
+                  />
+                </div>
+
+                <div className="grid grid-cols-2 gap-2">
+                  <div className="space-y-0.5">
+                    <label className="text-[10px] text-slate-400">Start (s)</label>
+                    <input
+                      type="number"
+                      step="0.1"
+                      min="0"
+                      value={
+                        numDrafts[`aud_start_${selectedAudioEdit.id}`] ??
+                        String(selectedAudioEdit.start)
+                      }
+                      onChange={(e) =>
+                        setNumDrafts((prev) => ({
+                          ...prev,
+                          [`aud_start_${selectedAudioEdit.id}`]: e.target.value,
+                        }))
+                      }
+                      onBlur={(e) => {
+                        const val = parseFloat(e.target.value);
+                        setNumDrafts((prev) => {
+                          const n = { ...prev };
+                          delete n[`aud_start_${selectedAudioEdit.id}`];
+                          return n;
+                        });
+                        if (Number.isFinite(val)) {
+                          const nextS = Math.max(0, val);
+                          update_audio_edit(selectedAudioEdit.id, {
+                            start: nextS,
+                            end: Math.max(nextS + 0.15, selectedAudioEdit.end),
+                          });
+                        }
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') e.currentTarget.blur();
+                      }}
+                      className="w-full bg-[#12161f] border border-[#272f40] rounded-lg px-2 py-1 text-xs font-mono text-slate-200 outline-none focus:border-rose-400"
+                    />
+                  </div>
+                  <div className="space-y-0.5">
+                    <label className="text-[10px] text-slate-400">End (s)</label>
+                    <input
+                      type="number"
+                      step="0.1"
+                      min="0.15"
+                      value={
+                        numDrafts[`aud_end_${selectedAudioEdit.id}`] ??
+                        String(selectedAudioEdit.end)
+                      }
+                      onChange={(e) =>
+                        setNumDrafts((prev) => ({
+                          ...prev,
+                          [`aud_end_${selectedAudioEdit.id}`]: e.target.value,
+                        }))
+                      }
+                      onBlur={(e) => {
+                        const val = parseFloat(e.target.value);
+                        setNumDrafts((prev) => {
+                          const n = { ...prev };
+                          delete n[`aud_end_${selectedAudioEdit.id}`];
+                          return n;
+                        });
+                        if (Number.isFinite(val)) {
+                          update_audio_edit(selectedAudioEdit.id, {
+                            end: Math.max(selectedAudioEdit.start + 0.15, val),
+                          });
+                        }
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') e.currentTarget.blur();
+                      }}
+                      className="w-full bg-[#12161f] border border-[#272f40] rounded-lg px-2 py-1 text-xs font-mono text-slate-200 outline-none focus:border-rose-400"
+                    />
+                  </div>
+                </div>
+
+                {canCutHere && (
+                  <button
+                    type="button"
+                    onClick={() => split_audio_at(playhead)}
+                    className="w-full py-1.5 rounded-lg bg-[#12161f] hover:bg-[#171c28] border border-[#272f40] text-xs font-medium text-emerald-200 flex items-center justify-center gap-1.5 transition cursor-pointer"
+                  >
+                    <AudioLines className="w-3.5 h-3.5 text-emerald-300" />
+                    Cut Audio at Playhead ({playhead.toFixed(1)}s)
+                  </button>
+                )}
+              </div>
+            );
+          })()}
+
           {/* Selected Zoom Effect Inspector */}
           {selectedZoom && (
             <div className="p-3 rounded-xl bg-[#1c212d] border border-sky-400/35 space-y-2.5">
@@ -1254,12 +1758,27 @@ export const RightAiAndStyles: React.FC = () => {
                     type="number"
                     step="0.1"
                     min="0"
-                    value={selectedSfx.start}
+                    value={numDrafts[`sfx_start_${selectedSfx.id}`] ?? String(selectedSfx.start)}
                     onChange={(e) =>
-                      update_sfx_clip(selectedSfx.id, {
-                        start: parseFloat(e.target.value) || 0,
-                      })
+                      setNumDrafts((prev) => ({
+                        ...prev,
+                        [`sfx_start_${selectedSfx.id}`]: e.target.value,
+                      }))
                     }
+                    onBlur={(e) => {
+                      const val = parseFloat(e.target.value);
+                      setNumDrafts((prev) => {
+                        const n = { ...prev };
+                        delete n[`sfx_start_${selectedSfx.id}`];
+                        return n;
+                      });
+                      if (Number.isFinite(val)) {
+                        update_sfx_clip(selectedSfx.id, { start: Math.max(0, val) });
+                      }
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') e.currentTarget.blur();
+                    }}
                     className="w-full bg-[#12161f] border border-[#272f40] rounded-lg px-2 py-1.5 text-xs font-mono text-slate-200 outline-none focus:border-emerald-400"
                   />
                 </div>
@@ -1270,11 +1789,24 @@ export const RightAiAndStyles: React.FC = () => {
                     step="0.1"
                     min="0"
                     max={Math.max(0, Number((sfxSourceDur - 0.15).toFixed(2)))}
-                    value={sfxTrimStart}
-                    onChange={(e) => {
+                    value={numDrafts[`sfx_trim_${selectedSfx.id}`] ?? String(sfxTrimStart)}
+                    onChange={(e) =>
+                      setNumDrafts((prev) => ({
+                        ...prev,
+                        [`sfx_trim_${selectedSfx.id}`]: e.target.value,
+                      }))
+                    }
+                    onBlur={(e) => {
+                      const val = parseFloat(e.target.value);
+                      setNumDrafts((prev) => {
+                        const n = { ...prev };
+                        delete n[`sfx_trim_${selectedSfx.id}`];
+                        return n;
+                      });
+                      if (!Number.isFinite(val)) return;
                       const nextIn = Math.max(
                         0,
-                        Math.min(Math.max(0, sfxSourceDur - 0.15), parseFloat(e.target.value) || 0),
+                        Math.min(Math.max(0, sfxSourceDur - 0.15), val),
                       );
                       const deltaTrim = nextIn - sfxTrimStart;
                       update_sfx_clip(selectedSfx.id, {
@@ -1284,6 +1816,9 @@ export const RightAiAndStyles: React.FC = () => {
                           Number((selectedSfx.duration - deltaTrim).toFixed(2)),
                         ),
                       });
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') e.currentTarget.blur();
                     }}
                     className="w-full bg-[#12161f] border border-[#272f40] rounded-lg px-2 py-1.5 text-xs font-mono text-slate-200 outline-none focus:border-emerald-400"
                   />
@@ -1295,12 +1830,32 @@ export const RightAiAndStyles: React.FC = () => {
                     step="0.1"
                     min="0.15"
                     max={Number(Math.max(0.15, sfxSourceDur - sfxTrimStart).toFixed(2))}
-                    value={selectedSfx.duration}
+                    value={numDrafts[`sfx_dur_${selectedSfx.id}`] ?? String(selectedSfx.duration)}
                     onChange={(e) =>
-                      update_sfx_clip(selectedSfx.id, {
-                        duration: parseFloat(e.target.value) || 0.5,
-                      })
+                      setNumDrafts((prev) => ({
+                        ...prev,
+                        [`sfx_dur_${selectedSfx.id}`]: e.target.value,
+                      }))
                     }
+                    onBlur={(e) => {
+                      const val = parseFloat(e.target.value);
+                      setNumDrafts((prev) => {
+                        const n = { ...prev };
+                        delete n[`sfx_dur_${selectedSfx.id}`];
+                        return n;
+                      });
+                      if (Number.isFinite(val)) {
+                        update_sfx_clip(selectedSfx.id, {
+                          duration: Math.max(
+                            0.15,
+                            Math.min(Math.max(0.15, sfxSourceDur - sfxTrimStart), val),
+                          ),
+                        });
+                      }
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') e.currentTarget.blur();
+                    }}
                     className="w-full bg-[#12161f] border border-[#272f40] rounded-lg px-2 py-1.5 text-xs font-mono text-slate-200 outline-none focus:border-emerald-400"
                   />
                 </div>
@@ -1481,14 +2036,30 @@ export const RightAiAndStyles: React.FC = () => {
                         type="number"
                         step="0.1"
                         min="0"
-                        value={activeCrop.start}
-                        onChange={(e) => {
-                          const s = Math.max(0, parseFloat(e.target.value) || 0);
+                        value={numDrafts.crop_start ?? String(activeCrop.start)}
+                        onChange={(e) =>
+                          setNumDrafts((prev) => ({
+                            ...prev,
+                            crop_start: e.target.value,
+                          }))
+                        }
+                        onBlur={(e) => {
+                          const val = parseFloat(e.target.value);
+                          setNumDrafts((prev) => {
+                            const n = { ...prev };
+                            delete n.crop_start;
+                            return n;
+                          });
+                          if (!Number.isFinite(val)) return;
+                          const s = Math.max(0, val);
                           set_video_crop({
                             ...activeCrop,
                             start: s,
                             end: Math.max(s + 0.5, activeCrop.end ?? s + 3.0),
                           });
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') e.currentTarget.blur();
                         }}
                         className="w-full bg-[#12161f] border border-[#272f40] rounded-lg px-2 py-1 text-xs font-mono text-slate-200 outline-none focus:border-amber-400"
                       />
@@ -1499,15 +2070,31 @@ export const RightAiAndStyles: React.FC = () => {
                         type="number"
                         step="0.1"
                         min="0.5"
-                        value={activeCrop.end}
-                        onChange={(e) => {
+                        value={numDrafts.crop_end ?? String(activeCrop.end)}
+                        onChange={(e) =>
+                          setNumDrafts((prev) => ({
+                            ...prev,
+                            crop_end: e.target.value,
+                          }))
+                        }
+                        onBlur={(e) => {
+                          const val = parseFloat(e.target.value);
+                          setNumDrafts((prev) => {
+                            const n = { ...prev };
+                            delete n.crop_end;
+                            return n;
+                          });
+                          if (!Number.isFinite(val)) return;
                           const s = activeCrop.start ?? 0;
-                          const en = Math.max(s + 0.5, parseFloat(e.target.value) || s + 1.0);
+                          const en = Math.max(s + 0.5, val);
                           set_video_crop({
                             ...activeCrop,
                             start: s,
                             end: en,
                           });
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') e.currentTarget.blur();
                         }}
                         className="w-full bg-[#12161f] border border-[#272f40] rounded-lg px-2 py-1 text-xs font-mono text-slate-200 outline-none focus:border-amber-400"
                       />
@@ -1527,7 +2114,10 @@ export const RightAiAndStyles: React.FC = () => {
               {project.workspaceState.overlayText && (
                 <button
                   type="button"
-                  onClick={() => setOverlayText(null)}
+                  onClick={() => {
+                    setOverlayTextDraft(null);
+                    setOverlayText(null);
+                  }}
                   className="text-[11px] text-slate-400 hover:text-slate-200 underline cursor-pointer"
                 >
                   Clear
@@ -1539,8 +2129,20 @@ export const RightAiAndStyles: React.FC = () => {
               <label className="text-[11px] text-slate-300">Overlay Text</label>
               <input
                 type="text"
-                value={project.workspaceState.overlayText ?? ''}
-                onChange={(e) => setOverlayText(e.target.value || null)}
+                value={overlayTextDraft ?? project.workspaceState.overlayText ?? ''}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  setOverlayTextDraft(val);
+                  setOverlayText(val.length > 0 ? val : null);
+                }}
+                onBlur={(e) => {
+                  const cleaned = e.target.value.trim();
+                  setOverlayTextDraft(null);
+                  setOverlayText(cleaned || null);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') e.currentTarget.blur();
+                }}
                 placeholder="e.g. LACY"
                 className="w-full bg-[#12161f] border border-[#272f40] focus:border-violet-400/70 rounded-lg px-2.5 py-1.5 text-xs text-slate-100 placeholder:text-slate-500 outline-none"
               />
@@ -1654,7 +2256,7 @@ export const RightAiAndStyles: React.FC = () => {
                       onClick={() => change_caption_style({ preset: p.id })}
                       className={`p-2.5 rounded-xl border text-left transition cursor-pointer ${
                         active
-                          ? 'border-amber-400 bg-amber-400/12'
+                          ? 'border-amber-400 bg-amber-400/15'
                           : 'border-[#272f40] bg-[#12161f] hover:border-[#333c4e]'
                       }`}
                     >

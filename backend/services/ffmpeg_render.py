@@ -7,7 +7,14 @@ import uuid
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
-from schemas import ClipItem, ProjectState, SfxClipItem, VideoCropRect, ZoomEffectItem
+from schemas import (
+    AudioEditItem,
+    ClipItem,
+    ProjectState,
+    SfxClipItem,
+    VideoCropRect,
+    ZoomEffectItem,
+)
 from services.ass_subtitles import generate_ass_subtitles
 from services.sfx_library import resolve_sfx_file_path
 from services.youtube_ingest import _find_ffmpeg
@@ -93,9 +100,11 @@ def _build_zoom_vf_filters(
         fx_expr = f"if(between(t,{s_t:.3f},{e_t:.3f}),{fx:.3f},{fx_expr})"
         fy_expr = f"if(between(t,{s_t:.3f},{e_t:.3f}),{fy:.3f},{fy_expr})"
 
+    scaled_w = f"trunc(max({out_w},{out_w}*({scale_expr}))/2)*2"
+    scaled_h = f"trunc(max({out_h},{out_h}*({scale_expr}))/2)*2"
     return [
-        f"scale=w='trunc(max(iw,iw*({scale_expr}))/2)*2':h='trunc(max(ih,ih*({scale_expr}))/2)*2':eval=frame:flags=bicubic",
-        f"crop={out_w}:{out_h}:'max(0,(iw-{out_w})*({fx_expr}))':'max(0,(ih-{out_h})*({fy_expr}))'",
+        f"scale=w='{scaled_w}':h='{scaled_h}':eval=frame:flags=bicubic",
+        f"crop={out_w}:{out_h}:'max(0,({scaled_w}-{out_w})*({fx_expr}))':'max(0,({scaled_h}-{out_h})*({fy_expr}))'",
     ]
 
 
@@ -157,6 +166,45 @@ def _build_vf_filter(
         filters.append(f"ass={escaped_ass}")
 
     return ",".join(filters)
+
+
+def _build_audio_edits_af_filter(
+    audio_edits: List[AudioEditItem],
+    window_start: float = 0.0,
+    window_duration: Optional[float] = None,
+) -> str:
+    """
+    Builds an FFmpeg `volume='...':eval=frame` filter for original video audio edits
+    (muted/cut sections or volume ducking/boosting) over timeline window `[window_start, window_end]`.
+    Does not affect separately mixed SFX/TTS tracks.
+    """
+    if not audio_edits:
+        return ""
+    win_s = max(0.0, float(window_start))
+    win_e = (
+        win_s + max(0.0, float(window_duration))
+        if window_duration is not None
+        else None
+    )
+    expr = "1.000"
+    changed = False
+    for ae in audio_edits:
+        raw_s = max(0.0, float(ae.start))
+        raw_e = max(0.0, float(ae.end))
+        if raw_e <= raw_s + 0.02:
+            continue
+        ov_s = max(win_s, raw_s)
+        ov_e = min(win_e, raw_e) if win_e is not None else raw_e
+        if ov_e <= ov_s + 0.02:
+            continue
+        loc_s = max(0.0, ov_s - win_s)
+        loc_e = max(loc_s + 0.02, ov_e - win_s)
+        vol = 0.0 if ae.muted else max(0.0, min(2.0, float(ae.volume)))
+        if abs(vol - 1.0) <= 0.005:
+            continue
+        expr = f"if(between(t,{loc_s:.3f},{loc_e:.3f}),{vol:.3f},{expr})"
+        changed = True
+    return f"volume='{expr}':eval=frame" if changed else ""
 
 
 def _collect_active_sfx(
@@ -279,13 +327,16 @@ def _run_ffmpeg_with_progress(
                     asyncio.run_coroutine_threadsafe(progress_cb(pct, status_label), loop)
                 except ValueError:
                     pass
-    finally:
+        code = proc.wait()
+    except BaseException:
         if proc.poll() is None:
             proc.kill()
+            proc.wait()
+        raise
+    finally:
         stderr_thread.join()
 
     stderr_out = "".join(stderr_chunks)
-    code = proc.wait()
     if code != 0:
         raise RuntimeError(f"FFmpeg failed (exit {code}): {stderr_out[-600:]}")
 
@@ -298,7 +349,14 @@ def _render_sync(
     progress_cb: Callable[[int, str], Awaitable[None]],
 ) -> List[Dict[str, str]]:
     ffmpeg_bin = _find_ffmpeg()
-    source_mp4 = (workspace_dir / "downloads" / f"{project_state.projectId}.mp4").resolve()
+    raw_pid = str(project_state.projectId or "").strip()
+    safe_pid = re.sub(r"[^a-zA-Z0-9_-]", "", raw_pid)
+    if not raw_pid or safe_pid != raw_pid:
+        raise ValueError("Invalid projectId.")
+    downloads_dir = (workspace_dir / "downloads").resolve()
+    source_mp4 = (downloads_dir / f"{safe_pid}.mp4").resolve()
+    if not source_mp4.is_relative_to(downloads_dir):
+        raise ValueError("Invalid source video path.")
     if not source_mp4.exists():
         raise FileNotFoundError(f"Source MP4 not found at {source_mp4}")
 
@@ -306,7 +364,9 @@ def _render_sync(
     exports_dir.mkdir(parents=True, exist_ok=True)
 
     job_id = uuid.uuid4().hex[:8]
-    work_dir = (exports_dir / f"_tmp_{project_state.projectId}_{job_id}").resolve()
+    work_dir = (exports_dir / f"_tmp_{safe_pid}_{job_id}").resolve()
+    if not work_dir.is_relative_to(exports_dir):
+        raise ValueError("Invalid export work directory.")
     work_dir.mkdir(parents=True, exist_ok=True)
 
     clips = project_state.tracks.clips
@@ -407,26 +467,35 @@ def _render_sync(
                     project_state.tracks.sfx, sfx_dir, clip.timelineStart, standalone_dur
                 )
                 safe_title = re.sub(r"[^a-zA-Z0-9_-]+", "_", clip.title).strip("_") or f"clip_{idx + 1}"
-                out_name = f"{project_state.projectId}_{idx + 1}_{safe_title}_{job_id}.mp4"
-                out_path = exports_dir / out_name
+                out_name = f"{safe_pid}_{idx + 1}_{safe_title}_{job_id}.mp4"
+                out_path = (exports_dir / out_name).resolve()
+                if not out_path.is_relative_to(exports_dir):
+                    raise ValueError("Invalid export output path.")
 
+                clip_src_start = max(0.0, float(clip.sourceStart))
                 cmd = [
                     ffmpeg_bin,
                     "-nostdin",
                     "-y",
                     "-ss",
-                    f"{clip.sourceStart:.3f}",
+                    f"{clip_src_start:.3f}",
                     "-t",
                     f"{raw_span:.3f}",
                     "-i",
                     source_mp4.as_posix(),
                 ]
+                clip_audio_af = _build_audio_edits_af_filter(
+                    project_state.tracks.audioEdits,
+                    window_start=clip.timelineStart,
+                    window_duration=standalone_dur,
+                )
+                af_parts: List[str] = []
+                if has_audio and abs(clip_speed - 1.0) > 0.01:
+                    af_parts.append(_build_atempo_filter(clip_speed))
+                if has_audio and clip_audio_af:
+                    af_parts.append(clip_audio_af)
+                base_af = ",".join(af_parts)
                 if local_sfx:
-                    base_af = (
-                        _build_atempo_filter(clip_speed)
-                        if (has_audio and abs(clip_speed - 1.0) > 0.01)
-                        else ""
-                    )
                     extra_in, fc = _build_sfx_filter_complex(
                         vf_filter, local_sfx, has_audio, base_af, standalone_dur
                     )
@@ -435,8 +504,8 @@ def _render_sync(
                 else:
                     if vf_filter:
                         cmd.extend(["-vf", vf_filter])
-                    if has_audio and abs(clip_speed - 1.0) > 0.01:
-                        cmd.extend(["-af", _build_atempo_filter(clip_speed)])
+                    if base_af:
+                        cmd.extend(["-af", base_af])
                 cmd.extend(
                     [
                         "-c:v",
@@ -490,14 +559,16 @@ def _render_sync(
             emit(pct, f"Cutting clip {idx + 1}/{total_clips} sequentially...")
             seg_path = work_dir / f"seg_{idx:03d}.mp4"
             clip_speed = max(0.25, min(4.0, float(getattr(clip, "speed", 1.0) or 1.0)))
+            clip_src_start = max(0.0, float(clip.sourceStart))
+            clip_raw_span = max(0.1, float(clip.sourceEnd) - clip_src_start)
             cut_cmd = [
                 ffmpeg_bin,
                 "-nostdin",
                 "-y",
                 "-ss",
-                f"{clip.sourceStart:.3f}",
+                f"{clip_src_start:.3f}",
                 "-t",
-                f"{max(0.1, clip.sourceEnd - clip.sourceStart):.3f}",
+                f"{clip_raw_span:.3f}",
                 "-i",
                 source_mp4.as_posix(),
             ]
@@ -594,21 +665,28 @@ def _render_sync(
             zooms=project_state.tracks.zooms,
             crop=project_state.workspaceState.crop,
         )
-        out_name = f"{project_state.projectId}_final_{ratio.replace(':', 'x')}_{job_id}.mp4"
-        final_out = exports_dir / out_name
+        out_name = f"{safe_pid}_final_{ratio.replace(':', 'x')}_{job_id}.mp4"
+        final_out = (exports_dir / out_name).resolve()
+        if not final_out.is_relative_to(exports_dir):
+            raise ValueError("Invalid final export path.")
         total_tl_duration = sum(c.duration for c in clips)
         active_sfx = _collect_active_sfx(
             project_state.tracks.sfx, sfx_dir, 0.0, total_tl_duration
         )
+        merged_audio_af = _build_audio_edits_af_filter(
+            project_state.tracks.audioEdits,
+            window_start=0.0,
+            window_duration=total_tl_duration,
+        )
 
-        if not vf_filter and not active_sfx:
+        if not vf_filter and not active_sfx and not merged_audio_af:
             emit(90, "Finalizing MP4 container...")
             shutil.move(str(merged_raw), str(final_out))
         elif active_sfx:
             emit(72, f"Encoding {ratio}, burning overlays & mixing {len(active_sfx)} SFX...")
             merged_has_audio = _has_audio_stream(merged_raw, ffmpeg_bin)
             extra_in, fc = _build_sfx_filter_complex(
-                vf_filter, active_sfx, merged_has_audio, "", total_tl_duration
+                vf_filter, active_sfx, merged_has_audio, merged_audio_af, total_tl_duration
             )
             burn_cmd = [
                 ffmpeg_bin,
@@ -656,33 +734,42 @@ def _render_sync(
             )
         else:
             emit(72, f"Encoding {ratio} & burning captions (-threads 0 -preset ultrafast)...")
+            merged_has_audio = (
+                _has_audio_stream(merged_raw, ffmpeg_bin) if merged_audio_af else False
+            )
             burn_cmd = [
                 ffmpeg_bin,
                 "-nostdin",
                 "-y",
                 "-i",
                 merged_raw.name,
-                "-vf",
-                vf_filter,
-                "-c:v",
-                "libx264",
-                "-preset",
-                "ultrafast",
-                "-threads",
-                "0",
-                "-crf",
-                "21",
-                "-pix_fmt",
-                "yuv420p",
-                "-c:a",
-                "copy",
-                "-movflags",
-                "+faststart",
-                "-progress",
-                "pipe:1",
-                "-nostats",
-                final_out.as_posix(),
             ]
+            if vf_filter:
+                burn_cmd.extend(["-vf", vf_filter])
+            if merged_audio_af and merged_has_audio:
+                burn_cmd.extend(["-af", merged_audio_af, "-c:a", "aac", "-b:a", "128k"])
+            else:
+                burn_cmd.extend(["-c:a", "copy"])
+            burn_cmd.extend(
+                [
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-threads",
+                    "0",
+                    "-crf",
+                    "21",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-movflags",
+                    "+faststart",
+                    "-progress",
+                    "pipe:1",
+                    "-nostats",
+                    final_out.as_posix(),
+                ]
+            )
             _run_ffmpeg_with_progress(
                 burn_cmd,
                 work_dir,

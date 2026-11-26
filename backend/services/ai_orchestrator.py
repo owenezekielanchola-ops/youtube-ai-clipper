@@ -35,6 +35,7 @@ from services.transcription import (
     detect_pause_gaps,
     load_cached_transcript,
 )
+from services.tts_service import materialize_voiceover_tool_call
 from services.visual_planner import (
     convert_visual_plan_to_tool_calls,
     plan_visual_edits_with_gemini,
@@ -110,6 +111,26 @@ CAPCUT_EFFECT_KEYWORDS = (
     "crop to",
     "uncrop",
     "reset crop",
+    "mute audio",
+    "mute the audio",
+    "mute video",
+    "mute part",
+    "mute the clip",
+    "unmute",
+    "delete audio",
+    "delete the audio",
+    "cut audio",
+    "cut the audio",
+    "remove audio",
+    "remove the audio",
+    "silence audio",
+    "duck audio",
+    "lower volume",
+    "lower audio",
+    "lower the audio",
+    "boost audio",
+    "video volume",
+    "original audio",
     "what are they doing",
     "what's happening",
     "whats happening",
@@ -204,12 +225,42 @@ def _should_use_gemini_viral_pipeline(prompt: str) -> bool:
     return _has_phrase_or_word(lowered, VIRAL_FINDER_KEYWORDS)
 
 
+def _to_float(val: Any, default: float) -> float:
+    if val is None or isinstance(val, bool):
+        return default
+    try:
+        num = float(val)
+        return num if num == num else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _filter_pauses_to_active_clips(
+    pauses: List[Dict[str, float]], clips: List[Any]
+) -> List[Dict[str, float]]:
+    if not pauses or not clips:
+        return pauses
+    out: List[Dict[str, float]] = []
+    for p in pauses:
+        ps = float(p.get("start", 0.0))
+        pe = float(p.get("end", 0.0))
+        for c in clips:
+            ov_s = max(ps, float(c.sourceStart))
+            ov_e = min(pe, float(c.sourceEnd))
+            if ov_e - ov_s >= 0.2:
+                out.append({"start": round(ov_s, 2), "end": round(ov_e, 2)})
+    return out
+
+
 def _parse_router_intent(raw_text: str) -> Optional[str]:
-    cleaned = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL | re.IGNORECASE).strip().lower()
-    if "viral_discovery" in cleaned:
-        return "viral_discovery"
-    if "timeline_edit" in cleaned:
-        return "timeline_edit"
+    cleaned = re.sub(r"<think>.*?</think>", "", raw_text or "", flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r"<think>.*$", "", cleaned, flags=re.DOTALL | re.IGNORECASE).strip().lower()
+    lines = [ln.strip() for ln in cleaned.splitlines() if ln.strip()]
+    tail = lines[-1] if lines else cleaned
+    toks = re.findall(r"[a-z_]+", tail)
+    for tok in reversed(toks):
+        if tok in {"viral_discovery", "timeline_edit"}:
+            return tok
     return None
 
 
@@ -268,7 +319,7 @@ def _classify_prompt_intent_with_ai(prompt: str) -> Tuple[str, str]:
                         {"role": "user", "content": prompt},
                     ],
                     temperature=0.0,
-                    max_tokens=20,
+                    max_tokens=160,
                 )
                 msg = completion.choices[0].message
                 raw_text = str(getattr(msg, "content", "") or "")
@@ -282,7 +333,9 @@ def _classify_prompt_intent_with_ai(prompt: str) -> Tuple[str, str]:
 
     gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
     if gemini_key and gemini_key != "your_gemini_api_key_here":
-        gemini_client = genai.Client(api_key=gemini_key)
+        gemini_client = genai.Client(
+            api_key=gemini_key, http_options=types.HttpOptions(timeout=15000)
+        )
         for idx, model_id in enumerate(get_gemini_models_chain()[:2]):
             try:
                 response = gemini_client.models.generate_content(
@@ -291,7 +344,7 @@ def _classify_prompt_intent_with_ai(prompt: str) -> Tuple[str, str]:
                     config=types.GenerateContentConfig(
                         system_instruction=router_system_prompt,
                         temperature=0.0,
-                        max_output_tokens=20,
+                        max_output_tokens=160,
                     ),
                 )
                 intent = _parse_router_intent(str(getattr(response, "text", "") or ""))
@@ -713,7 +766,7 @@ def _format_timeline_transcript_for_llm(
         )
 
     segments = transcript.get("segments") or []
-    mapped_lines: List[str] = []
+    mapped_pairs: List[Tuple[float, str]] = []
     for seg in segments:
         src_s = float(seg.get("start", 0.0))
         src_e = float(seg.get("end", src_s + 1.0))
@@ -728,15 +781,16 @@ def _format_timeline_transcript_for_llm(
             ov_e = min(src_e, clip.sourceEnd)
             tl_s = clip.timelineStart + (ov_s - clip.sourceStart) / speed
             tl_e = clip.timelineStart + (ov_e - clip.sourceStart) / speed
-            mapped_lines.append(
-                f"[TL {tl_s:.2f}s -> {tl_e:.2f}s | SRC {ov_s:.2f}s -> {ov_e:.2f}s] {txt}"
+            mapped_pairs.append(
+                (tl_s, f"[TL {tl_s:.2f}s -> {tl_e:.2f}s | SRC {ov_s:.2f}s -> {ov_e:.2f}s] {txt}")
             )
-            break
 
-    if not mapped_lines:
+    if not mapped_pairs:
         return _format_transcript_for_llm(
             transcript, max_segments=max_segments, max_chars=max_chars, prefer_start=prefer_start
         )
+    mapped_pairs.sort(key=lambda pair: pair[0])
+    mapped_lines = [line for _, line in mapped_pairs]
 
     if len(mapped_lines) > max_segments:
         if prefer_start:
@@ -819,7 +873,7 @@ def _find_phrase_timeline_window(
             cs = max(clip.sourceStart, src_s)
             ce = min(clip.sourceEnd, src_e)
             tl_s = clip.timelineStart + (cs - clip.sourceStart) / speed
-            tl_e = clip.timelineStart + max(0.3, ce - clip.sourceStart) / speed
+            tl_e = max(tl_s + 0.3, clip.timelineStart + (ce - clip.sourceStart) / speed)
             return round(tl_s, 2), round(tl_e, 2)
 
     return None
@@ -842,6 +896,11 @@ def _enrich_sfx_tool_calls(
                 (a for a in sfx_assets if a.id == asset_id), None
             )
             if chosen is None:
+                if args.get("url") and str(args.get("url")).strip():
+                    enriched.append(
+                        ToolCallSchema(id=tc.id, name=tc.name, arguments=args, reason=tc.reason)
+                    )
+                    continue
                 chosen = find_best_matching_sfx(sfx_assets, query)
 
             if chosen is not None:
@@ -859,8 +918,9 @@ def _enrich_sfx_tool_calls(
                 if trim_val > 0 or "trim_start" in args or "trimStart" in args:
                     args["trim_start"] = round(trim_val, 3)
                 max_avail = max(0.15, chosen.duration - trim_val)
+                raw_dur = _to_float(args.get("duration"), max_avail)
                 args["duration"] = round(
-                    max(0.15, min(max_avail, float(args.get("duration") or max_avail))),
+                    max(0.15, min(max_avail, raw_dur if raw_dur > 0 else max_avail)),
                     3,
                 )
                 try:
@@ -991,7 +1051,7 @@ def _enforce_crop_and_zoom_intent(
     intercepted_zoom_args: Optional[Dict[str, Any]] = None
     filtered_calls: List[ToolCallSchema] = []
     for tc in tool_calls:
-        if tc.name == "add_zoom_effect" and (wants_remove_zoom or (wants_crop and not wants_add_zoom)):
+        if tc.name == "add_zoom_effect" and not wants_add_zoom and (wants_remove_zoom or wants_crop):
             intercepted_zoom_args = dict(tc.arguments or {})
             continue
         filtered_calls.append(tc)
@@ -1025,8 +1085,6 @@ def _enforce_crop_and_zoom_intent(
                 (z for z in active_zooms if z.id in existing_del_ids),
                 active_zooms[0],
             )
-    elif active_zooms:
-        deleted_zoom_obj = active_zooms[0]
 
     # 2. Handle reset crop
     if wants_reset_crop:
@@ -1047,16 +1105,17 @@ def _enforce_crop_and_zoom_intent(
 
     # 3. Resolve best target time window [c_start, c_end] if timed crop is requested
     def _resolve_crop_time_window() -> Tuple[float, float]:
+        max_start = max(0.0, total_tl_dur - 0.5)
         if explicit_range_match:
             rs = float(explicit_range_match.group(1))
             re_t = float(explicit_range_match.group(2))
             if re_t > rs:
-                s = max(0.0, min(total_tl_dur - 0.3, rs))
-                e = max(s + 0.5, min(total_tl_dur, re_t))
+                s = max(0.0, min(max_start, rs))
+                e = min(total_tl_dur, max(s + 0.5, re_t))
                 return round(s, 2), round(e, 2)
         if explicit_for_dur_match:
             span = max(0.5, min(total_tl_dur, float(explicit_for_dur_match.group(1))))
-            s = min(max(0.0, total_tl_dur - 0.5), playhead)
+            s = min(max_start, playhead)
             e = min(total_tl_dur, max(s + 0.5, s + span))
             return round(s, 2), round(e, 2)
         if visual_plan:
@@ -1064,16 +1123,16 @@ def _enforce_crop_and_zoom_intent(
                 if isinstance(st, dict) and st.get("action") in {"set_video_crop", "add_zoom_effect"}:
                     p = st.get("params") or {}
                     if p.get("start") is not None and p.get("end") is not None:
-                        s = max(0.0, min(total_tl_dur - 0.3, float(p["start"])))
-                        e = max(s + 0.5, min(total_tl_dur, float(p["end"])))
+                        s = max(0.0, min(max_start, _to_float(p.get("start"), 0.0)))
+                        e = min(total_tl_dur, max(s + 0.5, _to_float(p.get("end"), s + 3.0)))
                         return round(s, 2), round(e, 2)
         if intercepted_zoom_args and intercepted_zoom_args.get("start") is not None:
-            s = max(0.0, min(total_tl_dur - 0.3, float(intercepted_zoom_args.get("start", 0.0))))
-            e = max(s + 0.5, min(total_tl_dur, float(intercepted_zoom_args.get("end", s + 3.0))))
+            s = max(0.0, min(max_start, _to_float(intercepted_zoom_args.get("start"), 0.0)))
+            e = min(total_tl_dur, max(s + 0.5, _to_float(intercepted_zoom_args.get("end"), s + 3.0)))
             return round(s, 2), round(e, 2)
         if deleted_zoom_obj is not None:
-            s = max(0.0, min(total_tl_dur - 0.3, float(deleted_zoom_obj.start)))
-            e = max(s + 0.5, min(total_tl_dur, float(deleted_zoom_obj.end)))
+            s = max(0.0, min(max_start, _to_float(deleted_zoom_obj.start, 0.0)))
+            e = min(total_tl_dur, max(s + 0.5, _to_float(deleted_zoom_obj.end, s + 3.0)))
             return round(s, 2), round(e, 2)
         if visual_plan:
             moments = visual_plan.get("detected_moments") or []
@@ -1085,8 +1144,8 @@ def _enforce_crop_and_zoom_intent(
             ] or [m for m in moments if isinstance(m, dict)]
             if preferred:
                 m0 = preferred[0]
-                s = max(0.0, min(total_tl_dur - 0.3, float(m0.get("start", 0.0))))
-                e = max(s + 0.5, min(total_tl_dur, float(m0.get("end", s + 3.2))))
+                s = max(0.0, min(max_start, _to_float(m0.get("start"), 0.0)))
+                e = min(total_tl_dur, max(s + 0.5, _to_float(m0.get("end"), s + 3.2)))
                 return round(s, 2), round(e, 2)
         if project_state.workspaceState.selectedTimeRange is not None:
             rng = project_state.workspaceState.selectedTimeRange
@@ -1139,10 +1198,10 @@ def _enforce_crop_and_zoom_intent(
                 if isinstance(st, dict) and st.get("action") == "set_video_crop":
                     p = st.get("params") or {}
                     if p.get("w") is not None and p.get("h") is not None:
-                        cx = max(0.0, min(0.9, float(p.get("x", 0.0))))
-                        cy = max(0.0, min(0.9, float(p.get("y", 0.0))))
-                        cw = max(0.15, min(1.0 - cx, float(p.get("w", 0.5))))
-                        ch = max(0.15, min(1.0 - cy, float(p.get("h", 0.5))))
+                        cx = max(0.0, min(0.9, _to_float(p.get("x"), 0.0)))
+                        cy = max(0.0, min(0.9, _to_float(p.get("y"), 0.0)))
+                        cw = max(0.15, min(1.0 - cx, _to_float(p.get("w"), 0.5)))
+                        ch = max(0.15, min(1.0 - cy, _to_float(p.get("h"), 0.5)))
                         if cx > 0.005 or cy > 0.005 or cw < 0.98 or ch < 0.98:
                             return {"x": round(cx, 3), "y": round(cy, 3), "w": round(cw, 3), "h": round(ch, 3)}
             subjects = [s for s in (visual_plan.get("subjects") or []) if isinstance(s, dict)]
@@ -1150,30 +1209,39 @@ def _enforce_crop_and_zoom_intent(
                 chosen_sub = _match_visual_subject(subjects) or subjects[0]
                 box = chosen_sub.get("box")
                 if isinstance(box, dict) and box.get("w") is not None and box.get("h") is not None:
-                    cx = max(0.0, min(0.85, float(box.get("x", 0.0))))
-                    cy = max(0.0, min(0.85, float(box.get("y", 0.0))))
-                    cw = max(0.22, min(1.0 - cx, float(box.get("w", 0.45))))
-                    ch = max(0.25, min(1.0 - cy, float(box.get("h", 0.5))))
+                    cx = max(0.0, min(0.85, _to_float(box.get("x"), 0.0)))
+                    cy = max(0.0, min(0.85, _to_float(box.get("y"), 0.0)))
+                    cw = max(0.22, min(1.0 - cx, _to_float(box.get("w"), 0.45)))
+                    ch = max(0.25, min(1.0 - cy, _to_float(box.get("h"), 0.5)))
                     if cx > 0.005 or cy > 0.005 or cw < 0.98 or ch < 0.98:
                         return {"x": round(cx, 3), "y": round(cy, 3), "w": round(cw, 3), "h": round(ch, 3)}
                 return _box_from_focus(
-                    float(chosen_sub.get("focus_x", 0.5)),
-                    float(chosen_sub.get("focus_y", 0.35)),
+                    _to_float(chosen_sub.get("focus_x"), 0.5),
+                    _to_float(chosen_sub.get("focus_y"), 0.35),
                     1.75,
                 )
             for st in visual_plan.get("planned_steps") or []:
                 if isinstance(st, dict) and st.get("action") == "add_zoom_effect":
                     p = st.get("params") or {}
                     return _box_from_focus(
-                        float(p.get("focus_x", 0.5)),
-                        float(p.get("focus_y", 0.35)),
-                        float(p.get("end_scale", 1.7)),
+                        _to_float(p.get("focus_x"), 0.5),
+                        _to_float(p.get("focus_y"), 0.35),
+                        _to_float(p.get("end_scale"), 1.7),
                     )
         if intercepted_zoom_args:
+            fx_raw = intercepted_zoom_args.get("focus_x")
+            if fx_raw is None:
+                fx_raw = intercepted_zoom_args.get("focusX")
+            fy_raw = intercepted_zoom_args.get("focus_y")
+            if fy_raw is None:
+                fy_raw = intercepted_zoom_args.get("focusY")
+            es_raw = intercepted_zoom_args.get("end_scale")
+            if es_raw is None:
+                es_raw = intercepted_zoom_args.get("endScale")
             return _box_from_focus(
-                float(intercepted_zoom_args.get("focus_x") or intercepted_zoom_args.get("focusX") or 0.5),
-                float(intercepted_zoom_args.get("focus_y") or intercepted_zoom_args.get("focusY") or 0.35),
-                float(intercepted_zoom_args.get("end_scale") or intercepted_zoom_args.get("endScale") or 1.7),
+                _to_float(fx_raw, 0.5),
+                _to_float(fy_raw, 0.35),
+                _to_float(es_raw, 1.7),
             )
         if deleted_zoom_obj is not None:
             return _box_from_focus(
@@ -1238,10 +1306,10 @@ def _enforce_crop_and_zoom_intent(
         # Prefer visually-measured Stage 1 crop coordinates over text-only Stage 2 LLM guesses,
         # and also fix accidental full-frame boxes.
         if has_visual_crop_source or (
-            float(c_args.get("x", 0.0)) <= 0.005
-            and float(c_args.get("y", 0.0)) <= 0.005
-            and float(c_args.get("w", 1.0)) >= 0.99
-            and float(c_args.get("h", 1.0)) >= 0.99
+            _to_float(c_args.get("x"), 0.0) <= 0.005
+            and _to_float(c_args.get("y"), 0.0) <= 0.005
+            and _to_float(c_args.get("w"), 1.0) >= 0.99
+            and _to_float(c_args.get("h"), 1.0) >= 0.99
         ):
             c_args.update(_resolve_crop_box())
         if wants_timed_crop and (c_args.get("start") is None or c_args.get("end") is None):
@@ -1565,6 +1633,175 @@ def _build_smart_sfx_tool_calls(
     return sfx_calls
 
 
+def _resolve_audio_edit_intent(
+    prompt: str,
+    project_state: ProjectState,
+    visual_plan: Optional[Dict[str, Any]] = None,
+    transcript: Optional[Dict[str, Any]] = None,
+) -> Optional[Tuple[List[ToolCallSchema], str, bool]]:
+    """
+    Parses natural-language video audio control requests (mute, cut/delete audio, unmute,
+    duck/lower volume, boost volume) into `edit_video_audio` or `delete_audio_edit` calls.
+    Returns (calls, summary_note, strip_remove_time_ranges) or None.
+    """
+    lowered = (prompt or "").lower()
+    has_sfx_primary = any(
+        k in lowered
+        for k in ("sound effect", "sound effects", "sfx", "audio effect", "audio effects", "mp3")
+    ) and not any(k in lowered for k in ("original audio", "video audio", "video volume"))
+    if has_sfx_primary:
+        return None
+
+    wants_unmute = bool(
+        re.search(r"\bunmute\b", lowered)
+        or re.search(
+            r"\b(?:restore|undo|remove|delete|clear|reset)\b.{0,20}\b(?:mute|muted|audio\s+edit)\b",
+            lowered,
+        )
+        or "turn audio back on" in lowered
+        or "bring back audio" in lowered
+    )
+    if wants_unmute:
+        return (
+            [
+                ToolCallSchema(
+                    id=f"tc_{uuid.uuid4().hex[:8]}",
+                    name="delete_audio_edit",
+                    arguments={"audio_edit_id": "all"},
+                    reason="Restored original video audio volume",
+                )
+            ],
+            "Restored original video audio",
+            False,
+        )
+
+    mentions_audio_or_vol = bool(
+        re.search(r"\b(audio|sound|volume|loudness|mic|voice|dialogue|background)\b", lowered)
+    )
+    is_audio_cut = bool(
+        re.search(r"\bmute\b", lowered)
+        or (
+            re.search(r"\b(cut|delete|remove|silence|kill|strip)\b", lowered)
+            and re.search(r"\b(audio|sound|mic)\b", lowered)
+            and not re.search(r"\b(voiceover|tts|narration|sfx|sound\s+effects?)\b", lowered)
+        )
+    )
+    vol_pct_m = re.search(
+        r"(?:volume|audio|sound)\b.{0,20}?\b(\d{1,3})\s*%",
+        lowered,
+    ) or re.search(r"\b(\d{1,3})\s*%\s*(?:volume|audio|sound)\b", lowered)
+    vol_ratio_m = re.search(
+        r"(?:volume|audio|gain)\b.{0,15}?\b(0(?:\.\d+)?|1(?:\.\d+)?|2(?:\.0+)?)\b",
+        lowered,
+    )
+    wants_duck = bool(
+        mentions_audio_or_vol
+        and any(k in lowered for k in ("duck", "lower", "quieter", "quiet down", "turn down", "reduce", "softer", "half"))
+    )
+    wants_boost = bool(
+        mentions_audio_or_vol
+        and any(k in lowered for k in ("boost", "louder", "turn up", "increase", "raise"))
+    )
+    if not (is_audio_cut or vol_pct_m or vol_ratio_m or wants_duck or wants_boost):
+        return None
+
+    clips = project_state.tracks.clips or []
+    total_tl_dur = max(
+        0.5,
+        sum(float(c.duration) for c in clips)
+        if clips
+        else float(project_state.sourceVideo.originalDuration or 10.0),
+    )
+    playhead = max(0.0, float(project_state.workspaceState.playheadPosition or 0.0))
+
+    range_m = re.search(
+        r"\b(?:from|at|between)\s+(\d+(?:\.\d+)?)\s*(?:s|sec|seconds?)?\s*(?:to|and|-)\s*(\d+(?:\.\d+)?)\s*(?:s|sec|seconds?)?\b",
+        lowered,
+    ) or re.search(
+        r"\b(\d+(?:\.\d+)?)\s*(?:s|sec|seconds?)\s*(?:to|-)\s*(\d+(?:\.\d+)?)\s*(?:s|sec|seconds?)?\b",
+        lowered,
+    )
+    first_n_m = re.search(
+        r"\b(?:first|starting)\s+(\d+(?:\.\d+)?)\s*(?:s|sec|seconds?)\b",
+        lowered,
+    )
+    for_n_m = re.search(r"\bfor\s+(\d+(?:\.\d+)?)\s*(?:s|sec|seconds?)\b", lowered)
+
+    if range_m:
+        s_t = max(0.0, min(total_tl_dur - 0.15, float(range_m.group(1))))
+        e_t = min(total_tl_dur, max(s_t + 0.15, float(range_m.group(2))))
+    elif first_n_m:
+        s_t = 0.0
+        e_t = min(total_tl_dur, max(0.2, float(first_n_m.group(1))))
+    elif any(k in lowered for k in ("whole", "entire", "all video", "full video", "full audio", "all audio", "everything")):
+        s_t = 0.0
+        e_t = total_tl_dur
+    else:
+        phrase_win = _extract_spoken_phrase_window(prompt, transcript, clips)
+        if phrase_win is not None:
+            s_t = max(0.0, phrase_win[0])
+            e_t = min(total_tl_dur, max(s_t + 0.3, phrase_win[1]))
+        elif visual_plan and (visual_plan.get("detected_moments") or []):
+            m0 = visual_plan["detected_moments"][0]
+            s_t = max(0.0, min(total_tl_dur - 0.2, _to_float(m0.get("start"), playhead)))
+            e_t = min(total_tl_dur, max(s_t + 0.3, _to_float(m0.get("end"), s_t + 3.0)))
+        elif project_state.workspaceState.selectedTimeRange is not None:
+            rng = project_state.workspaceState.selectedTimeRange
+            s_t = max(0.0, float(rng.start))
+            e_t = min(total_tl_dur, max(s_t + 0.2, float(rng.end)))
+        elif for_n_m:
+            s_t = min(max(0.0, total_tl_dur - 0.2), playhead)
+            e_t = min(total_tl_dur, max(s_t + 0.2, s_t + float(for_n_m.group(1))))
+        else:
+            s_t = min(max(0.0, total_tl_dur - 0.5), playhead)
+            e_t = min(total_tl_dur, max(s_t + 0.3, s_t + 3.0))
+
+    s_t = round(s_t, 2)
+    e_t = round(e_t, 2)
+    if is_audio_cut:
+        muted_flag = True
+        vol_val = 0.0
+        lbl = "Muted audio"
+        note = f"Muted video audio ({s_t:.1f}s–{e_t:.1f}s)"
+    else:
+        if vol_pct_m:
+            vol_val = round(max(0.0, min(2.0, float(vol_pct_m.group(1)) / 100.0)), 2)
+        elif vol_ratio_m:
+            vol_val = round(max(0.0, min(2.0, float(vol_ratio_m.group(1)))), 2)
+        elif "half" in lowered:
+            vol_val = 0.5
+        elif wants_boost:
+            vol_val = 1.5
+        else:
+            vol_val = 0.25
+        muted_flag = vol_val <= 0.001
+        lbl = "Muted audio" if muted_flag else f"Vol {round(vol_val * 100)}%"
+        note = f"Set video audio to {round(vol_val * 100)}% ({s_t:.1f}s–{e_t:.1f}s)"
+
+    strip_cuts = bool(
+        is_audio_cut
+        and not re.search(r"\b(video|footage|clip|frames?|pause|silence)\b", lowered)
+    )
+    return (
+        [
+            ToolCallSchema(
+                id=f"tc_{uuid.uuid4().hex[:8]}",
+                name="edit_video_audio",
+                arguments={
+                    "start": s_t,
+                    "end": e_t,
+                    "muted": muted_flag,
+                    "volume": vol_val,
+                    "label": lbl,
+                },
+                reason=note,
+            )
+        ],
+        note,
+        strip_cuts,
+    )
+
+
 def _enforce_caption_and_timeline_tools(
     prompt: str,
     tool_calls: List[ToolCallSchema],
@@ -1711,7 +1948,7 @@ def _enforce_caption_and_timeline_tools(
             else:
                 merged_args = dict(existing_style_tc.arguments or {})
                 for k, v in desired_style.items():
-                    if merged_args.get(k) is None or k in {"text_color", "highlight_color"}:
+                    if merged_args.get(k) is None:
                         merged_args[k] = v
                 existing_style_tc.arguments = merged_args
                 if color_hit is not None:
@@ -1735,7 +1972,8 @@ def _enforce_caption_and_timeline_tools(
 
     # 3. Enforce delete_drawing / delete_sfx_clip when user asks to remove drawing or sound effect
     if re.search(r"\b(remove|delete|clear)\b.{0,25}\b(drawing|arrow|circle|box|line|highlight)\b", lowered):
-        calls = [tc for tc in calls if tc.name != "add_drawing"]
+        if not re.search(r"\b(add|draw|put|create)\b.{0,20}\b(drawing|arrow|circle|box|rect|line|highlight)\b", lowered):
+            calls = [tc for tc in calls if tc.name != "add_drawing"]
         active_drawings = list(project_state.tracks.drawings or [])
         if active_drawings and not any(tc.name == "delete_drawing" for tc in calls):
             for d in active_drawings:
@@ -1755,7 +1993,8 @@ def _enforce_caption_and_timeline_tools(
         )
     )
     if wants_remove_sfx:
-        calls = [tc for tc in calls if tc.name != "add_sfx_clip"]
+        if not re.search(r"\b(add|put|place|insert)\b.{0,20}\b(sfx|sound\s+effects?|audio\s+effects?)\b", lowered):
+            calls = [tc for tc in calls if tc.name != "add_sfx_clip"]
         active_sfx = list(project_state.tracks.sfx or [])
         if active_sfx and not any(tc.name == "delete_sfx_clip" for tc in calls):
             for s in active_sfx:
@@ -1769,19 +2008,20 @@ def _enforce_caption_and_timeline_tools(
             notes.append(f"Removed {len(active_sfx)} SFX clip(s)")
 
     # 4. Enforce remove pauses when user asks to remove pauses/silence and LLM omitted it
+    active_pauses = _filter_pauses_to_active_clips(pauses, project_state.tracks.clips)
     if (
         any(k in lowered for k in ("remove pause", "remove pauses", "remove all pauses", "remove silence", "cut silence", "dead air"))
-        and pauses
+        and active_pauses
         and not any(tc.name == "remove_time_ranges" for tc in calls)
     ):
         calls.append(
             ToolCallSchema(
                 id=f"tc_{uuid.uuid4().hex[:8]}",
                 name="remove_time_ranges",
-                arguments={"ranges": pauses},
+                arguments={"ranges": active_pauses},
             )
         )
-        notes.append(f"Removed {len(pauses)} pause gap(s)")
+        notes.append(f"Removed {len(active_pauses)} pause gap(s)")
 
     # 5. Enforce speed change when user asks to speed up / slow down and LLM omitted set_clip_speed
     has_speed_word = any(
@@ -1932,6 +2172,16 @@ def _enforce_caption_and_timeline_tools(
             extra = f" (+{len(sfx_calls) - 4} more)" if len(sfx_calls) > 4 else ""
             notes.append(f"Added {len(sfx_calls)} SFX ({placed_summary}{extra})")
 
+    # 7. Enforce edit_video_audio / delete_audio_edit for video audio mute/cut/volume prompts
+    audio_res = _resolve_audio_edit_intent(prompt, project_state, visual_plan, transcript)
+    if audio_res is not None:
+        audio_calls, audio_note, strip_cuts = audio_res
+        if strip_cuts:
+            calls = [tc for tc in calls if tc.name != "remove_time_ranges"]
+        if not any(tc.name in {"edit_video_audio", "delete_audio_edit"} for tc in calls):
+            calls.extend(audio_calls)
+            notes.append(audio_note)
+
     return calls, ("; ".join(notes) if notes else None)
 
 
@@ -1942,14 +2192,16 @@ def _snap_to_word_boundaries(
     max_duration: float,
 ) -> Tuple[float, float]:
     """Snaps proposed clip boundaries to Groq Whisper word/sentence boundaries so speakers aren't cut mid-word."""
-    s = max(0.0, float(start))
-    e = min(max_duration, float(end))
+    s = max(0.0, min(max(0.0, max_duration - 1.0), _to_float(start, 0.0)))
+    e = min(max_duration, _to_float(end, s + 3.0))
+    if e <= s:
+        e = min(max_duration, s + 3.0)
     if not transcript:
-        return round(s, 2), round(max(s + 1.0, e), 2)
+        return round(s, 2), round(max(min(max_duration, s + 1.0), e), 2)
 
     words = transcript.get("words") or []
     if not words:
-        return round(s, 2), round(max(s + 1.0, e), 2)
+        return round(s, 2), round(max(min(max_duration, s + 1.0), e), 2)
 
     if len(words) > 256:
         idx_s = _bisect_dict_start(words, s)
@@ -1965,19 +2217,22 @@ def _snap_to_word_boundaries(
         best_end = min(words, key=lambda w: abs(float(w["end"]) - e))
 
     if abs(float(best_start["start"]) - s) <= 1.5:
-        s = max(0.0, float(best_start["start"]) - 0.08)
+        s = max(0.0, min(max(0.0, max_duration - 1.0), float(best_start["start"]) - 0.08))
 
     if abs(float(best_end["end"]) - e) <= 1.5:
         e = min(max_duration, float(best_end["end"]) + 0.15)
 
     if e <= s + 0.3:
-        e = min(max_duration, max(float(end), s + 3.0))
+        e = min(max_duration, max(_to_float(end, s + 3.0), s + 3.0))
+        if e <= s + 0.3:
+            s = max(0.0, e - 3.0)
     return round(s, 2), round(e, 2)
 
 
 def _strip_json_fences(raw_text: str) -> str:
     text = raw_text.strip()
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<think>.*?(?=\{|$)", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*\n?", "", text, flags=re.IGNORECASE)
         text = re.sub(r"\n?```\s*$", "", text)
@@ -1998,19 +2253,18 @@ def _normalize_isolated_clips(
     max_dur = duration if duration > 0 else 99999.0
     snapped_clips: List[Dict[str, Any]] = []
     for clip in raw_clips:
-        s, e = _snap_to_word_boundaries(
-            float(clip.get("source_start", 0.0)),
-            float(clip.get("source_end", min(30.0, max_dur))),
-            transcript,
-            max_dur,
-        )
+        if not isinstance(clip, dict):
+            continue
+        raw_s = _to_float(clip.get("source_start"), 0.0)
+        raw_e = _to_float(clip.get("source_end"), min(raw_s + 25.0, max_dur))
+        s, e = _snap_to_word_boundaries(raw_s, raw_e, transcript, max_dur)
         snapped_clips.append(
             {
                 "source_start": s,
                 "source_end": e,
                 "title": str(clip.get("title") or "Viral Highlight"),
                 "reason": str(clip.get("reason") or "High-engagement hook and payoff"),
-                "virality_score": float(clip.get("virality_score") or 9.0),
+                "virality_score": _to_float(clip.get("virality_score"), 9.0),
             }
         )
     return snapped_clips
@@ -2061,6 +2315,164 @@ def _filter_protected_caption_calls(
     return filtered
 
 
+_INTRO_HOOK_PHRASES = (
+    "intro caption",
+    "intro hook",
+    "opening caption",
+    "teaser caption",
+    "hook caption",
+    "what will happen",
+    "what's about to happen",
+    "whats about to happen",
+    "what is about to happen",
+    "what is gonna happen",
+    "what will gonna happen",
+    "gonna happen",
+    "text to speech",
+    "tts",
+)
+
+
+def _normalize_intro_hook_caption_calls(
+    prompt: str,
+    tool_calls: List[ToolCallSchema],
+    project_state: ProjectState,
+    transcript: Optional[Dict[str, Any]] = None,
+) -> List[ToolCallSchema]:
+    """
+    Ensures `add_caption` calls meant as an opening intro/TTS teaser hook:
+    1. Are tagged `kind="intro_hook"` (so frontend/TTS & overlap cleanup treat them cleanly), and
+    2. Are anchored in SOURCE seconds to the opening of the first active clip (`clips[0].sourceStart`)
+       rather than 0.0s when the active clip starts later in a longer video.
+    """
+    low_prompt = (prompt or "").lower()
+    prompt_wants_intro_hook = any(p in low_prompt for p in _INTRO_HOOK_PHRASES) or bool(
+        re.search(r"\bintro\b.{0,25}\b(caption|hook|text|teaser)\b", low_prompt)
+    )
+    clips = project_state.tracks.clips or []
+    clip0 = clips[0] if clips else None
+    max_src_dur = float(project_state.sourceVideo.originalDuration or 99999.0)
+
+    for tc in tool_calls:
+        if tc.name != "add_caption":
+            continue
+        args = dict(tc.arguments or {})
+        raw_kind = str(args.get("kind") or args.get("caption_kind") or "").strip().lower()
+        raw_start = _to_float(args.get("start"), 0.0)
+        raw_end = _to_float(args.get("end"), raw_start + 3.2)
+        c0_start_val = max(0.0, float(clip0.sourceStart)) if clip0 is not None else 0.0
+        is_intro = raw_kind == "intro_hook" or (
+            prompt_wants_intro_hook and (raw_start <= 1.5 or raw_start <= c0_start_val + 1.5)
+        )
+        args["kind"] = "intro_hook" if is_intro else "subtitle"
+        args.pop("caption_kind", None)
+        span = max(1.8, min(4.5, raw_end - raw_start if raw_end > raw_start else 3.2))
+
+        if clip0 is not None:
+            c0_start = max(0.0, float(clip0.sourceStart))
+            c0_end = max(c0_start + 0.5, float(clip0.sourceEnd))
+            if is_intro and (raw_start < c0_start - 0.1 or raw_start > c0_start + 1.5):
+                args["start"] = round(c0_start, 2)
+                args["end"] = round(min(c0_end, c0_start + span), 2)
+            elif c0_start > 1.0 and raw_start < c0_start - 0.1:
+                args["start"] = round(c0_start, 2)
+                args["end"] = round(min(c0_end, c0_start + span), 2)
+            else:
+                clamped_s = max(0.0, min(max_src_dur - 0.4, raw_start))
+                args["start"] = round(clamped_s, 2)
+                args["end"] = round(min(max_src_dur, max(clamped_s + 0.5, raw_end)), 2)
+
+        tc.arguments = args
+    return tool_calls
+
+
+_TTS_PROMPT_KEYWORDS = (
+    "text to speech",
+    "text-to-speech",
+    "tts",
+    "voiceover",
+    "voice over",
+    "narrate",
+    "narration",
+    "ai voice",
+    "speak this",
+    "read it out",
+)
+
+
+def _resolve_voiceover_tool_calls(
+    tool_calls: List[ToolCallSchema],
+    sfx_dir: Optional[Path],
+    project_state: ProjectState,
+    prompt: str,
+    transcript: Optional[Dict[str, Any]] = None,
+) -> Tuple[List[ToolCallSchema], List[SfxAsset], Optional[str]]:
+    """
+    Converts any `generate_voiceover` tool call into real playable/exportable
+    `add_sfx_clip` + synced `add_caption` calls via TTS.ai, and also auto-synthesizes
+    spoken audio if the prompt requested TTS alongside an `intro_hook` caption.
+    """
+    resolved: List[ToolCallSchema] = []
+    generated_assets: List[SfxAsset] = []
+    notes: List[str] = []
+    static_calls = [tc for tc in tool_calls if tc.name != "generate_voiceover"]
+    total_tl = max(
+        1.0,
+        sum(float(c.duration) for c in (project_state.tracks.clips or []))
+        or float(project_state.sourceVideo.originalDuration or 10.0),
+    )
+
+    for tc in tool_calls:
+        if tc.name != "generate_voiceover":
+            resolved.append(tc)
+            continue
+        vo_calls, asset, note = materialize_voiceover_tool_call(
+            tc.arguments or {},
+            project_state,
+            sfx_dir,
+            existing_tool_calls=resolved + static_calls,
+            effective_dur=total_tl,
+        )
+        resolved.extend(vo_calls)
+        if asset is not None:
+            generated_assets.append(asset)
+        if note:
+            notes.append(note)
+
+    low_prompt = (prompt or "").lower()
+    wants_tts = any(k in low_prompt for k in _TTS_PROMPT_KEYWORDS)
+    if wants_tts and not generated_assets and sfx_dir is not None:
+        hook_cap = next(
+            (
+                tc
+                for tc in resolved
+                if tc.name == "add_caption"
+                and str((tc.arguments or {}).get("kind") or "") == "intro_hook"
+                and str((tc.arguments or {}).get("text") or "").strip()
+            ),
+            None,
+        )
+        if hook_cap is not None:
+            vo_calls, asset, note = materialize_voiceover_tool_call(
+                {
+                    "text": str(hook_cap.arguments["text"]).strip(),
+                    "start": 0.0,
+                    "also_add_caption": False,
+                },
+                project_state,
+                sfx_dir,
+                existing_tool_calls=resolved,
+                effective_dur=total_tl,
+            )
+            resolved.extend(vo_calls)
+            if asset is not None:
+                generated_assets.append(asset)
+            if note:
+                notes.append(note)
+
+    return resolved, generated_assets, ("; ".join(notes) if notes else None)
+
+
 def _parse_viral_json_response(
     raw_text: str,
     project_state: ProjectState,
@@ -2068,8 +2480,12 @@ def _parse_viral_json_response(
     prompt: str,
     duration: float,
     route_used: str,
+    sfx_dir: Optional[Path] = None,
+    sfx_assets: Optional[List[SfxAsset]] = None,
 ) -> AiEditResponse:
     parsed = json.loads(_strip_json_fences(raw_text))
+    if not isinstance(parsed, dict):
+        raise ValueError("Viral JSON response must be an object.")
     explanation = str(
         parsed.get("explanation") or "Found highlight moment(s) and updated your timeline."
     )
@@ -2080,8 +2496,11 @@ def _parse_viral_json_response(
     cap_range: Tuple[Optional[float], Optional[float]] = (None, None)
 
     for raw_tc in parsed.get("tool_calls") or []:
+        if not isinstance(raw_tc, dict):
+            continue
         name = str(raw_tc.get("name", ""))
-        args = dict(raw_tc.get("arguments") or {})
+        raw_args = raw_tc.get("arguments")
+        args = dict(raw_args) if isinstance(raw_args, dict) else {}
         if not name:
             continue
         if name == "isolate_highlight_clips" and isinstance(args.get("clips"), list):
@@ -2096,12 +2515,12 @@ def _parse_viral_json_response(
                 args.pop("start_time", None)
                 start_t = None
             else:
-                start_t = float(st_raw)
+                start_t = _to_float(st_raw, 0.0)
             if et_raw is None or et_raw == "":
                 args.pop("end_time", None)
                 end_t = None
             else:
-                end_t = float(et_raw)
+                end_t = _to_float(et_raw, 0.0)
             cap_range = (start_t, end_t)
 
         tool_calls.append(
@@ -2113,18 +2532,28 @@ def _parse_viral_json_response(
         )
 
     tool_calls = _filter_protected_caption_calls(tool_calls, project_state, prompt)
+    tool_calls = _normalize_intro_hook_caption_calls(
+        prompt, tool_calls, project_state, transcript=transcript
+    )
+    tool_calls, tts_assets, tts_note = _resolve_voiceover_tool_calls(
+        tool_calls, sfx_dir, project_state, prompt, transcript=transcript
+    )
+    tool_calls = _enrich_sfx_tool_calls(tool_calls, list(sfx_assets or []) + tts_assets)
 
     auto_captions: Optional[List[CaptionItem]] = (
         _build_captions_for_isolated_or_range(transcript, isolated_clips, cap_range)
         if wants_captions
         else None
     )
+    if tts_note and tts_note.lower() not in explanation.lower():
+        explanation = f"{explanation} ({tts_note}.)".strip()
 
     return AiEditResponse(
         message=explanation,
         tool_calls=tool_calls,
         auto_captions=auto_captions,
         route_used=route_used,
+        generated_assets=tts_assets,
     )
 
 
@@ -2150,6 +2579,8 @@ def _run_gemini_viral_pipeline(
     campaign_id: Optional[str] = None,
     campaign_rules: Optional[List[str]] = None,
     chapters: Optional[List[Dict[str, Any]]] = None,
+    sfx_dir: Optional[Path] = None,
+    sfx_assets: Optional[List[SfxAsset]] = None,
 ) -> AiEditResponse:
     gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
     groq_key = os.getenv("GROQ_API_KEY", "").strip()
@@ -2320,7 +2751,7 @@ def _run_gemini_viral_pipeline(
         nonlocal last_error
         if not has_gemini:
             return None
-        client = genai.Client(api_key=gemini_key)
+        client = genai.Client(api_key=gemini_key, http_options=types.HttpOptions(timeout=60000))
         contents: List[Any] = []
         yt_url = project_state.youtubeUrl.strip()
         use_direct_yt_uri = (
@@ -2359,6 +2790,8 @@ def _run_gemini_viral_pipeline(
                     prompt,
                     duration,
                     route_label,
+                    sfx_dir=sfx_dir,
+                    sfx_assets=sfx_assets,
                 )
             except Exception as exc:
                 last_error = exc
@@ -2411,6 +2844,8 @@ def _run_gemini_viral_pipeline(
                                 prompt,
                                 duration,
                                 f"groq:{m_id} [viral]",
+                                sfx_dir=sfx_dir,
+                                sfx_assets=sfx_assets,
                             )
                         except Exception as exc:
                             msg_low = str(exc).lower()
@@ -2443,6 +2878,8 @@ def _run_gemini_viral_pipeline(
                         prompt,
                         duration,
                         f"nvidia:{m_id} [viral]",
+                        sfx_dir=sfx_dir,
+                        sfx_assets=sfx_assets,
                     )
 
                 cands.append({"provider": "nvidia", "model": nv_id, "fn": _run_nv})
@@ -2502,6 +2939,7 @@ def _run_gemini_editor_fallback(
     transcript: Optional[Dict[str, Any]],
     sfx_assets: Optional[List[SfxAsset]] = None,
     visual_plan: Optional[Dict[str, Any]] = None,
+    sfx_dir: Optional[Path] = None,
 ) -> Optional[AiEditResponse]:
     """Cross-provider fallback when Groq is unconfigured or all Groq tool models fail."""
     gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
@@ -2520,7 +2958,7 @@ def _run_gemini_editor_fallback(
         f"Available tools & schemas:\n{tool_specs}"
     )
 
-    client = genai.Client(api_key=gemini_key)
+    client = genai.Client(api_key=gemini_key, http_options=types.HttpOptions(timeout=60000))
     duration = project_state.sourceVideo.originalDuration
     quota_failures = 0
     for model_id in get_gemini_models_chain()[:3]:
@@ -2541,12 +2979,22 @@ def _run_gemini_editor_fallback(
                 prompt,
                 duration,
                 f"gemini-editor-backup ({model_id})",
+                sfx_dir=sfx_dir,
+                sfx_assets=sfx_assets,
             )
-            res.tool_calls = _enrich_sfx_tool_calls(res.tool_calls, sfx_assets or [])
+            res.tool_calls = _enrich_sfx_tool_calls(
+                res.tool_calls, list(sfx_assets or []) + res.generated_assets
+            )
             res.tool_calls, crop_zoom_note = _enforce_crop_and_zoom_intent(
                 prompt, res.tool_calls, project_state, visual_plan=visual_plan, transcript=transcript
             )
-            pauses_list = detect_pause_gaps(transcript, min_gap=0.7) if transcript else []
+            pauses_list = (
+                _filter_pauses_to_active_clips(
+                    detect_pause_gaps(transcript, min_gap=0.7), project_state.tracks.clips
+                )
+                if transcript
+                else []
+            )
             res.tool_calls, style_tool_note = _enforce_caption_and_timeline_tools(
                 prompt,
                 res.tool_calls,
@@ -2581,6 +3029,23 @@ def _is_pure_visual_prompt(prompt: str) -> bool:
     disqualifiers = (
         "caption",
         "subtitle",
+        "tts",
+        "voiceover",
+        "voice over",
+        "text to speech",
+        "text-to-speech",
+        "narrat",
+        "ai voice",
+        "intro",
+        "hook",
+        "teaser",
+        "speak",
+        "read it out",
+        "font",
+        "color",
+        "speed",
+        "slow",
+        "fast",
         "pause",
         "silence",
         "trim",
@@ -2594,6 +3059,22 @@ def _is_pure_visual_prompt(prompt: str) -> bool:
         "9:16",
         "16:9",
         "1:1",
+        "mute",
+        "unmute",
+        "volume",
+        "duck audio",
+        "duck video",
+        "video audio",
+        "original audio",
+        "cut audio",
+        "cut the audio",
+        "delete audio",
+        "delete the audio",
+        "remove audio",
+        "remove the audio",
+        "lower audio",
+        "lower the audio",
+        "boost audio",
         "portrait",
         "vertical",
         "square",
@@ -2669,14 +3150,14 @@ def _run_ai_director(
         "Output VALID JSON ONLY (no markdown fences) matching:\n"
         "{\n"
         '  "route": "timeline_edit" | "viral_discovery" | "reference_style" | "describe_only",\n'
-        '  "needs_vision": boolean (true if the edit requires seeing what/where things are in the video frames — e.g. crop onto any subject/face/object/HUD, zoom onto a visible subject/reaction, draw arrow/circle on an object, describe video, smart visual SFX placement; false ONLY for pure transcript/caption/audio/speed/ratio commands),\n'
+        '  "needs_vision": boolean (true if the edit requires seeing what/where things are in the video frames — e.g. crop onto any subject/face/object/HUD, zoom onto a visible subject/reaction, draw arrow/circle on an object, describe video, smart visual SFX placement, or writing an intro teaser caption describing what happens visually; false ONLY for pure transcript/caption-style/audio/speed/ratio commands),\n'
         '  "vision_mode": "raw_source" | "target_canvas" ("raw_source" whenever cropping to an object/subject so coordinates match the unpadded source; "target_canvas" for zooms, drawings, or viewing),\n'
         '  "target_subjects": ["exact objects/people/regions user wants targeted, e.g. streamer face, boss health bar, red ferrari, dog"],\n'
         '  "is_timed": boolean (true if user wants the effect briefly/temporarily/during a reaction or timestamp window),\n'
         '  "time_hint": "when it should start/end or what reaction/event triggers it",\n'
         '  "is_pure_visual": boolean,\n'
         '  "vision_brief": "Clear step-by-step instruction telling Stage 1 Vision what to spot and return boxes/timestamps for",\n'
-        '  "tool_brief": "Clear normalized summary of all timeline edits Stage 2 should apply"\n'
+        '  "tool_brief": "Clear normalized summary of all timeline edits Stage 2 should apply (if user asks for an opening intro/teaser caption explaining what will happen, instruct Stage 2 to call add_caption at clips[0].sourceStart with kind=\'intro_hook\' and concise TTS-ready text; if user asks for spoken Text-to-Speech / TTS / voiceover, instruct Stage 2 to call generate_voiceover)"\n'
         "}"
     )
     user_payload = (
@@ -2736,7 +3217,9 @@ def _run_ai_director(
     if has_gemini:
         for gem_id in get_gemini_models_chain()[:1]:
             def _run_gem(m_id: str = gem_id) -> Dict[str, Any]:
-                client = genai.Client(api_key=gemini_key)
+                client = genai.Client(
+                    api_key=gemini_key, http_options=types.HttpOptions(timeout=30000)
+                )
                 resp = client.models.generate_content(
                     model=m_id,
                     contents=user_payload,
@@ -2776,6 +3259,7 @@ def _run_groq_fast_editor(
     visual_plan: Optional[Dict[str, Any]] = None,
     planner_model: Optional[str] = None,
     director_brief: Optional[Dict[str, Any]] = None,
+    sfx_dir: Optional[Path] = None,
 ) -> AiEditResponse:
     groq_key = os.getenv("GROQ_API_KEY", "").strip()
     has_groq = bool(groq_key and groq_key != "your_groq_api_key_here")
@@ -2783,7 +3267,13 @@ def _run_groq_fast_editor(
     prefer_start = any(
         w in lowered_prompt for w in ("first", "beginning", "intro", "start", "opening")
     )
-    pauses = detect_pause_gaps(transcript, min_gap=0.7) if transcript else []
+    pauses = (
+        _filter_pauses_to_active_clips(
+            detect_pause_gaps(transcript, min_gap=0.7), project_state.tracks.clips
+        )
+        if transcript
+        else []
+    )
     heatmap_peaks = _extract_top_heatmap_peaks(project_state)
     transcript_text = _format_timeline_transcript_for_llm(
         transcript,
@@ -2865,7 +3355,9 @@ def _run_groq_fast_editor(
             "8. 'Zoom in when he says <phrase>': find the exact `TL` timestamp window where `<phrase>` is spoken in the transcript below and call `add_zoom_effect`.\n"
             "9. 'Add a sound effect here' or 'Add sound effects that are applicable for the video': inspect EVERY sound's `id`, `name`, `tags`, and `description` in `Available Custom MP3 SFX Library`. For a targeted SFX request, call `add_sfx_clip` at `playheadPosition` (or the matched `TL` timestamp). For a whole-video / 'applicable sound effects' request, follow Gemini Visual Planner's `planned_steps` / `detected_moments` and emit multiple well-spaced `add_sfx_clip` calls (>= 2s apart) matched to each moment's mood using exact `asset_id` and `sfx_name`, varying sounds across different moments. To trim an existing timeline sound effect (skip leading audio or shorten duration), call `trim_sfx_clip(sfx_id?, sfx_name?, trim_start?, duration?)`. If the library is empty, politely tell the user to upload `.mp3` files in the SFX Library tab.\n"
             "10. 'Draw a line/arrow/circle pointing here': call `add_drawing` over `[playheadPosition, playheadPosition + 2.5]` using normalized `0.0..1.0` coordinates (e.g. arrow from `(0.24, 0.26)` to `(0.50, 0.48)`).\n"
-            "11. CROP vs ZOOM RULE: When the user asks to CROP (e.g. 'crop to creator face', 'replace the zoom with crop', 'crop showing reaction but only for a while'), you MUST call `set_video_crop(x, y, w, h, start?, end?)` — NEVER call `add_zoom_effect` when the user asks for a crop! If the user says 'only for a while', 'at the funny part', or 'during the reaction', pass `start` and `end` (in Timeline Seconds `TL`) to `set_video_crop`. If the user also asks to remove or replace an existing zoom, call BOTH `delete_zoom_effect` (using the ID from `Active Zoom Effects`) AND `set_video_crop`."
+            "11. CROP vs ZOOM RULE: When the user asks to CROP (e.g. 'crop to creator face', 'replace the zoom with crop', 'crop showing reaction but only for a while'), you MUST call `set_video_crop(x, y, w, h, start?, end?)` — NEVER call `add_zoom_effect` when the user asks for a crop! If the user says 'only for a while', 'at the funny part', or 'during the reaction', pass `start` and `end` (in Timeline Seconds `TL`) to `set_video_crop`. If the user also asks to remove or replace an existing zoom, call BOTH `delete_zoom_effect` (using the ID from `Active Zoom Effects`) AND `set_video_crop`.\n"
+            "12. INTRO HOOK / TEASER CAPTION & TTS VOICEOVER RULE: If the user asks for an opening intro caption or teaser explaining what will happen in the clip (e.g. 'Look at what this person is gonna do to get GTA VI'), read the transcript and visual planner report to craft ONE punchy curiosity sentence (<= 14 words, natural for Text-to-Speech). If they want spoken audio / TTS / voiceover, call `generate_voiceover(text=..., start=0.0, also_add_caption=true)` (which generates the TTS.ai MP3 track AND adds the synced `intro_hook` caption!). Otherwise call `add_caption(start=clips[0].sourceStart, end=clips[0].sourceStart + 3.2, text=..., kind=\"intro_hook\")` (note `add_caption` uses SOURCE seconds, NOT 0.0 if the active clip starts later!).\n"
+            "13. VIDEO AUDIO MUTE / CUT / VOLUME RULE: When the user asks to mute, cut, delete, remove, silence, lower, duck, or boost ONLY the original video audio (NOT video footage and NOT SFX/TTS), call `edit_video_audio(start, end, muted, volume, label?)` using Timeline Seconds `TL` — NEVER call `remove_time_ranges` when they only want the audio removed/muted. To unmute/restore original audio, call `delete_audio_edit(audio_edit_id='all')` or target a specific ID from `Active Video Audio Edits`."
             f"{first_note}{campaign_block}{director_block}{visual_plan_block}\n\n"
             f"Current Project Context:\n"
             f"- Original Duration: {project_state.sourceVideo.originalDuration:.2f}s\n"
@@ -2875,6 +3367,7 @@ def _run_groq_fast_editor(
             f"- Aspect Ratio: {project_state.workspaceState.targetAspectRatio}\n"
             f"- Current Video Crop: {project_state.workspaceState.crop.model_dump_json() if project_state.workspaceState.crop else 'None (full frame)'}\n"
             f"- Active Clips: {json.dumps([c.model_dump() for c in project_state.tracks.clips[:25]])}\n"
+            f"- Active Video Audio Edits: {json.dumps([a.model_dump() for a in (project_state.tracks.audioEdits or [])[:20]])}\n"
             f"- Active Zoom Effects: {json.dumps([z.model_dump() for z in project_state.tracks.zooms[:20]])}\n"
             f"- Active Drawings: {json.dumps([d.model_dump() for d in project_state.tracks.drawings[:20]])}\n"
             f"- Active SFX Clips: {json.dumps([s.model_dump() for s in project_state.tracks.sfx[:20]])}\n"
@@ -2914,9 +3407,15 @@ def _run_groq_fast_editor(
                 sfx_assets=sfx_assets,
             )
             if direct_calls:
+                direct_caps = (
+                    build_captions_from_transcript(transcript)
+                    if transcript and any(tc.name == "generate_auto_captions" for tc in direct_calls)
+                    else None
+                )
                 return AiEditResponse(
                     message=f"{visual_plan.get('scene_summary', 'Planned visual edits.')} Executed {len(direct_calls)} planned edit(s).",
                     tool_calls=direct_calls,
+                    auto_captions=direct_caps,
                     route_used=f"{planner_model or 'visual-planner'} [direct-plan]",
                 )
         gemini_backup = _run_gemini_editor_fallback(
@@ -2926,11 +3425,12 @@ def _run_groq_fast_editor(
             transcript,
             sfx_assets=sfx_assets,
             visual_plan=visual_plan,
+            sfx_dir=sfx_dir,
         )
         if gemini_backup is not None:
             return gemini_backup
         return _deterministic_edit_fallback(
-            prompt, project_state, transcript, pauses, sfx_assets=sfx_assets
+            prompt, project_state, transcript, pauses, sfx_assets=sfx_assets, sfx_dir=sfx_dir
         )
 
     messages: List[Dict[str, Any]] = [{"role": "system", "content": system_prompt}]
@@ -2952,15 +3452,7 @@ def _run_groq_fast_editor(
     )
 
     def _extract_json_dict(raw_text: str) -> Dict[str, Any]:
-        cleaned = (raw_text or "").strip()
-        if cleaned.startswith("```"):
-            lines = cleaned.splitlines()
-            if len(lines) >= 2:
-                cleaned = "\n".join(lines[1:-1] if lines[-1].strip().startswith("```") else lines[1:]).strip()
-        start_i = cleaned.find("{")
-        end_i = cleaned.rfind("}")
-        if start_i != -1 and end_i > start_i:
-            cleaned = cleaned[start_i : end_i + 1]
+        cleaned = _strip_json_fences(raw_text)
         data = json.loads(cleaned)
         if not isinstance(data, dict):
             raise ValueError("Expected JSON object")
@@ -3110,9 +3602,15 @@ def _run_groq_fast_editor(
                 sfx_assets=sfx_assets,
             )
             if direct_calls:
+                direct_caps = (
+                    build_captions_from_transcript(transcript)
+                    if transcript and any(tc.name == "generate_auto_captions" for tc in direct_calls)
+                    else None
+                )
                 return AiEditResponse(
                     message=f"{visual_plan.get('scene_summary', 'Planned visual edits.')} Executed {len(direct_calls)} planned edit(s).",
                     tool_calls=direct_calls,
+                    auto_captions=direct_caps,
                     route_used=f"{planner_model or 'visual-planner'} [direct-plan]",
                 )
         gemini_backup = _run_gemini_editor_fallback(
@@ -3122,6 +3620,7 @@ def _run_groq_fast_editor(
             transcript,
             sfx_assets=sfx_assets,
             visual_plan=visual_plan,
+            sfx_dir=sfx_dir,
         )
         if gemini_backup is not None:
             return gemini_backup
@@ -3147,12 +3646,12 @@ def _run_groq_fast_editor(
                 args.pop("start_time", None)
                 start_t = None
             else:
-                start_t = float(st_raw)
+                start_t = _to_float(st_raw, 0.0)
             if et_raw is None or et_raw == "":
                 args.pop("end_time", None)
                 end_t = None
             else:
-                end_t = float(et_raw)
+                end_t = _to_float(et_raw, 0.0)
             cap_range = (start_t, end_t)
         tool_calls.append(
             ToolCallSchema(
@@ -3163,7 +3662,13 @@ def _run_groq_fast_editor(
         )
 
     tool_calls = _filter_protected_caption_calls(tool_calls, project_state, prompt)
-    tool_calls = _enrich_sfx_tool_calls(tool_calls, sfx_assets or [])
+    tool_calls = _normalize_intro_hook_caption_calls(
+        prompt, tool_calls, project_state, transcript=transcript
+    )
+    tool_calls, tts_assets, tts_note = _resolve_voiceover_tool_calls(
+        tool_calls, sfx_dir, project_state, prompt, transcript=transcript
+    )
+    tool_calls = _enrich_sfx_tool_calls(tool_calls, list(sfx_assets or []) + tts_assets)
     tool_calls, crop_zoom_note = _enforce_crop_and_zoom_intent(
         prompt,
         tool_calls,
@@ -3191,7 +3696,7 @@ def _run_groq_fast_editor(
     )
 
     explanation = explanation_raw.strip()
-    extra_notes = "; ".join(n for n in (crop_zoom_note, style_tool_note) if n)
+    extra_notes = "; ".join(n for n in (tts_note, crop_zoom_note, style_tool_note) if n)
     if extra_notes and extra_notes.lower() not in explanation.lower():
         explanation = f"{explanation} ({extra_notes}.)".strip() if explanation else f"{extra_notes}."
     if not explanation:
@@ -3204,6 +3709,7 @@ def _run_groq_fast_editor(
         tool_calls=tool_calls,
         auto_captions=auto_captions,
         route_used=f"{planner_model} -> {base_route}" if planner_model else base_route,
+        generated_assets=tts_assets,
     )
 
 
@@ -3332,6 +3838,7 @@ def _deterministic_edit_fallback(
     transcript: Optional[Dict[str, Any]],
     pauses: List[Dict[str, float]],
     sfx_assets: Optional[List[SfxAsset]] = None,
+    sfx_dir: Optional[Path] = None,
 ) -> AiEditResponse:
     """Deterministic command parser fallback when GROQ_API_KEY is not configured."""
     lowered = prompt.lower()
@@ -3352,12 +3859,16 @@ def _deterministic_edit_fallback(
         k in lowered
         for k in ("sound effect", "sound effects", "sfx", "audio effect", "audio effects", "mp3")
     )
+    has_audio_cut_only = bool(
+        (re.search(r"\bmute\b", lowered) or re.search(r"\b(cut|delete|remove)\b.{0,15}\b(audio|sound|mic)\b", lowered))
+        and not re.search(r"\b(pause|silence|video|footage|clip)\b", lowered)
+    )
     first_n = (
         re.search(
             r"(?:cut|remove|trim)\s+(?:the\s+)?first\s+(\d+(?:\.\d+)?)\s*(?:s|sec|seconds?)",
             lowered,
         )
-        if not has_sfx_target
+        if not has_sfx_target and not has_audio_cut_only
         else None
     )
     if first_n:
@@ -3384,7 +3895,11 @@ def _deterministic_edit_fallback(
         else:
             notes.append("No pause gaps > 0.7s were detected")
 
-    if "9:16" in lowered or "vertical" in lowered or "short" in lowered or "tiktok" in lowered:
+    if (
+        "9:16" in lowered
+        or "vertical" in lowered
+        or _has_phrase_or_word(lowered, ("short", "shorts", "tiktok"))
+    ):
         tool_calls.append(
             ToolCallSchema(
                 id=f"tc_{uuid.uuid4().hex[:8]}",
@@ -3393,7 +3908,7 @@ def _deterministic_edit_fallback(
             )
         )
         notes.append("Switched format to 9:16")
-    elif "1:1" in lowered or "square" in lowered:
+    elif "1:1" in lowered or _has_phrase_or_word(lowered, ("square",)):
         tool_calls.append(
             ToolCallSchema(
                 id=f"tc_{uuid.uuid4().hex[:8]}",
@@ -3402,7 +3917,7 @@ def _deterministic_edit_fallback(
             )
         )
         notes.append("Switched format to 1:1")
-    elif "16:9" in lowered or "landscape" in lowered:
+    elif "16:9" in lowered or _has_phrase_or_word(lowered, ("landscape",)):
         tool_calls.append(
             ToolCallSchema(
                 id=f"tc_{uuid.uuid4().hex[:8]}",
@@ -3448,11 +3963,12 @@ def _deterministic_edit_fallback(
             style_args["text_color"] = "#FACC15"
     if "bold" in lowered:
         style_args["is_bold"] = True
-    if "top" in lowered:
+    has_cap_ctx = any(k in lowered for k in ("caption", "subtitle", "text", "put", "move", "position"))
+    if has_cap_ctx and _has_phrase_or_word(lowered, ("top",)):
         style_args["position"] = "top"
-    elif "middle" in lowered or "center" in lowered:
+    elif has_cap_ctx and _has_phrase_or_word(lowered, ("middle", "center")):
         style_args["position"] = "middle"
-    elif "bottom" in lowered:
+    elif has_cap_ctx and _has_phrase_or_word(lowered, ("bottom",)):
         style_args["position"] = "bottom"
 
     if style_args:
@@ -3573,7 +4089,7 @@ def _deterministic_edit_fallback(
         if "punch" in lowered:
             kind = "punch_in"
             s_scale, e_scale, easing = 1.0, 1.4, "instant"
-        elif "zoom out" in lowered or "out" in lowered:
+        elif "zoom out" in lowered or "zoom-out" in lowered:
             kind = "zoom_out"
             s_scale, e_scale, easing = 1.4, 1.0, "ease_in_out"
         else:
@@ -3605,7 +4121,12 @@ def _deterministic_edit_fallback(
         notes.append(f"Added {kind.replace('_', ' ')} ({z_start:.1f}s–{z_end:.1f}s)")
 
     # Drawing overlay rules ("draw an arrow pointing here", "circle here", "draw a line")
-    if any(k in lowered for k in ("draw", "arrow", "circle", "box", "rect", "line", "highlight")):
+    has_cap_highlight = "yellow highlight" in lowered or any(
+        k in lowered for k in ("caption highlight", "highlight color", "highlight captions")
+    )
+    if _has_phrase_or_word(lowered, ("draw", "arrow", "circle", "box", "rect", "line")) or (
+        _has_phrase_or_word(lowered, ("highlight",)) and not has_cap_highlight
+    ):
         if "circle" in lowered:
             d_tool = "circle"
             pts = [{"x": 0.34, "y": 0.28}, {"x": 0.66, "y": 0.66}]
@@ -3726,6 +4247,29 @@ def _deterministic_edit_fallback(
         )
         notes.append(c_label)
 
+    tts_assets: List[SfxAsset] = []
+    if any(k in lowered for k in _TTS_PROMPT_KEYWORDS):
+        quoted_line = re.search(r"[\"']([^\"']{4,140})[\"']", prompt)
+        if quoted_line:
+            spoken_line = quoted_line.group(1).strip()
+        elif transcript and (transcript.get("segments") or []):
+            seg0 = str(transcript["segments"][0].get("text") or "").strip()
+            spoken_line = seg0[:90] if seg0 else "Watch what happens next in this clip!"
+        else:
+            spoken_line = "Watch what happens next in this clip!"
+        tool_calls.append(
+            ToolCallSchema(
+                id=f"tc_{uuid.uuid4().hex[:8]}",
+                name="generate_voiceover",
+                arguments={"text": spoken_line, "start": 0.0, "also_add_caption": True},
+            )
+        )
+        tool_calls, tts_assets, tts_note = _resolve_voiceover_tool_calls(
+            tool_calls, sfx_dir, project_state, prompt, transcript=transcript
+        )
+        if tts_note:
+            notes.append(tts_note)
+
     tool_calls, fallback_crop_note = _enforce_crop_and_zoom_intent(
         prompt, tool_calls, project_state, visual_plan=None, transcript=transcript
     )
@@ -3755,6 +4299,7 @@ def _deterministic_edit_fallback(
         tool_calls=tool_calls,
         auto_captions=auto_captions,
         route_used="local-rule-fallback",
+        generated_assets=tts_assets,
     )
 
 
@@ -3798,13 +4343,22 @@ def process_ai_edit(
                 custom_instruction=prompt,
                 transcript_tl_text=tl_text,
                 deep_think=deep_think,
+                sfx_dir=sfx_dir,
             )
         )
+        raw_gen = (_prof or {}).get("generated_assets") or []
+        gen_assets = [
+            a if isinstance(a, SfxAsset) else SfxAsset(**a)
+            for a in raw_gen
+            if isinstance(a, (dict, SfxAsset))
+        ]
         return AiEditResponse(
             message=summary_msg,
             tool_calls=tool_calls,
             auto_captions=auto_captions,
             route_used=f"reference-style ({route_label})",
+            requires_confirmation=True,
+            generated_assets=gen_assets,
         )
 
     director_brief: Optional[Dict[str, Any]] = None
@@ -3841,6 +4395,8 @@ def process_ai_edit(
                     transcript,
                     campaign_id=campaign_id,
                     campaign_rules=campaign_rules,
+                    sfx_dir=sfx_dir,
+                    sfx_assets=sfx_assets,
                 )
             )
         except Exception as exc:
@@ -3886,7 +4442,13 @@ def process_ai_edit(
         and (visual_plan.get("planned_steps") or visual_plan.get("detected_moments"))
         and _is_pure_visual_prompt(prompt)
     ):
-        pauses_fast = detect_pause_gaps(transcript, min_gap=0.7) if transcript else []
+        pauses_fast = (
+            _filter_pauses_to_active_clips(
+                detect_pause_gaps(transcript, min_gap=0.7), project_state.tracks.clips
+            )
+            if transcript
+            else []
+        )
         direct_calls = convert_visual_plan_to_tool_calls(visual_plan, sfx_assets)
         direct_calls = _enrich_sfx_tool_calls(direct_calls, sfx_assets or [])
         direct_calls, _ = _enforce_crop_and_zoom_intent(
@@ -3907,6 +4469,11 @@ def process_ai_edit(
             sfx_assets=sfx_assets,
         )
         if direct_calls:
+            direct_caps = (
+                build_captions_from_transcript(transcript)
+                if transcript and any(tc.name == "generate_auto_captions" for tc in direct_calls)
+                else None
+            )
             return _with_router_tag(
                 AiEditResponse(
                     message=(
@@ -3914,6 +4481,7 @@ def process_ai_edit(
                         f"Executed {len(direct_calls)} planned edit(s)."
                     ),
                     tool_calls=direct_calls,
+                    auto_captions=direct_caps,
                     route_used=f"{planner_model or 'visual-planner'} [single-pass]",
                 )
             )
@@ -3931,10 +4499,17 @@ def process_ai_edit(
                 visual_plan=visual_plan,
                 planner_model=planner_model,
                 director_brief=director_brief,
+                sfx_dir=sfx_dir,
             )
         )
     except Exception as exc:
-        pauses = detect_pause_gaps(transcript, min_gap=0.7) if transcript else []
+        pauses = (
+            _filter_pauses_to_active_clips(
+                detect_pause_gaps(transcript, min_gap=0.7), project_state.tracks.clips
+            )
+            if transcript
+            else []
+        )
         if visual_plan is not None and (
             visual_plan.get("planned_steps") or visual_plan.get("detected_moments")
         ):
@@ -3958,15 +4533,21 @@ def process_ai_edit(
                 sfx_assets=sfx_assets,
             )
             if direct_calls:
+                direct_caps = (
+                    build_captions_from_transcript(transcript)
+                    if transcript and any(tc.name == "generate_auto_captions" for tc in direct_calls)
+                    else None
+                )
                 return _with_router_tag(
                     AiEditResponse(
                         message=f"{visual_plan.get('scene_summary', 'Planned visual edits.')} Executed {len(direct_calls)} planned edit(s).",
                         tool_calls=direct_calls,
+                        auto_captions=direct_caps,
                         route_used=f"{planner_model or 'visual-planner'} [direct-plan]",
                     )
                 )
         fallback = _deterministic_edit_fallback(
-            prompt, project_state, transcript, pauses, sfx_assets=sfx_assets
+            prompt, project_state, transcript, pauses, sfx_assets=sfx_assets, sfx_dir=sfx_dir
         )
         fallback.message = f"[Groq fallback: {exc}] {fallback.message}"
         return _with_router_tag(fallback)

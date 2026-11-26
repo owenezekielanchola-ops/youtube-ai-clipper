@@ -1,5 +1,7 @@
 import json
+import os
 import re
+import threading
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
@@ -7,6 +9,8 @@ from urllib.parse import quote, unquote
 
 from schemas import SfxAsset
 from services.youtube_ingest import _find_ffmpeg, _probe_media_duration
+
+_SFX_META_LOCK = threading.RLock()
 
 ALLOWED_SFX_EXTS = {".mp3", ".wav", ".m4a", ".ogg"}
 MAX_SFX_BYTES = 25 * 1024 * 1024
@@ -233,7 +237,9 @@ def _load_meta(sfx_dir: Path) -> Dict[str, Dict[str, Any]]:
 def _save_meta(sfx_dir: Path, meta: Dict[str, Dict[str, Any]]) -> None:
     sfx_dir.mkdir(parents=True, exist_ok=True)
     meta_path = sfx_dir / "library.json"
-    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    tmp_path = sfx_dir / f".library_{uuid.uuid4().hex[:8]}.tmp"
+    tmp_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    os.replace(tmp_path, meta_path)
 
 
 def _entry_to_asset(filename: str, entry: Dict[str, Any], base_url: str) -> SfxAsset:
@@ -250,52 +256,53 @@ def _entry_to_asset(filename: str, entry: Dict[str, Any], base_url: str) -> SfxA
 
 
 def list_sfx_assets(sfx_dir: Path, base_url: str = "http://localhost:8000") -> List[SfxAsset]:
-    sfx_dir.mkdir(parents=True, exist_ok=True)
-    meta = _load_meta(sfx_dir)
-    changed = False
+    with _SFX_META_LOCK:
+        sfx_dir.mkdir(parents=True, exist_ok=True)
+        meta = _load_meta(sfx_dir)
+        changed = False
 
-    existing_files = {
-        p.name: p
-        for p in sfx_dir.iterdir()
-        if p.is_file() and p.suffix.lower() in ALLOWED_SFX_EXTS
-    }
+        existing_files = {
+            p.name: p
+            for p in sfx_dir.iterdir()
+            if p.is_file() and p.suffix.lower() in ALLOWED_SFX_EXTS
+        }
 
-    # Prune deleted audio files from metadata
-    for known_name in list(meta.keys()):
-        if known_name not in existing_files:
-            del meta[known_name]
-            changed = True
-
-    # Auto-register newly added audio files dropped into workspace_data/sfx/
-    for filename, path in existing_files.items():
-        if filename not in meta:
-            inferred_name = _infer_display_name(filename)
-            meta[filename] = {
-                "id": f"sfx_{uuid.uuid4().hex[:8]}",
-                "name": inferred_name,
-                "duration": _probe_sfx_duration(path),
-                "tags": _infer_tags(inferred_name),
-                "description": "",
-            }
-            changed = True
-        else:
-            entry = meta[filename]
-            if not entry.get("id"):
-                entry["id"] = f"sfx_{uuid.uuid4().hex[:8]}"
-                changed = True
-            if not entry.get("duration"):
-                entry["duration"] = _probe_sfx_duration(path)
+        # Prune deleted audio files from metadata
+        for known_name in list(meta.keys()):
+            if known_name not in existing_files:
+                del meta[known_name]
                 changed = True
 
-    if changed:
-        _save_meta(sfx_dir, meta)
+        # Auto-register newly added audio files dropped into workspace_data/sfx/
+        for filename, path in existing_files.items():
+            if filename not in meta:
+                inferred_name = _infer_display_name(filename)
+                meta[filename] = {
+                    "id": f"sfx_{uuid.uuid4().hex[:8]}",
+                    "name": inferred_name,
+                    "duration": _probe_sfx_duration(path),
+                    "tags": _infer_tags(inferred_name),
+                    "description": "",
+                }
+                changed = True
+            else:
+                entry = meta[filename]
+                if not entry.get("id"):
+                    entry["id"] = f"sfx_{uuid.uuid4().hex[:8]}"
+                    changed = True
+                if not entry.get("duration"):
+                    entry["duration"] = _probe_sfx_duration(path)
+                    changed = True
 
-    assets = [
-        _entry_to_asset(filename, meta[filename], base_url)
-        for filename in existing_files
-    ]
-    assets.sort(key=lambda a: a.name.lower())
-    return assets
+        if changed:
+            _save_meta(sfx_dir, meta)
+
+        assets = [
+            _entry_to_asset(filename, meta[filename], base_url)
+            for filename in existing_files
+        ]
+        assets.sort(key=lambda a: a.name.lower())
+        return assets
 
 
 def save_uploaded_sfx(
@@ -333,16 +340,17 @@ def save_uploaded_sfx(
     resolved_tags = _normalize_tags(tags) if tags is not None else _infer_tags(display_name)
     duration = _probe_sfx_duration(target_path)
 
-    meta = _load_meta(sfx_dir)
-    entry = {
-        "id": f"sfx_{uuid.uuid4().hex[:8]}",
-        "name": display_name,
-        "duration": duration,
-        "tags": resolved_tags,
-        "description": str(description or "").strip(),
-    }
-    meta[candidate_name] = entry
-    _save_meta(sfx_dir, meta)
+    with _SFX_META_LOCK:
+        meta = _load_meta(sfx_dir)
+        entry = {
+            "id": f"sfx_{uuid.uuid4().hex[:8]}",
+            "name": display_name,
+            "duration": duration,
+            "tags": resolved_tags,
+            "description": str(description or "").strip(),
+        }
+        meta[candidate_name] = entry
+        _save_meta(sfx_dir, meta)
 
     return _entry_to_asset(candidate_name, entry, base_url)
 
@@ -355,39 +363,41 @@ def update_sfx_metadata(
     description: Optional[str] = None,
     base_url: str = "http://localhost:8000",
 ) -> Optional[SfxAsset]:
-    list_sfx_assets(sfx_dir, base_url=base_url)
-    meta = _load_meta(sfx_dir)
-    for filename, entry in meta.items():
-        if entry.get("id") == sfx_id:
-            if name is not None and name.strip():
-                entry["name"] = name.strip()
-            if tags is not None:
-                entry["tags"] = _normalize_tags(tags)
-            if description is not None:
-                entry["description"] = description.strip()
-            _save_meta(sfx_dir, meta)
-            return _entry_to_asset(filename, entry, base_url)
-    return None
+    with _SFX_META_LOCK:
+        list_sfx_assets(sfx_dir, base_url=base_url)
+        meta = _load_meta(sfx_dir)
+        for filename, entry in meta.items():
+            if entry.get("id") == sfx_id:
+                if name is not None and name.strip():
+                    entry["name"] = name.strip()
+                if tags is not None:
+                    entry["tags"] = _normalize_tags(tags)
+                if description is not None:
+                    entry["description"] = description.strip()
+                _save_meta(sfx_dir, meta)
+                return _entry_to_asset(filename, entry, base_url)
+        return None
 
 
 def delete_sfx_asset(sfx_dir: Path, sfx_id: str) -> bool:
-    list_sfx_assets(sfx_dir)
-    meta = _load_meta(sfx_dir)
-    target_filename: Optional[str] = None
-    for filename, entry in meta.items():
-        if entry.get("id") == sfx_id:
-            target_filename = filename
-            break
-    if target_filename is None:
-        return False
+    with _SFX_META_LOCK:
+        list_sfx_assets(sfx_dir)
+        meta = _load_meta(sfx_dir)
+        target_filename: Optional[str] = None
+        for filename, entry in meta.items():
+            if entry.get("id") == sfx_id:
+                target_filename = filename
+                break
+        if target_filename is None:
+            return False
 
-    audio_path = (sfx_dir / target_filename).resolve()
-    root_resolved = sfx_dir.resolve()
-    if audio_path.is_relative_to(root_resolved):
-        audio_path.unlink(missing_ok=True)
-    del meta[target_filename]
-    _save_meta(sfx_dir, meta)
-    return True
+        audio_path = (sfx_dir / target_filename).resolve()
+        root_resolved = sfx_dir.resolve()
+        if audio_path.is_relative_to(root_resolved):
+            audio_path.unlink(missing_ok=True)
+        del meta[target_filename]
+        _save_meta(sfx_dir, meta)
+        return True
 
 
 def resolve_sfx_file_path(

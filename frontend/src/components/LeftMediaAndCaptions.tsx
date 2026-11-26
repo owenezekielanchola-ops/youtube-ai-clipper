@@ -4,8 +4,11 @@ import {
   ChevronDown,
   ChevronUp,
   Flame,
+  Loader2,
   Lock,
   Merge,
+  Mic,
+  MicOff,
   Music,
   Pause,
   Play,
@@ -18,8 +21,8 @@ import {
   Upload,
   Volume2,
 } from 'lucide-react';
-import { useEditorStore } from '../store/useEditorStore';
-import type { SfxAsset } from '../types/editor';
+import { API_BASE, useEditorStore } from '../store/useEditorStore';
+import type { CaptionItem, SfxAsset } from '../types/editor';
 
 function formatSec(sec: number): string {
   const m = Math.floor(sec / 60);
@@ -31,6 +34,8 @@ export const LeftMediaAndCaptions: React.FC = () => {
   const project = useEditorStore((s) => s.project);
   const runAutoCaptions = useEditorStore((s) => s.runAutoCaptions);
   const removeDetectedPauses = useEditorStore((s) => s.removeDetectedPauses);
+  const isAutoCaptioning = useEditorStore((s) => s.isAutoCaptioning);
+  const isRemovingPauses = useEditorStore((s) => s.isRemovingPauses);
   const remove_time_ranges = useEditorStore((s) => s.remove_time_ranges);
   const isolate_highlight_clips = useEditorStore((s) => s.isolate_highlight_clips);
   const add_caption = useEditorStore((s) => s.add_caption);
@@ -46,24 +51,333 @@ export const LeftMediaAndCaptions: React.FC = () => {
   const updateSfxAssetMeta = useEditorStore((s) => s.updateSfxAssetMeta);
   const deleteSfxAssetFromLibrary = useEditorStore((s) => s.deleteSfxAssetFromLibrary);
   const add_sfx_clip = useEditorStore((s) => s.add_sfx_clip);
+  const add_audio_edit = useEditorStore((s) => s.add_audio_edit);
 
-  const [leftTab, setLeftTab] = useState<'captions' | 'sfx'>('captions');
+  const [leftTab, setLeftTab] = useState<'captions' | 'voice' | 'sfx'>('captions');
   const [showSourceDetails, setShowSourceDetails] = useState(true);
   const [sfxSearch, setSfxSearch] = useState('');
   const [playingAssetId, setPlayingAssetId] = useState<string | null>(null);
   const [tagDrafts, setTagDrafts] = useState<Record<string, string>>({});
+  const [capTimeDrafts, setCapTimeDrafts] = useState<
+    Record<string, { start?: string; end?: string }>
+  >({});
   const [isDragOver, setIsDragOver] = useState(false);
+  const [ttsLoadingCapId, setTtsLoadingCapId] = useState<string | null>(null);
+  const setStatusBanner = useEditorStore((s) => s.setStatusBanner);
+
+  // Manual Voice / TTS & Speech-to-Text Studio state
+  type TtsVoiceOption = { id: string; name: string; model: string; language: string };
+  const FALLBACK_TTS_VOICES: TtsVoiceOption[] = [
+    { id: 'af_bella', name: 'Bella (Warm Female)', model: 'kokoro', language: 'en-US' },
+    { id: 'af_heart', name: 'Heart (Expressive Female)', model: 'kokoro', language: 'en-US' },
+    { id: 'af_nicole', name: 'Nicole (Clean Narration)', model: 'kokoro', language: 'en-US' },
+    { id: 'am_adam', name: 'Adam (Bold Male)', model: 'kokoro', language: 'en-US' },
+    { id: 'am_michael', name: 'Michael (Creator Male)', model: 'kokoro', language: 'en-US' },
+    { id: 'bf_emma', name: 'Emma (UK Female)', model: 'kokoro', language: 'en-GB' },
+    { id: 'bm_george', name: 'George (UK Male)', model: 'kokoro', language: 'en-GB' },
+  ];
+  const [ttsVoices, setTtsVoices] = useState<TtsVoiceOption[]>(FALLBACK_TTS_VOICES);
+  const [ttsKeyConfigured, setTtsKeyConfigured] = useState(false);
+  const [isLoadingVoices, setIsLoadingVoices] = useState(false);
+  const [ttsVoice, setTtsVoice] = useState('af_bella');
+  const [ttsModel, setTtsModel] = useState('kokoro');
+  const [ttsSpeed, setTtsSpeed] = useState(1.05);
+  const [ttsVolume, setTtsVolume] = useState(0.95);
+  const [ttsScript, setTtsScript] = useState('');
+  const [ttsPlacement, setTtsPlacement] = useState<'playhead' | 'start' | 'custom'>('playhead');
+  const [ttsCustomStart, setTtsCustomStart] = useState('0');
+  const [ttsAlsoCaption, setTtsAlsoCaption] = useState(true);
+  const [ttsCapKind, setTtsCapKind] = useState<'intro_hook' | 'subtitle'>('intro_hook');
+  const [ttsBgAudioMode, setTtsBgAudioMode] = useState<'keep' | 'duck' | 'mute'>('duck');
+  const [isGeneratingManualTts, setIsGeneratingManualTts] = useState(false);
+  const [isDictatingStt, setIsDictatingStt] = useState(false);
+  const [isTranscribingStt, setIsTranscribingStt] = useState(false);
+
+  const sttRecorderRef = useRef<MediaRecorder | null>(null);
+  const sttStreamRef = useRef<MediaStream | null>(null);
+  const sttChunksRef = useRef<Blob[]>([]);
+
+  const fetchTtsVoicesList = async () => {
+    setIsLoadingVoices(true);
+    try {
+      const resp = await fetch(`${API_BASE}/api/tts/voices`);
+      if (!resp.ok) return;
+      const data = await resp.json();
+      if (Array.isArray(data.voices) && data.voices.length > 0) {
+        setTtsVoices(data.voices as TtsVoiceOption[]);
+      }
+      setTtsKeyConfigured(Boolean(data.key_configured));
+    } catch {
+      // Keep curated fallback list if backend unreachable
+    } finally {
+      setIsLoadingVoices(false);
+    }
+  };
+
+  const toggleSttDictation = async () => {
+    if (isDictatingStt) {
+      sttRecorderRef.current?.stop();
+      setIsDictatingStt(false);
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      sttStreamRef.current = stream;
+      const preferredMime =
+        typeof MediaRecorder.isTypeSupported === 'function'
+          ? MediaRecorder.isTypeSupported('audio/webm')
+            ? 'audio/webm'
+            : MediaRecorder.isTypeSupported('audio/mp4')
+              ? 'audio/mp4'
+              : ''
+          : '';
+      const recorder = preferredMime
+        ? new MediaRecorder(stream, { mimeType: preferredMime })
+        : new MediaRecorder(stream);
+      sttChunksRef.current = [];
+      recorder.ondataavailable = (ev) => {
+        if (ev.data.size > 0) sttChunksRef.current.push(ev.data);
+      };
+      recorder.onstop = async () => {
+        stream.getTracks().forEach((t) => t.stop());
+        if (sttStreamRef.current === stream) {
+          sttStreamRef.current = null;
+        }
+        const blobType = recorder.mimeType || preferredMime || 'audio/webm';
+        const blob = new Blob(sttChunksRef.current, { type: blobType });
+        if (blob.size === 0) return;
+        const ext = blobType.includes('mp4') ? 'm4a' : blobType.includes('ogg') ? 'ogg' : 'webm';
+        const formData = new FormData();
+        formData.append('file', blob, `stt.${ext}`);
+        setIsTranscribingStt(true);
+        try {
+          const resp = await fetch(`${API_BASE}/api/voice-transcribe`, {
+            method: 'POST',
+            body: formData,
+          });
+          if (!resp.ok) {
+            const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+            throw new Error(err.detail || 'Speech-to-Text failed');
+          }
+          const data = await resp.json();
+          const spoken = String(data?.text || '').trim();
+          if (spoken) {
+            setTtsScript((prev) => (prev.trim() ? `${prev.trim()} ${spoken}` : spoken));
+            setStatusBanner('Speech-to-Text transcribed into your script box.');
+          }
+        } catch (err) {
+          setStatusBanner(
+            `Speech-to-Text error: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        } finally {
+          setIsTranscribingStt(false);
+        }
+      };
+      sttRecorderRef.current = recorder;
+      recorder.start();
+      setIsDictatingStt(true);
+    } catch {
+      setStatusBanner('Microphone access denied or unavailable.');
+    }
+  };
+
+  const resolveTimelineToSource = (tlTime: number): number => {
+    const clipsList = useEditorStore.getState().project.tracks.clips;
+    if (clipsList.length === 0) return Math.max(0, tlTime);
+    for (const c of clipsList) {
+      if (tlTime >= c.timelineStart && tlTime <= c.timelineStart + c.duration + 0.01) {
+        const spd = Math.max(0.25, Math.min(4.0, c.speed ?? 1));
+        const off = Math.max(0, Math.min(c.duration, tlTime - c.timelineStart));
+        return Number((c.sourceStart + off * spd).toFixed(2));
+      }
+    }
+    const firstClip = clipsList[0];
+    return tlTime <= 0.05 ? firstClip.sourceStart : firstClip.sourceEnd;
+  };
+
+  const handleGenerateManualVoiceover = async () => {
+    const cleanText = ttsScript.trim();
+    if (!cleanText || isGeneratingManualTts) return;
+    const reqProjectId = useEditorStore.getState().project.projectId;
+    const ph = useEditorStore.getState().project.workspaceState.playheadPosition;
+    const parsedCustom = parseFloat(ttsCustomStart);
+    const tlStart = Math.max(
+      0,
+      ttsPlacement === 'start'
+        ? 0
+        : ttsPlacement === 'custom' && Number.isFinite(parsedCustom)
+          ? parsedCustom
+          : ph,
+    );
+
+    setIsGeneratingManualTts(true);
+    try {
+      const resp = await fetch(`${API_BASE}/api/tts/generate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          text: cleanText,
+          voice: ttsVoice,
+          model: ttsModel,
+          speed: ttsSpeed,
+          name:
+            ttsCapKind === 'intro_hook' && tlStart < 0.5
+              ? 'Intro Hook TTS'
+              : `Voiceover: ${cleanText.slice(0, 24)}`,
+        }),
+      });
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+        throw new Error(err.detail || 'TTS generation failed');
+      }
+      const data = await resp.json();
+      const asset = data.asset as SfxAsset | undefined;
+      if (!asset?.url) throw new Error('Missing generated audio asset');
+      await fetchSfxLibrary();
+      const liveState = useEditorStore.getState();
+      if (liveState.project.projectId !== reqProjectId) return;
+
+      liveState.add_sfx_clip({
+        assetId: asset.id,
+        name: asset.name,
+        url: asset.url,
+        start: Number(tlStart.toFixed(2)),
+        duration: asset.duration,
+        sourceDuration: asset.duration,
+        volume: ttsVolume,
+      });
+
+      if (ttsAlsoCaption) {
+        const firstClip = liveState.project.tracks.clips[0];
+        const firstClipSpd = firstClip ? Math.max(0.25, Math.min(4.0, firstClip.speed ?? 1)) : 1;
+        const srcStart = resolveTimelineToSource(tlStart);
+        const capSpanSrc = Math.max(1.2, asset.duration * firstClipSpd);
+        liveState.add_caption(
+          srcStart,
+          Number((srcStart + capSpanSrc).toFixed(2)),
+          cleanText,
+          ttsCapKind,
+        );
+      }
+
+      if (ttsBgAudioMode !== 'keep') {
+        liveState.add_audio_edit({
+          start: Number(tlStart.toFixed(2)),
+          end: Number((tlStart + Math.max(0.4, asset.duration)).toFixed(2)),
+          muted: ttsBgAudioMode === 'mute',
+          volume: ttsBgAudioMode === 'mute' ? 0 : 0.2,
+          label: ttsBgAudioMode === 'mute' ? 'Muted under VO' : 'Ducked under VO',
+        });
+      }
+
+      setStatusBanner(
+        `Added TTS.ai voiceover (${ttsVoice} · ${ttsModel}) at ${tlStart.toFixed(1)}s.`,
+      );
+    } catch (err) {
+      setStatusBanner(
+        `TTS voiceover error: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      setIsGeneratingManualTts(false);
+    }
+  };
+
+  const handleAddTextAsCaptionOnly = () => {
+    const cleanText = ttsScript.trim();
+    if (!cleanText || !hasVideo) return;
+    const ph = useEditorStore.getState().project.workspaceState.playheadPosition;
+    const parsedCustom = parseFloat(ttsCustomStart);
+    const tlStart = Math.max(
+      0,
+      ttsPlacement === 'start'
+        ? 0
+        : ttsPlacement === 'custom' && Number.isFinite(parsedCustom)
+          ? parsedCustom
+          : ph,
+    );
+    const srcStart = resolveTimelineToSource(tlStart);
+    add_caption(srcStart, Number((srcStart + 3.0).toFixed(2)), cleanText, ttsCapKind);
+    setStatusBanner(`Added ${ttsCapKind === 'intro_hook' ? 'intro hook ' : ''}caption at ${tlStart.toFixed(1)}s.`);
+  };
+
+  const cleanHighlightToken = (token: string) =>
+    token.replace(/[^\p{L}\p{N}']/gu, '').toLowerCase();
+
+  const handleSpeakCaptionTts = async (cap: CaptionItem) => {
+    const cleanText = cap.text.trim();
+    if (!cleanText || ttsLoadingCapId) return;
+    const reqProjectId = useEditorStore.getState().project.projectId;
+    setTtsLoadingCapId(cap.id);
+    try {
+      const resp = await fetch(`${API_BASE}/api/tts/generate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          text: cleanText,
+          voice: ttsVoice,
+          model: ttsModel,
+          speed: cap.captionKind === 'intro_hook' ? ttsSpeed : 1.0,
+          name: cap.captionKind === 'intro_hook' ? 'Intro Hook TTS' : undefined,
+        }),
+      });
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+        throw new Error(err.detail || 'TTS generation failed');
+      }
+      const data = await resp.json();
+      const asset = data.asset as SfxAsset | undefined;
+      if (!asset?.url) throw new Error('Missing generated audio asset');
+      await fetchSfxLibrary();
+      const liveState = useEditorStore.getState();
+      if (liveState.project.projectId !== reqProjectId) return;
+      const liveCap =
+        liveState.project.tracks.captions.find((c) => c.id === cap.id) ?? cap;
+      const clip = liveState.project.tracks.clips.find(
+        (c) => c.sourceEnd >= liveCap.start && c.sourceStart <= liveCap.end,
+      );
+      const spd = clip ? Math.max(0.25, Math.min(4.0, clip.speed ?? 1)) : 1;
+      const tlStart = clip
+        ? Math.max(
+            0,
+            clip.timelineStart + Math.max(0, liveCap.start - clip.sourceStart) / spd,
+          )
+        : Math.max(0, liveCap.start);
+      liveState.add_sfx_clip({
+        assetId: asset.id,
+        name: asset.name,
+        url: asset.url,
+        start: Number(tlStart.toFixed(2)),
+        duration: asset.duration,
+        sourceDuration: asset.duration,
+        volume: 0.95,
+      });
+      setStatusBanner(`Generated TTS.ai voiceover '${asset.name}' at ${tlStart.toFixed(1)}s.`);
+    } catch (err) {
+      setStatusBanner(
+        `TTS voiceover error: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      setTtsLoadingCapId(null);
+    }
+  };
 
   const auditionAudioRef = useRef<HTMLAudioElement | null>(null);
   const sfxInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     void fetchSfxLibrary();
+    void fetchTtsVoicesList();
     return () => {
       if (auditionAudioRef.current) {
         auditionAudioRef.current.pause();
         auditionAudioRef.current = null;
       }
+      if (sttRecorderRef.current && sttRecorderRef.current.state !== 'inactive') {
+        sttRecorderRef.current.onstop = null;
+        sttRecorderRef.current.stop();
+      }
+      sttStreamRef.current?.getTracks().forEach((t) => t.stop());
+      sttStreamRef.current = null;
     };
   }, [fetchSfxLibrary]);
 
@@ -83,10 +397,23 @@ export const LeftMediaAndCaptions: React.FC = () => {
     stopAudition();
     const audio = new Audio(asset.url);
     audio.volume = 0.85;
-    audio.onended = () => setPlayingAssetId(null);
+    audio.onended = () => {
+      if (auditionAudioRef.current === audio) {
+        stopAudition();
+      }
+    };
+    audio.onerror = () => {
+      if (auditionAudioRef.current === audio) {
+        stopAudition();
+      }
+    };
     auditionAudioRef.current = audio;
     setPlayingAssetId(asset.id);
-    audio.play().catch(() => setPlayingAssetId(null));
+    audio.play().catch(() => {
+      if (auditionAudioRef.current === audio) {
+        stopAudition();
+      }
+    });
   };
 
   const filteredSfx = useMemo(() => {
@@ -131,13 +458,13 @@ export const LeftMediaAndCaptions: React.FC = () => {
     existingHighlights: string[],
     wordToken: string,
   ) => {
-    const clean = wordToken.replace(/[^\w']/g, '');
+    const clean = cleanHighlightToken(wordToken);
     if (!clean) return;
     const exists = existingHighlights.some(
-      (h) => h.toLowerCase() === clean.toLowerCase(),
+      (h) => cleanHighlightToken(h) === clean,
     );
     const next = exists
-      ? existingHighlights.filter((h) => h.toLowerCase() !== clean.toLowerCase())
+      ? existingHighlights.filter((h) => cleanHighlightToken(h) !== clean)
       : [...existingHighlights, clean];
     edit_caption(capId, text, next, true);
   };
@@ -256,22 +583,30 @@ export const LeftMediaAndCaptions: React.FC = () => {
             <div className="grid grid-cols-3 gap-1">
               <button
                 type="button"
-                disabled={!hasVideo}
-                onClick={() => runAutoCaptions()}
+                disabled={!hasVideo || isAutoCaptioning}
+                onClick={() => void runAutoCaptions()}
                 className="px-1.5 py-1.5 rounded-lg bg-[#1c212d] hover:bg-[#232a39] disabled:opacity-40 border border-[#272f40] text-[11px] font-medium text-slate-200 flex items-center justify-center gap-1 transition"
                 title="Generate auto-captions from speech (preserves locked manual edits)"
               >
-                <Captions className="w-3 h-3 text-amber-300 shrink-0" />
+                {isAutoCaptioning ? (
+                  <Loader2 className="w-3 h-3 text-amber-300 animate-spin shrink-0" />
+                ) : (
+                  <Captions className="w-3 h-3 text-amber-300 shrink-0" />
+                )}
                 <span>Captions</span>
               </button>
               <button
                 type="button"
-                disabled={!hasVideo}
-                onClick={() => removeDetectedPauses(0.7)}
+                disabled={!hasVideo || isRemovingPauses}
+                onClick={() => void removeDetectedPauses(0.7)}
                 className="px-1.5 py-1.5 rounded-lg bg-[#1c212d] hover:bg-[#232a39] disabled:opacity-40 border border-[#272f40] text-[11px] font-medium text-slate-200 flex items-center justify-center gap-1 transition"
                 title="Automatically cut silent pauses longer than 0.7 seconds"
               >
-                <Sparkles className="w-3 h-3 text-emerald-300 shrink-0" />
+                {isRemovingPauses ? (
+                  <Loader2 className="w-3 h-3 text-emerald-300 animate-spin shrink-0" />
+                ) : (
+                  <Sparkles className="w-3 h-3 text-emerald-300 shrink-0" />
+                )}
                 <span>Pauses</span>
               </button>
               <button
@@ -292,35 +627,50 @@ export const LeftMediaAndCaptions: React.FC = () => {
         )}
       </div>
 
-      {/* Segmented Tabs: Captions | My SFX */}
+      {/* Segmented Tabs: Captions | Voice / TTS | My SFX */}
       <div className="p-2 border-b border-[#272f40] shrink-0">
-        <div className="grid grid-cols-2 gap-1 bg-[#0f1218] p-1 rounded-xl border border-[#272f40]">
+        <div className="grid grid-cols-3 gap-1 bg-[#0f1218] p-1 rounded-xl border border-[#272f40]">
           <button
             type="button"
             onClick={() => {
               stopAudition();
               setLeftTab('captions');
             }}
-            className={`py-1.5 rounded-lg text-xs font-semibold flex items-center justify-center gap-1.5 transition ${
+            className={`py-1.5 px-1 rounded-lg text-[11px] font-semibold flex items-center justify-center gap-1 transition cursor-pointer ${
               leftTab === 'captions'
                 ? 'bg-[#1c212d] text-amber-300 border border-[#2f394e] shadow-sm'
                 : 'text-slate-400 hover:text-slate-200 border border-transparent'
             }`}
           >
-            <Captions className="w-3.5 h-3.5" />
-            Captions ({project.tracks.captions.length})
+            <Captions className="w-3.5 h-3.5 shrink-0" />
+            <span className="truncate">Captions</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              stopAudition();
+              setLeftTab('voice');
+            }}
+            className={`py-1.5 px-1 rounded-lg text-[11px] font-semibold flex items-center justify-center gap-1 transition cursor-pointer ${
+              leftTab === 'voice'
+                ? 'bg-[#1c212d] text-cyan-300 border border-[#2f394e] shadow-sm'
+                : 'text-slate-400 hover:text-slate-200 border border-transparent'
+            }`}
+          >
+            <Mic className="w-3.5 h-3.5 shrink-0" />
+            <span className="truncate">Voice/TTS</span>
           </button>
           <button
             type="button"
             onClick={() => setLeftTab('sfx')}
-            className={`py-1.5 rounded-lg text-xs font-semibold flex items-center justify-center gap-1.5 transition ${
+            className={`py-1.5 px-1 rounded-lg text-[11px] font-semibold flex items-center justify-center gap-1 transition cursor-pointer ${
               leftTab === 'sfx'
                 ? 'bg-[#1c212d] text-emerald-300 border border-[#2f394e] shadow-sm'
                 : 'text-slate-400 hover:text-slate-200 border border-transparent'
             }`}
           >
-            <Music className="w-3.5 h-3.5" />
-            My SFX ({sfxLibrary.length})
+            <Music className="w-3.5 h-3.5 shrink-0" />
+            <span className="truncate">SFX ({sfxLibrary.length})</span>
           </button>
         </div>
       </div>
@@ -368,22 +718,40 @@ export const LeftMediaAndCaptions: React.FC = () => {
                   }`}
                 >
                   {/* Timing + Lock Badge + Actions */}
-                  <div className="flex items-center justify-between gap-1.5">
+                  <div className="flex flex-wrap items-center justify-between gap-1.5">
                     <div className="flex items-center gap-1">
                       <input
                         type="number"
                         step="0.1"
                         min="0"
-                        value={cap.start}
+                        value={capTimeDrafts[cap.id]?.start ?? String(cap.start)}
                         aria-label="Caption start time"
-                        onChange={(e) =>
-                          adjust_caption_timing(
-                            cap.id,
-                            parseFloat(e.target.value) || 0,
-                            cap.end,
-                            true,
-                          )
-                        }
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          setCapTimeDrafts((prev) => ({
+                            ...prev,
+                            [cap.id]: { ...prev[cap.id], start: val },
+                          }));
+                        }}
+                        onBlur={(e) => {
+                          const parsed = parseFloat(e.target.value);
+                          setCapTimeDrafts((prev) => {
+                            const next = { ...prev };
+                            if (next[cap.id]) {
+                              const copy = { ...next[cap.id] };
+                              delete copy.start;
+                              if (copy.end === undefined) delete next[cap.id];
+                              else next[cap.id] = copy;
+                            }
+                            return next;
+                          });
+                          if (Number.isFinite(parsed) && Math.abs(parsed - cap.start) > 0.001) {
+                            adjust_caption_timing(cap.id, Math.max(0, parsed), cap.end, true);
+                          }
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') e.currentTarget.blur();
+                        }}
                         className="w-14 bg-[#12161f] border border-[#272f40] focus:border-amber-400/70 rounded-md px-1.5 py-1 text-[11px] font-mono tabular-nums text-slate-200 outline-none"
                       />
                       <span className="text-xs text-slate-500">→</span>
@@ -391,16 +759,39 @@ export const LeftMediaAndCaptions: React.FC = () => {
                         type="number"
                         step="0.1"
                         min="0"
-                        value={cap.end}
+                        value={capTimeDrafts[cap.id]?.end ?? String(cap.end)}
                         aria-label="Caption end time"
-                        onChange={(e) =>
-                          adjust_caption_timing(
-                            cap.id,
-                            cap.start,
-                            parseFloat(e.target.value) || cap.start + 0.5,
-                            true,
-                          )
-                        }
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          setCapTimeDrafts((prev) => ({
+                            ...prev,
+                            [cap.id]: { ...prev[cap.id], end: val },
+                          }));
+                        }}
+                        onBlur={(e) => {
+                          const parsed = parseFloat(e.target.value);
+                          setCapTimeDrafts((prev) => {
+                            const next = { ...prev };
+                            if (next[cap.id]) {
+                              const copy = { ...next[cap.id] };
+                              delete copy.end;
+                              if (copy.start === undefined) delete next[cap.id];
+                              else next[cap.id] = copy;
+                            }
+                            return next;
+                          });
+                          if (Number.isFinite(parsed) && Math.abs(parsed - cap.end) > 0.001) {
+                            adjust_caption_timing(
+                              cap.id,
+                              cap.start,
+                              Math.max(cap.start + 0.1, parsed),
+                              true,
+                            );
+                          }
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') e.currentTarget.blur();
+                        }}
                         className="w-14 bg-[#12161f] border border-[#272f40] focus:border-amber-400/70 rounded-md px-1.5 py-1 text-[11px] font-mono tabular-nums text-slate-200 outline-none"
                       />
                     </div>
@@ -415,6 +806,19 @@ export const LeftMediaAndCaptions: React.FC = () => {
                           Locked
                         </span>
                       )}
+                      <button
+                        type="button"
+                        disabled={!cap.text.trim() || Boolean(ttsLoadingCapId)}
+                        onClick={() => void handleSpeakCaptionTts(cap)}
+                        title="Generate spoken TTS.ai voiceover from this caption & add to timeline"
+                        className="p-1.5 rounded-md hover:bg-emerald-500/20 disabled:opacity-40 text-emerald-300 transition"
+                      >
+                        {ttsLoadingCapId === cap.id ? (
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        ) : (
+                          <Volume2 className="w-3.5 h-3.5" />
+                        )}
+                      </button>
                       {idx < project.tracks.captions.length - 1 && (
                         <button
                           type="button"
@@ -467,10 +871,12 @@ export const LeftMediaAndCaptions: React.FC = () => {
                       .split(/\s+/)
                       .filter(Boolean)
                       .map((w, wi) => {
-                        const clean = w.replace(/[^\w']/g, '').toLowerCase();
-                        const isHl = cap.highlightedWords.some(
-                          (hw) => hw.toLowerCase() === clean,
-                        );
+                        const clean = cleanHighlightToken(w);
+                        const isHl =
+                          clean !== '' &&
+                          cap.highlightedWords.some(
+                            (hw) => cleanHighlightToken(hw) === clean,
+                          );
                         return (
                           <button
                             key={`${cap.id}_w_${wi}`}
@@ -497,6 +903,281 @@ export const LeftMediaAndCaptions: React.FC = () => {
                 </div>
               ))
             )}
+          </div>
+        </div>
+      ) : leftTab === 'voice' ? (
+        /* Manual Speech-to-Text (STT) & TTS.ai Voiceover Studio */
+        <div className="flex-1 min-h-0 overflow-y-auto p-2.5 space-y-3">
+          <div className="rounded-xl border border-[#272f40] bg-[#1c212d] p-2.5 space-y-2.5">
+            <div className="flex items-center justify-between gap-2">
+              <div>
+                <h3 className="text-xs font-semibold text-cyan-300 flex items-center gap-1.5">
+                  <Volume2 className="w-3.5 h-3.5" />
+                  Voiceover &amp; Speech-to-Text
+                </h3>
+                <p className="text-[10px] text-slate-400 mt-0.5">
+                  {ttsKeyConfigured
+                    ? 'TTS.ai API Key active · up to 4,800 chars'
+                    : 'Free TTS.ai Mode · up to 480 chars/req'}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => void fetchTtsVoicesList()}
+                disabled={isLoadingVoices}
+                title="Refresh TTS.ai voices"
+                aria-label="Refresh TTS voices"
+                className="p-1.5 rounded-lg bg-[#12161f] hover:bg-[#171c28] border border-[#272f40] text-slate-300 transition cursor-pointer"
+              >
+                <RefreshCw className={`w-3 h-3 ${isLoadingVoices ? 'animate-spin' : ''}`} />
+              </button>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2">
+              <div className="space-y-1">
+                <label className="text-[10px] font-medium text-slate-300">
+                  Voice to Use
+                </label>
+                <select
+                  value={ttsVoice}
+                  onChange={(e) => {
+                    const nextId = e.target.value;
+                    setTtsVoice(nextId);
+                    const matched = ttsVoices.find((v) => v.id === nextId);
+                    if (matched?.model) setTtsModel(matched.model);
+                  }}
+                  aria-label="TTS Voice"
+                  className="w-full bg-[#12161f] border border-[#272f40] rounded-lg px-2 py-1.5 text-[11px] text-slate-100 outline-none cursor-pointer"
+                >
+                  {ttsVoices.map((v) => (
+                    <option key={v.id} value={v.id} className="bg-[#161b26]">
+                      {v.name} ({v.language})
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="space-y-1">
+                <label className="text-[10px] font-medium text-slate-300">
+                  Engine / Model
+                </label>
+                <select
+                  value={ttsModel}
+                  onChange={(e) => setTtsModel(e.target.value)}
+                  aria-label="TTS Model"
+                  className="w-full bg-[#12161f] border border-[#272f40] rounded-lg px-2 py-1.5 text-[11px] text-slate-100 outline-none cursor-pointer"
+                >
+                  <option value="kokoro" className="bg-[#161b26]">Kokoro (Natural · Free)</option>
+                  <option value="piper" className="bg-[#161b26]">Piper (Fast · Free)</option>
+                  <option value="vits" className="bg-[#161b26]">VITS (Expressive · Free)</option>
+                  <option value="melotts" className="bg-[#161b26]">MeloTTS (Clear · Free)</option>
+                </select>
+              </div>
+            </div>
+
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between gap-2">
+                <label className="text-[10px] font-medium text-slate-300">
+                  Script or Mic Dictation (Speech-to-Text)
+                </label>
+                <span className="text-[10px] font-mono tabular-nums text-slate-400">
+                  {ttsScript.length}/{ttsKeyConfigured ? 4800 : 480}
+                </span>
+              </div>
+              <textarea
+                rows={3}
+                value={ttsScript}
+                onChange={(e) => setTtsScript(e.target.value)}
+                placeholder="Type what you want spoken (e.g. 'Watch what he does to unlock GTA VI'), or click Dictate Mic below to convert your speech into text..."
+                className="w-full bg-[#12161f] border border-[#272f40] focus:border-cyan-400/70 rounded-lg p-2 text-xs text-slate-100 placeholder:text-slate-500 outline-none resize-none leading-relaxed"
+              />
+              <div className="grid grid-cols-2 gap-1.5">
+                <button
+                  type="button"
+                  disabled={isTranscribingStt}
+                  onClick={() => void toggleSttDictation()}
+                  className={`py-1.5 px-2 rounded-lg border text-[11px] font-medium flex items-center justify-center gap-1.5 transition cursor-pointer disabled:opacity-50 ${
+                    isDictatingStt
+                      ? 'bg-rose-500/20 border-rose-400 text-rose-200 animate-pulse'
+                      : 'bg-[#12161f] hover:bg-[#171c28] border-[#272f40] text-slate-200'
+                  }`}
+                >
+                  {isTranscribingStt ? (
+                    <>
+                      <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-300" />
+                      Transcribing...
+                    </>
+                  ) : isDictatingStt ? (
+                    <>
+                      <MicOff className="w-3.5 h-3.5 text-rose-300" />
+                      Stop Mic (STT)
+                    </>
+                  ) : (
+                    <>
+                      <Mic className="w-3.5 h-3.5 text-cyan-300" />
+                      Dictate Mic (STT)
+                    </>
+                  )}
+                </button>
+                <button
+                  type="button"
+                  disabled={!hasVideo || !ttsScript.trim()}
+                  onClick={handleAddTextAsCaptionOnly}
+                  title="Add the text above directly as a caption without generating TTS audio"
+                  className="py-1.5 px-2 rounded-lg bg-[#12161f] hover:bg-[#171c28] disabled:opacity-40 border border-[#272f40] text-[11px] font-medium text-amber-200 flex items-center justify-center gap-1 transition cursor-pointer"
+                >
+                  <Captions className="w-3.5 h-3.5 text-amber-300" />
+                  Add as Caption
+                </button>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2.5 pt-1 border-t border-[#272f40]">
+              <div className="space-y-1">
+                <div className="flex justify-between text-[10px] text-slate-300">
+                  <span>Voice Speed</span>
+                  <span className="font-mono text-cyan-300 tabular-nums">{ttsSpeed.toFixed(2)}x</span>
+                </div>
+                <input
+                  type="range"
+                  min={0.6}
+                  max={1.6}
+                  step={0.05}
+                  value={ttsSpeed}
+                  onChange={(e) => setTtsSpeed(Number(e.target.value))}
+                  aria-label="TTS speed"
+                  className="w-full accent-cyan-400"
+                />
+              </div>
+              <div className="space-y-1">
+                <div className="flex justify-between text-[10px] text-slate-300">
+                  <span>Voice Volume</span>
+                  <span className="font-mono text-cyan-300 tabular-nums">{Math.round(ttsVolume * 100)}%</span>
+                </div>
+                <input
+                  type="range"
+                  min={0.2}
+                  max={1.5}
+                  step={0.05}
+                  value={ttsVolume}
+                  onChange={(e) => setTtsVolume(Number(e.target.value))}
+                  aria-label="TTS volume"
+                  className="w-full accent-cyan-400"
+                />
+              </div>
+            </div>
+
+            <div className="space-y-2 pt-1 border-t border-[#272f40]">
+              <div className="space-y-1">
+                <label className="text-[10px] font-medium text-slate-300">
+                  Place on Timeline
+                </label>
+                <div className="grid grid-cols-3 gap-1">
+                  {(
+                    [
+                      { id: 'playhead', label: 'Playhead' },
+                      { id: 'start', label: '0.0s Intro' },
+                      { id: 'custom', label: 'Custom (s)' },
+                    ] as const
+                  ).map((opt) => (
+                    <button
+                      key={opt.id}
+                      type="button"
+                      onClick={() => setTtsPlacement(opt.id)}
+                      className={`py-1 rounded-lg text-[11px] border transition cursor-pointer ${
+                        ttsPlacement === opt.id
+                          ? 'bg-cyan-500/20 border-cyan-400 text-cyan-200 font-semibold'
+                          : 'bg-[#12161f] border-[#272f40] text-slate-300'
+                      }`}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+                {ttsPlacement === 'custom' && (
+                  <input
+                    type="number"
+                    step="0.1"
+                    min="0"
+                    value={ttsCustomStart}
+                    onChange={(e) => setTtsCustomStart(e.target.value)}
+                    aria-label="Custom TTS start seconds"
+                    className="w-full bg-[#12161f] border border-[#272f40] rounded-lg px-2 py-1 text-xs font-mono text-slate-200 outline-none focus:border-cyan-400"
+                  />
+                )}
+              </div>
+
+              <div className="flex items-center justify-between gap-2">
+                <label className="flex items-center gap-1.5 text-[11px] text-slate-200 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={ttsAlsoCaption}
+                    onChange={(e) => setTtsAlsoCaption(e.target.checked)}
+                    className="accent-cyan-400"
+                  />
+                  <span>Sync Caption</span>
+                </label>
+                {ttsAlsoCaption && (
+                  <select
+                    value={ttsCapKind}
+                    onChange={(e) =>
+                      setTtsCapKind(e.target.value as 'intro_hook' | 'subtitle')
+                    }
+                    aria-label="Synced caption type"
+                    className="bg-[#12161f] border border-[#272f40] rounded-md px-2 py-0.5 text-[11px] text-slate-200 outline-none"
+                  >
+                    <option value="intro_hook">Intro Hook</option>
+                    <option value="subtitle">Subtitle</option>
+                  </select>
+                )}
+              </div>
+
+              <div className="space-y-1">
+                <label className="text-[10px] font-medium text-slate-300">
+                  Video Original Audio Under Voiceover
+                </label>
+                <div className="grid grid-cols-3 gap-1">
+                  {(
+                    [
+                      { id: 'keep', label: 'Keep 100%' },
+                      { id: 'duck', label: 'Duck 20%' },
+                      { id: 'mute', label: 'Mute 0%' },
+                    ] as const
+                  ).map((m) => (
+                    <button
+                      key={m.id}
+                      type="button"
+                      onClick={() => setTtsBgAudioMode(m.id)}
+                      className={`py-1 rounded-lg text-[10px] border transition cursor-pointer ${
+                        ttsBgAudioMode === m.id
+                          ? 'bg-emerald-500/20 border-emerald-400 text-emerald-200 font-semibold'
+                          : 'bg-[#12161f] border-[#272f40] text-slate-300'
+                      }`}
+                    >
+                      {m.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            <button
+              type="button"
+              disabled={!ttsScript.trim() || isGeneratingManualTts}
+              onClick={() => void handleGenerateManualVoiceover()}
+              className="w-full py-2 rounded-xl bg-cyan-400 hover:bg-cyan-300 disabled:opacity-40 text-slate-950 text-xs font-semibold flex items-center justify-center gap-1.5 transition cursor-pointer shadow-sm"
+            >
+              {isGeneratingManualTts ? (
+                <>
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  Generating Voiceover...
+                </>
+              ) : (
+                <>
+                  <Volume2 className="w-3.5 h-3.5" />
+                  Generate Voiceover &amp; Add to Timeline
+                </>
+              )}
+            </button>
           </div>
         </div>
       ) : (
@@ -593,6 +1274,12 @@ export const LeftMediaAndCaptions: React.FC = () => {
                     .split(',')
                     .map((t) => t.trim())
                     .filter(Boolean);
+                  setTagDrafts((prev) => {
+                    const next = { ...prev };
+                    delete next[asset.id];
+                    return next;
+                  });
+                  if (parsed.join(',') === asset.tags.join(',')) return;
                   void updateSfxAssetMeta(asset.id, { tags: parsed });
                 };
                 return (
@@ -665,6 +1352,7 @@ export const LeftMediaAndCaptions: React.FC = () => {
                             url: asset.url,
                             start: project.workspaceState.playheadPosition,
                             duration: asset.duration,
+                            sourceDuration: asset.duration,
                             volume: 0.85,
                           })
                         }

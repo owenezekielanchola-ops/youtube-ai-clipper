@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowLeft,
   ArrowRight,
+  AudioLines,
   ChevronDown,
   ChevronUp,
   Crop,
@@ -10,6 +11,7 @@ import {
   Scissors,
   Trash2,
   Volume2,
+  VolumeX,
   X,
   ZoomIn,
   ZoomOut,
@@ -57,6 +59,12 @@ export const BottomTimeline: React.FC = () => {
   const sfxLibrary = useEditorStore((s) => s.sfxLibrary);
   const update_sfx_clip = useEditorStore((s) => s.update_sfx_clip);
   const delete_sfx_clip = useEditorStore((s) => s.delete_sfx_clip);
+  const selectedAudioEditId = useEditorStore((s) => s.selectedAudioEditId);
+  const setSelectedAudioEditId = useEditorStore((s) => s.setSelectedAudioEditId);
+  const add_audio_edit = useEditorStore((s) => s.add_audio_edit);
+  const update_audio_edit = useEditorStore((s) => s.update_audio_edit);
+  const delete_audio_edit = useEditorStore((s) => s.delete_audio_edit);
+  const split_audio_at = useEditorStore((s) => s.split_audio_at);
 
   const trackScrollRef = useRef<HTMLDivElement | null>(null);
   const [draggedClipId, setDraggedClipId] = useState<string | null>(null);
@@ -86,10 +94,19 @@ export const BottomTimeline: React.FC = () => {
   const selectedIds = project.workspaceState.selectedClipIds;
 
   const totalDuration = useMemo(
-    () => Math.max(10, clips.reduce((acc, c) => acc + c.duration, 0)),
+    () => clips.reduce((acc, c) => acc + c.duration, 0),
     [clips],
   );
-  const timelineWidthPx = Math.max(800, Math.ceil(totalDuration * timelineZoom) + 120);
+  const visualDuration = Math.max(10, totalDuration);
+  const timelineWidthPx = Math.max(800, Math.ceil(visualDuration * timelineZoom) + 120);
+  const activeDragCleanupRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    return () => {
+      activeDragCleanupRef.current?.();
+      activeDragCleanupRef.current = null;
+    };
+  }, []);
 
   const activeClipAtPlayhead = useMemo(() => {
     return (
@@ -135,6 +152,7 @@ export const BottomTimeline: React.FC = () => {
           target.tagName === 'SELECT' ||
           target.isContentEditable);
       if (isEditingInput) return;
+      if (document.querySelector('[aria-modal="true"]')) return;
 
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
         e.preventDefault();
@@ -152,41 +170,53 @@ export const BottomTimeline: React.FC = () => {
         return;
       }
 
+      const st = useEditorStore.getState();
       if (e.code === 'Space') {
         e.preventDefault();
-        const st = useEditorStore.getState();
+        if (st.isCropMode) st.setIsCropMode(false);
+        if (st.activeDrawTool) st.setActiveDrawTool(null);
         if (st.project.tracks.clips.length > 0) {
           st.setIsPlaying(!st.isPlaying);
         }
-      } else if (e.key.toLowerCase() === 's' && !e.ctrlKey && !e.metaKey) {
+      } else if (e.key.toLowerCase() === 's' && !e.ctrlKey && !e.metaKey && !e.altKey) {
         e.preventDefault();
-        handleSplitAtPlayhead();
+        const ph = st.project.workspaceState.playheadPosition;
+        const active = st.project.tracks.clips.find(
+          (c) =>
+            ph > c.timelineStart + 0.15 &&
+            ph < c.timelineStart + c.duration - 0.15,
+        );
+        if (active) {
+          st.split_clip(active.id, ph);
+        }
       } else if (e.key === 'Delete' || e.key === 'Backspace') {
-        if (selectedZoomId) {
+        const tracks = st.project.tracks;
+        const zId = st.selectedZoomId;
+        const dId = st.selectedDrawingId;
+        const sfxId = st.selectedSfxId;
+        const audId = st.selectedAudioEditId;
+        const selClipIds = st.project.workspaceState.selectedClipIds;
+        if (zId && (tracks.zooms ?? []).some((z) => z.id === zId)) {
           e.preventDefault();
-          delete_zoom_effect(selectedZoomId);
-        } else if (selectedDrawingId) {
+          st.delete_zoom_effect(zId);
+        } else if (dId && (tracks.drawings ?? []).some((d) => d.id === dId)) {
           e.preventDefault();
-          delete_drawing(selectedDrawingId);
-        } else if (selectedSfxId) {
+          st.delete_drawing(dId);
+        } else if (sfxId && (tracks.sfx ?? []).some((s) => s.id === sfxId)) {
           e.preventDefault();
-          delete_sfx_clip(selectedSfxId);
-        } else if (selectedIds.length > 0) {
+          st.delete_sfx_clip(sfxId);
+        } else if (audId && (tracks.audioEdits ?? []).some((a) => a.id === audId)) {
           e.preventDefault();
-          delete_clips(selectedIds);
+          st.delete_audio_edit(audId);
+        } else if (selClipIds.length > 0) {
+          e.preventDefault();
+          st.delete_clips(selClipIds);
         }
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [
-    activeClipAtPlayhead,
-    playhead,
-    selectedIds,
-    selectedZoomId,
-    selectedDrawingId,
-    selectedSfxId,
-  ]);
+  }, []);
 
   const handleRulerMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
     const rect = e.currentTarget.getBoundingClientRect();
@@ -198,11 +228,17 @@ export const BottomTimeline: React.FC = () => {
     };
     updateFromClientX(e.clientX);
 
+    activeDragCleanupRef.current?.();
     const onMove = (ev: MouseEvent) => updateFromClientX(ev.clientX);
-    const onUp = () => {
+    const cleanup = () => {
       window.removeEventListener('mousemove', onMove);
       window.removeEventListener('mouseup', onUp);
+      if (activeDragCleanupRef.current === cleanup) {
+        activeDragCleanupRef.current = null;
+      }
     };
+    const onUp = () => cleanup();
+    activeDragCleanupRef.current = cleanup;
     window.addEventListener('mousemove', onMove);
     window.addEventListener('mouseup', onUp);
   };
@@ -214,6 +250,7 @@ export const BottomTimeline: React.FC = () => {
     edge: 'left' | 'right',
   ) => {
     e.stopPropagation();
+    e.preventDefault();
     const startX = e.clientX;
     const origStart = clip.sourceStart;
     const origEnd = clip.sourceEnd;
@@ -222,6 +259,7 @@ export const BottomTimeline: React.FC = () => {
     let latestStart = origStart;
     let latestEnd = origEnd;
 
+    activeDragCleanupRef.current?.();
     const onMove = (ev: MouseEvent) => {
       const deltaPx = ev.clientX - startX;
       const deltaSec = (deltaPx / timelineZoom) * clipSpeed;
@@ -237,9 +275,15 @@ export const BottomTimeline: React.FC = () => {
       });
     };
 
-    const onUp = () => {
+    const cleanup = () => {
       window.removeEventListener('mousemove', onMove);
       window.removeEventListener('mouseup', onUp);
+      if (activeDragCleanupRef.current === cleanup) {
+        activeDragCleanupRef.current = null;
+      }
+    };
+    const onUp = () => {
+      cleanup();
       setTrimPreview(null);
       if (
         Math.abs(latestStart - origStart) > 0.05 ||
@@ -249,6 +293,7 @@ export const BottomTimeline: React.FC = () => {
       }
     };
 
+    activeDragCleanupRef.current = cleanup;
     window.addEventListener('mousemove', onMove);
     window.addEventListener('mouseup', onUp);
   };
@@ -263,17 +308,22 @@ export const BottomTimeline: React.FC = () => {
     clipSpeed = 1,
   ) => {
     e.stopPropagation();
+    e.preventDefault();
     const startX = e.clientX;
     const speedFactor = Math.max(0.25, Math.min(4.0, clipSpeed));
+    const maxSource = project.sourceVideo.originalDuration > 0
+      ? project.sourceVideo.originalDuration
+      : origEnd + 60;
     let s = origStart;
     let end = origEnd;
 
+    activeDragCleanupRef.current?.();
     const onMove = (ev: MouseEvent) => {
       const delta = ((ev.clientX - startX) / timelineZoom) * speedFactor;
       if (edge === 'left') {
         s = Math.max(0, Math.min(origEnd - 0.2, origStart + delta));
       } else {
-        end = Math.max(origStart + 0.2, origEnd + delta);
+        end = Math.min(maxSource, Math.max(origStart + 0.2, origEnd + delta));
       }
       setCaptionDragPreview({
         capId,
@@ -281,14 +331,21 @@ export const BottomTimeline: React.FC = () => {
         srcEnd: Number(end.toFixed(2)),
       });
     };
-    const onUp = () => {
+    const cleanup = () => {
       window.removeEventListener('mousemove', onMove);
       window.removeEventListener('mouseup', onUp);
+      if (activeDragCleanupRef.current === cleanup) {
+        activeDragCleanupRef.current = null;
+      }
+    };
+    const onUp = () => {
+      cleanup();
       setCaptionDragPreview(null);
       if (Math.abs(s - origStart) > 0.04 || Math.abs(end - origEnd) > 0.04) {
         adjust_caption_timing(capId, s, end, true);
       }
     };
+    activeDragCleanupRef.current = cleanup;
     window.addEventListener('mousemove', onMove);
     window.addEventListener('mouseup', onUp);
   };
@@ -302,19 +359,22 @@ export const BottomTimeline: React.FC = () => {
     onCommit: (nextStart: number, nextEnd: number) => void,
   ) => {
     e.stopPropagation();
+    e.preventDefault();
     const startX = e.clientX;
     let s = origStart;
     let end = origEnd;
     const span = Math.max(0.25, origEnd - origStart);
+    const maxBound = Math.max(totalDuration, origEnd);
 
+    activeDragCleanupRef.current?.();
     const onMove = (ev: MouseEvent) => {
       const delta = (ev.clientX - startX) / timelineZoom;
       if (mode === 'left') {
         s = Math.max(0, Math.min(origEnd - 0.25, origStart + delta));
       } else if (mode === 'right') {
-        end = Math.min(totalDuration, Math.max(origStart + 0.25, origEnd + delta));
+        end = Math.min(maxBound, Math.max(origStart + 0.25, origEnd + delta));
       } else {
-        s = Math.max(0, Math.min(totalDuration - span, origStart + delta));
+        s = Math.max(0, Math.min(Math.max(0, maxBound - span), origStart + delta));
         end = s + span;
       }
       setRangeDragPreview({
@@ -324,15 +384,22 @@ export const BottomTimeline: React.FC = () => {
       });
     };
 
-    const onUp = () => {
+    const cleanup = () => {
       window.removeEventListener('mousemove', onMove);
       window.removeEventListener('mouseup', onUp);
+      if (activeDragCleanupRef.current === cleanup) {
+        activeDragCleanupRef.current = null;
+      }
+    };
+    const onUp = () => {
+      cleanup();
       setRangeDragPreview(null);
       if (Math.abs(s - origStart) > 0.04 || Math.abs(end - origEnd) > 0.04) {
         onCommit(Number(s.toFixed(3)), Number(end.toFixed(3)));
       }
     };
 
+    activeDragCleanupRef.current = cleanup;
     window.addEventListener('mousemove', onMove);
     window.addEventListener('mouseup', onUp);
   };
@@ -344,16 +411,19 @@ export const BottomTimeline: React.FC = () => {
     sourceDur: number,
   ) => {
     e.stopPropagation();
+    e.preventDefault();
     const startX = e.clientX;
     const origStart = sc.start;
     const origDur = sc.duration;
     const origEnd = origStart + origDur;
     const origTrimStart = Math.max(0, sc.trimStart ?? 0);
+    const maxBound = Math.max(totalDuration, origEnd);
 
     let nextStart = origStart;
     let nextEnd = origEnd;
     let nextTrimStart = origTrimStart;
 
+    activeDragCleanupRef.current?.();
     const onMove = (ev: MouseEvent) => {
       const delta = (ev.clientX - startX) / timelineZoom;
       if (mode === 'left') {
@@ -364,7 +434,7 @@ export const BottomTimeline: React.FC = () => {
         nextEnd = origEnd;
       } else if (mode === 'right') {
         const maxRemaining = Math.max(0.15, sourceDur - origTrimStart);
-        const maxEnd = Math.min(totalDuration, origStart + maxRemaining);
+        const maxEnd = Math.min(maxBound, origStart + maxRemaining);
         const minEnd = Math.min(maxEnd, origStart + 0.15);
         nextStart = origStart;
         nextEnd = Math.max(minEnd, Math.min(maxEnd, origEnd + delta));
@@ -390,9 +460,15 @@ export const BottomTimeline: React.FC = () => {
       }
     };
 
-    const onUp = () => {
+    const cleanup = () => {
       window.removeEventListener('mousemove', onMove);
       window.removeEventListener('mouseup', onUp);
+      if (activeDragCleanupRef.current === cleanup) {
+        activeDragCleanupRef.current = null;
+      }
+    };
+    const onUp = () => {
+      cleanup();
       setRangeDragPreview(null);
       setSfxTrimPreview(null);
       const nextDur = Math.max(0.15, Number((nextEnd - nextStart).toFixed(3)));
@@ -409,19 +485,20 @@ export const BottomTimeline: React.FC = () => {
       }
     };
 
+    activeDragCleanupRef.current = cleanup;
     window.addEventListener('mousemove', onMove);
     window.addEventListener('mouseup', onUp);
   };
 
   // Adaptive ruler tick spacing (caps DOM tick nodes cleanly even on multi-hour timelines)
   const baseTickStepSec = timelineZoom >= 25 ? 2 : timelineZoom >= 12 ? 5 : 10;
-  const minStepForDom = totalDuration > 300 ? Math.ceil(totalDuration / 150) : baseTickStepSec;
+  const minStepForDom = visualDuration > 300 ? Math.ceil(visualDuration / 150) : baseTickStepSec;
   const cleanSteps = [2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600];
   const tickStepSec =
     cleanSteps.find((step) => step >= Math.max(baseTickStepSec, minStepForDom)) ??
     Math.ceil(minStepForDom / 600) * 600;
   const ticks: number[] = [];
-  for (let t = 0; t <= totalDuration; t += tickStepSec) {
+  for (let t = 0; t <= visualDuration; t += tickStepSec) {
     ticks.push(t);
   }
 
@@ -473,6 +550,28 @@ export const BottomTimeline: React.FC = () => {
   const zooms = project.tracks.zooms ?? [];
   const drawings = project.tracks.drawings ?? [];
   const sfxClips = project.tracks.sfx ?? [];
+  const audioEdits = project.tracks.audioEdits ?? [];
+  const selectedAudioEdit =
+    audioEdits.find((ae) => ae.id === selectedAudioEditId) ?? null;
+  const canSplitAudioAtPlayhead = useMemo(
+    () =>
+      audioEdits.some(
+        (ae) => playhead > ae.start + 0.15 && playhead < ae.end - 0.15,
+      ) || Boolean(activeClipAtPlayhead),
+    [audioEdits, playhead, activeClipAtPlayhead],
+  );
+  const selectedClipAudioMute = useMemo(() => {
+    if (!selectedClip) return null;
+    const cEnd = selectedClip.timelineStart + selectedClip.duration;
+    return (
+      audioEdits.find(
+        (ae) =>
+          ae.muted &&
+          Math.abs(ae.start - selectedClip.timelineStart) < 0.15 &&
+          Math.abs(ae.end - cEnd) < 0.15,
+      ) ?? null
+    );
+  }, [audioEdits, selectedClip]);
   const rawCrop = project.workspaceState.crop;
   const timedCrop =
     rawCrop &&
@@ -609,14 +708,104 @@ export const BottomTimeline: React.FC = () => {
                 aria-label="Clip playback speed"
                 className="bg-transparent text-xs font-mono tabular-nums text-cyan-200 outline-none cursor-pointer"
               >
-                {[0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3].map((spd) => (
-                  <option key={spd} value={spd} className="bg-[#161b26] text-slate-100">
-                    {spd}x
-                  </option>
-                ))}
+                {Array.from(
+                  new Set([0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4, selectedClip.speed ?? 1]),
+                )
+                  .sort((a, b) => a - b)
+                  .map((spd) => (
+                    <option key={spd} value={spd} className="bg-[#161b26] text-slate-100">
+                      {spd}x
+                    </option>
+                  ))}
               </select>
             </div>
           )}
+
+          {/* Video Audio Cut & Mute Controls (affect audio only, not video frames) */}
+          <div className="flex items-center gap-1 ml-1 pl-1.5 border-l border-[#272f40]">
+            <button
+              type="button"
+              disabled={!canSplitAudioAtPlayhead}
+              onClick={() => split_audio_at(playhead)}
+              title="Cut / split video audio at playhead so you can mute or adjust one part"
+              className="px-2 py-1.5 rounded-lg bg-[#1c212d] hover:bg-[#232a39] disabled:opacity-40 border border-[#272f40] text-xs font-medium text-emerald-200 flex items-center gap-1 transition cursor-pointer"
+            >
+              <AudioLines className="w-3.5 h-3.5 text-emerald-300" />
+              <span className="hidden sm:inline">Cut Audio</span>
+            </button>
+            <button
+              type="button"
+              disabled={clips.length === 0 || totalDuration <= 0.15}
+              onClick={() => {
+                if (selectedAudioEdit) {
+                  update_audio_edit(selectedAudioEdit.id, {
+                    muted: !selectedAudioEdit.muted,
+                    volume: !selectedAudioEdit.muted ? 0 : 1,
+                    label: !selectedAudioEdit.muted ? 'Muted audio' : 'Audio 100%',
+                  });
+                } else {
+                  const s = Math.max(0, Math.min(totalDuration - 0.2, playhead));
+                  const e = Math.min(totalDuration, Math.max(s + 0.25, s + 2.5));
+                  add_audio_edit({
+                    start: Number(s.toFixed(2)),
+                    end: Number(e.toFixed(2)),
+                    muted: true,
+                    volume: 0,
+                    label: 'Muted audio',
+                  });
+                }
+              }}
+              title={
+                selectedAudioEdit
+                  ? selectedAudioEdit.muted
+                    ? 'Unmute selected audio part'
+                    : 'Mute / delete selected audio part'
+                  : 'Mute a 2.5s video audio segment starting at playhead (keeps video)'
+              }
+              className={`px-2 py-1.5 rounded-lg border text-xs font-medium flex items-center gap-1 transition cursor-pointer disabled:opacity-40 ${
+                selectedAudioEdit?.muted
+                  ? 'bg-rose-500/20 border-rose-400/60 text-rose-200'
+                  : 'bg-[#1c212d] hover:bg-[#232a39] border-[#272f40] text-rose-200'
+              }`}
+            >
+              <VolumeX className="w-3.5 h-3.5 text-rose-400" />
+              <span className="hidden md:inline">
+                {selectedAudioEdit?.muted ? 'Unmute Part' : 'Mute Audio'}
+              </span>
+            </button>
+            {selectedClip && (
+              <button
+                type="button"
+                onClick={() => {
+                  if (selectedClipAudioMute) {
+                    delete_audio_edit(selectedClipAudioMute.id);
+                  } else {
+                    add_audio_edit({
+                      start: Number(selectedClip.timelineStart.toFixed(3)),
+                      end: Number(
+                        (selectedClip.timelineStart + selectedClip.duration).toFixed(3),
+                      ),
+                      muted: true,
+                      volume: 0,
+                      label: `Muted: ${selectedClip.title}`,
+                    });
+                  }
+                }}
+                title={
+                  selectedClipAudioMute
+                    ? 'Restore selected clip video audio'
+                    : 'Mute video audio for the entire selected clip'
+                }
+                className={`px-2 py-1.5 rounded-lg border text-xs font-medium transition cursor-pointer ${
+                  selectedClipAudioMute
+                    ? 'bg-rose-500/25 border-rose-400 text-rose-100'
+                    : 'bg-[#1c212d] hover:bg-[#232a39] border-[#272f40] text-slate-200'
+                }`}
+              >
+                {selectedClipAudioMute ? 'Unmute Clip' : 'Mute Clip'}
+              </button>
+            )}
+          </div>
         </div>
 
         {/* Subtle Keyboard Cheat-Sheet */}
@@ -749,7 +938,16 @@ export const BottomTimeline: React.FC = () => {
                     ? Math.max(0.1, (trimPreview.sourceEnd - trimPreview.sourceStart) / clipSpeed)
                     : clip.duration;
                   const leftPx = clip.timelineStart * timelineZoom;
-                  const widthPx = Math.max(24, displayDuration * timelineZoom);
+                  const nextClipStart =
+                    idx + 1 < clips.length ? clips[idx + 1].timelineStart : null;
+                  const maxWidthPx =
+                    nextClipStart != null
+                      ? Math.max(4, (nextClipStart - clip.timelineStart) * timelineZoom)
+                      : Infinity;
+                  const widthPx = Math.min(
+                    maxWidthPx,
+                    Math.max(24, displayDuration * timelineZoom),
+                  );
 
                   return (
                     <div
@@ -783,6 +981,11 @@ export const BottomTimeline: React.FC = () => {
                     >
                       {/* Left Trim Handle */}
                       <div
+                        draggable={false}
+                        onDragStart={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                        }}
                         onMouseDown={(e) => startTrimDrag(e, clip, 'left')}
                         title="Drag to trim clip start"
                         className="w-2 h-full bg-amber-400/35 hover:bg-amber-400 cursor-ew-resize shrink-0"
@@ -807,6 +1010,11 @@ export const BottomTimeline: React.FC = () => {
                       )}
                       {/* Right Trim Handle */}
                       <div
+                        draggable={false}
+                        onDragStart={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                        }}
                         onMouseDown={(e) => startTrimDrag(e, clip, 'right')}
                         title="Drag to trim clip end"
                         className="w-2 h-full bg-amber-400/35 hover:bg-amber-400 cursor-ew-resize shrink-0"
@@ -864,6 +1072,107 @@ export const BottomTimeline: React.FC = () => {
                     </div>
                   );
                 })}
+
+                {/* Interactive Video Audio Mute / Cut / Volume Segments */}
+                {audioEdits.map((ae) => {
+                  const drag =
+                    rangeDragPreview && rangeDragPreview.id === ae.id ? rangeDragPreview : null;
+                  const s = drag ? drag.start : ae.start;
+                  const eTime = drag ? drag.end : ae.end;
+                  const leftPx = s * timelineZoom;
+                  const widthPx = Math.max(26, (eTime - s) * timelineZoom);
+                  const active = selectedAudioEditId === ae.id;
+                  const effGain = ae.muted ? 0 : ae.volume;
+                  const isMutedSeg = ae.muted || effGain <= 0.001;
+                  const isBoostSeg = !isMutedSeg && effGain > 1.01;
+                  const isDuckSeg = !isMutedSeg && effGain < 0.99;
+
+                  return (
+                    <div
+                      key={ae.id}
+                      onClick={(ev) => {
+                        ev.stopPropagation();
+                        setSelectedAudioEditId(ae.id);
+                      }}
+                      onMouseDown={(ev) =>
+                        startRangeDrag(ev, ae.id, ae.start, ae.end, 'move', (ns, ne) =>
+                          update_audio_edit(ae.id, { start: ns, end: ne }),
+                        )
+                      }
+                      title={`${ae.label || (isMutedSeg ? 'Muted audio' : `Audio ${Math.round(effGain * 100)}%`)} (${s.toFixed(1)}s–${eTime.toFixed(1)}s) · Drag edges to resize`}
+                      style={{ left: `${leftPx}px`, width: `${widthPx}px` }}
+                      className={`absolute top-0.5 bottom-0.5 rounded-md border flex items-center overflow-hidden cursor-grab z-10 ${
+                        isMutedSeg
+                          ? active
+                            ? 'bg-rose-500/40 border-rose-300'
+                            : 'bg-rose-500/25 border-rose-400/70 hover:border-rose-300'
+                          : isDuckSeg
+                            ? active
+                              ? 'bg-amber-500/35 border-amber-300'
+                              : 'bg-amber-500/20 border-amber-400/60 hover:border-amber-300'
+                            : isBoostSeg
+                              ? active
+                                ? 'bg-cyan-500/35 border-cyan-300'
+                                : 'bg-cyan-500/20 border-cyan-400/60 hover:border-cyan-300'
+                              : active
+                                ? 'bg-emerald-500/35 border-emerald-200'
+                                : 'bg-emerald-500/20 border-emerald-300/70 hover:border-emerald-200'
+                      }`}
+                    >
+                      <div
+                        onMouseDown={(ev) =>
+                          startRangeDrag(ev, ae.id, ae.start, ae.end, 'left', (ns, ne) =>
+                            update_audio_edit(ae.id, { start: ns, end: ne }),
+                          )
+                        }
+                        className="w-1.5 h-full bg-white/15 hover:bg-white/60 cursor-ew-resize shrink-0"
+                      />
+                      <button
+                        type="button"
+                        onMouseDown={(ev) => ev.stopPropagation()}
+                        onClick={(ev) => {
+                          ev.stopPropagation();
+                          update_audio_edit(ae.id, {
+                            muted: !ae.muted,
+                            volume: !ae.muted ? 0 : 1,
+                            label: !ae.muted ? 'Muted audio' : 'Audio 100%',
+                          });
+                        }}
+                        title={isMutedSeg ? 'Unmute this audio segment' : 'Mute/cut this audio segment'}
+                        className="p-0.5 ml-0.5 text-slate-100 hover:text-amber-200 shrink-0 cursor-pointer"
+                      >
+                        {isMutedSeg ? (
+                          <VolumeX className="w-3 h-3 text-rose-200" />
+                        ) : (
+                          <Volume2 className="w-3 h-3 text-emerald-100" />
+                        )}
+                      </button>
+                      <span className="flex-1 px-1 text-[10px] font-medium text-slate-100 truncate">
+                        {isMutedSeg ? 'Muted' : `${Math.round(effGain * 100)}%`}
+                      </span>
+                      <button
+                        type="button"
+                        onMouseDown={(ev) => ev.stopPropagation()}
+                        onClick={(ev) => {
+                          ev.stopPropagation();
+                          delete_audio_edit(ae.id);
+                        }}
+                        className="p-0.5 text-slate-200 hover:text-red-300 shrink-0 cursor-pointer"
+                        title="Restore original audio (delete audio segment)"
+                      >
+                        <X className="w-3 h-3" />
+                      </button>
+                      <div
+                        onMouseDown={(ev) =>
+                          startRangeDrag(ev, ae.id, ae.start, ae.end, 'right', (ns, ne) =>
+                            update_audio_edit(ae.id, { start: ns, end: ne }),
+                          )
+                        }
+                        className="w-1.5 h-full bg-white/15 hover:bg-white/60 cursor-ew-resize shrink-0"
+                      />
+                    </div>
+                  );
+                })}
               </div>
 
               {/* Captions Track */}
@@ -909,6 +1218,107 @@ export const BottomTimeline: React.FC = () => {
                           )
                         }
                         className="w-1.5 h-full hover:bg-amber-400 cursor-ew-resize shrink-0"
+                      />
+                    </div>
+                  );
+                })}
+
+                {/* Interactive Video Audio Mute / Cut / Volume Segments */}
+                {audioEdits.map((ae) => {
+                  const drag =
+                    rangeDragPreview && rangeDragPreview.id === ae.id ? rangeDragPreview : null;
+                  const s = drag ? drag.start : ae.start;
+                  const eTime = drag ? drag.end : ae.end;
+                  const leftPx = s * timelineZoom;
+                  const widthPx = Math.max(26, (eTime - s) * timelineZoom);
+                  const active = selectedAudioEditId === ae.id;
+                  const effGain = ae.muted ? 0 : ae.volume;
+                  const isMutedSeg = ae.muted || effGain <= 0.001;
+                  const isBoostSeg = !isMutedSeg && effGain > 1.01;
+                  const isDuckSeg = !isMutedSeg && effGain < 0.99;
+
+                  return (
+                    <div
+                      key={ae.id}
+                      onClick={(ev) => {
+                        ev.stopPropagation();
+                        setSelectedAudioEditId(ae.id);
+                      }}
+                      onMouseDown={(ev) =>
+                        startRangeDrag(ev, ae.id, ae.start, ae.end, 'move', (ns, ne) =>
+                          update_audio_edit(ae.id, { start: ns, end: ne }),
+                        )
+                      }
+                      title={`${ae.label || (isMutedSeg ? 'Muted audio' : `Audio ${Math.round(effGain * 100)}%`)} (${s.toFixed(1)}s–${eTime.toFixed(1)}s) · Drag edges to resize`}
+                      style={{ left: `${leftPx}px`, width: `${widthPx}px` }}
+                      className={`absolute top-0.5 bottom-0.5 rounded-md border flex items-center overflow-hidden cursor-grab z-10 ${
+                        isMutedSeg
+                          ? active
+                            ? 'bg-rose-500/40 border-rose-300'
+                            : 'bg-rose-500/25 border-rose-400/70 hover:border-rose-300'
+                          : isDuckSeg
+                            ? active
+                              ? 'bg-amber-500/35 border-amber-300'
+                              : 'bg-amber-500/20 border-amber-400/60 hover:border-amber-300'
+                            : isBoostSeg
+                              ? active
+                                ? 'bg-cyan-500/35 border-cyan-300'
+                                : 'bg-cyan-500/20 border-cyan-400/60 hover:border-cyan-300'
+                              : active
+                                ? 'bg-emerald-500/35 border-emerald-200'
+                                : 'bg-emerald-500/20 border-emerald-300/70 hover:border-emerald-200'
+                      }`}
+                    >
+                      <div
+                        onMouseDown={(ev) =>
+                          startRangeDrag(ev, ae.id, ae.start, ae.end, 'left', (ns, ne) =>
+                            update_audio_edit(ae.id, { start: ns, end: ne }),
+                          )
+                        }
+                        className="w-1.5 h-full bg-white/15 hover:bg-white/60 cursor-ew-resize shrink-0"
+                      />
+                      <button
+                        type="button"
+                        onMouseDown={(ev) => ev.stopPropagation()}
+                        onClick={(ev) => {
+                          ev.stopPropagation();
+                          update_audio_edit(ae.id, {
+                            muted: !ae.muted,
+                            volume: !ae.muted ? 0 : 1,
+                            label: !ae.muted ? 'Muted audio' : 'Audio 100%',
+                          });
+                        }}
+                        title={isMutedSeg ? 'Unmute this audio segment' : 'Mute/cut this audio segment'}
+                        className="p-0.5 ml-0.5 text-slate-100 hover:text-amber-200 shrink-0 cursor-pointer"
+                      >
+                        {isMutedSeg ? (
+                          <VolumeX className="w-3 h-3 text-rose-200" />
+                        ) : (
+                          <Volume2 className="w-3 h-3 text-emerald-100" />
+                        )}
+                      </button>
+                      <span className="flex-1 px-1 text-[10px] font-medium text-slate-100 truncate">
+                        {isMutedSeg ? 'Muted' : `${Math.round(effGain * 100)}%`}
+                      </span>
+                      <button
+                        type="button"
+                        onMouseDown={(ev) => ev.stopPropagation()}
+                        onClick={(ev) => {
+                          ev.stopPropagation();
+                          delete_audio_edit(ae.id);
+                        }}
+                        className="p-0.5 text-slate-200 hover:text-red-300 shrink-0 cursor-pointer"
+                        title="Restore original audio (delete audio segment)"
+                      >
+                        <X className="w-3 h-3" />
+                      </button>
+                      <div
+                        onMouseDown={(ev) =>
+                          startRangeDrag(ev, ae.id, ae.start, ae.end, 'right', (ns, ne) =>
+                            update_audio_edit(ae.id, { start: ns, end: ne }),
+                          )
+                        }
+                        className="w-1.5 h-full bg-white/15 hover:bg-white/60 cursor-ew-resize shrink-0"
                       />
                     </div>
                   );
@@ -979,6 +1389,107 @@ export const BottomTimeline: React.FC = () => {
                     </div>
                   );
                 })}
+
+                {/* Interactive Video Audio Mute / Cut / Volume Segments */}
+                {audioEdits.map((ae) => {
+                  const drag =
+                    rangeDragPreview && rangeDragPreview.id === ae.id ? rangeDragPreview : null;
+                  const s = drag ? drag.start : ae.start;
+                  const eTime = drag ? drag.end : ae.end;
+                  const leftPx = s * timelineZoom;
+                  const widthPx = Math.max(26, (eTime - s) * timelineZoom);
+                  const active = selectedAudioEditId === ae.id;
+                  const effGain = ae.muted ? 0 : ae.volume;
+                  const isMutedSeg = ae.muted || effGain <= 0.001;
+                  const isBoostSeg = !isMutedSeg && effGain > 1.01;
+                  const isDuckSeg = !isMutedSeg && effGain < 0.99;
+
+                  return (
+                    <div
+                      key={ae.id}
+                      onClick={(ev) => {
+                        ev.stopPropagation();
+                        setSelectedAudioEditId(ae.id);
+                      }}
+                      onMouseDown={(ev) =>
+                        startRangeDrag(ev, ae.id, ae.start, ae.end, 'move', (ns, ne) =>
+                          update_audio_edit(ae.id, { start: ns, end: ne }),
+                        )
+                      }
+                      title={`${ae.label || (isMutedSeg ? 'Muted audio' : `Audio ${Math.round(effGain * 100)}%`)} (${s.toFixed(1)}s–${eTime.toFixed(1)}s) · Drag edges to resize`}
+                      style={{ left: `${leftPx}px`, width: `${widthPx}px` }}
+                      className={`absolute top-0.5 bottom-0.5 rounded-md border flex items-center overflow-hidden cursor-grab z-10 ${
+                        isMutedSeg
+                          ? active
+                            ? 'bg-rose-500/40 border-rose-300'
+                            : 'bg-rose-500/25 border-rose-400/70 hover:border-rose-300'
+                          : isDuckSeg
+                            ? active
+                              ? 'bg-amber-500/35 border-amber-300'
+                              : 'bg-amber-500/20 border-amber-400/60 hover:border-amber-300'
+                            : isBoostSeg
+                              ? active
+                                ? 'bg-cyan-500/35 border-cyan-300'
+                                : 'bg-cyan-500/20 border-cyan-400/60 hover:border-cyan-300'
+                              : active
+                                ? 'bg-emerald-500/35 border-emerald-200'
+                                : 'bg-emerald-500/20 border-emerald-300/70 hover:border-emerald-200'
+                      }`}
+                    >
+                      <div
+                        onMouseDown={(ev) =>
+                          startRangeDrag(ev, ae.id, ae.start, ae.end, 'left', (ns, ne) =>
+                            update_audio_edit(ae.id, { start: ns, end: ne }),
+                          )
+                        }
+                        className="w-1.5 h-full bg-white/15 hover:bg-white/60 cursor-ew-resize shrink-0"
+                      />
+                      <button
+                        type="button"
+                        onMouseDown={(ev) => ev.stopPropagation()}
+                        onClick={(ev) => {
+                          ev.stopPropagation();
+                          update_audio_edit(ae.id, {
+                            muted: !ae.muted,
+                            volume: !ae.muted ? 0 : 1,
+                            label: !ae.muted ? 'Muted audio' : 'Audio 100%',
+                          });
+                        }}
+                        title={isMutedSeg ? 'Unmute this audio segment' : 'Mute/cut this audio segment'}
+                        className="p-0.5 ml-0.5 text-slate-100 hover:text-amber-200 shrink-0 cursor-pointer"
+                      >
+                        {isMutedSeg ? (
+                          <VolumeX className="w-3 h-3 text-rose-200" />
+                        ) : (
+                          <Volume2 className="w-3 h-3 text-emerald-100" />
+                        )}
+                      </button>
+                      <span className="flex-1 px-1 text-[10px] font-medium text-slate-100 truncate">
+                        {isMutedSeg ? 'Muted' : `${Math.round(effGain * 100)}%`}
+                      </span>
+                      <button
+                        type="button"
+                        onMouseDown={(ev) => ev.stopPropagation()}
+                        onClick={(ev) => {
+                          ev.stopPropagation();
+                          delete_audio_edit(ae.id);
+                        }}
+                        className="p-0.5 text-slate-200 hover:text-red-300 shrink-0 cursor-pointer"
+                        title="Restore original audio (delete audio segment)"
+                      >
+                        <X className="w-3 h-3" />
+                      </button>
+                      <div
+                        onMouseDown={(ev) =>
+                          startRangeDrag(ev, ae.id, ae.start, ae.end, 'right', (ns, ne) =>
+                            update_audio_edit(ae.id, { start: ns, end: ne }),
+                          )
+                        }
+                        className="w-1.5 h-full bg-white/15 hover:bg-white/60 cursor-ew-resize shrink-0"
+                      />
+                    </div>
+                  );
+                })}
               </div>
 
               {/* Drawings Track */}
@@ -1045,6 +1556,107 @@ export const BottomTimeline: React.FC = () => {
                     </div>
                   );
                 })}
+
+                {/* Interactive Video Audio Mute / Cut / Volume Segments */}
+                {audioEdits.map((ae) => {
+                  const drag =
+                    rangeDragPreview && rangeDragPreview.id === ae.id ? rangeDragPreview : null;
+                  const s = drag ? drag.start : ae.start;
+                  const eTime = drag ? drag.end : ae.end;
+                  const leftPx = s * timelineZoom;
+                  const widthPx = Math.max(26, (eTime - s) * timelineZoom);
+                  const active = selectedAudioEditId === ae.id;
+                  const effGain = ae.muted ? 0 : ae.volume;
+                  const isMutedSeg = ae.muted || effGain <= 0.001;
+                  const isBoostSeg = !isMutedSeg && effGain > 1.01;
+                  const isDuckSeg = !isMutedSeg && effGain < 0.99;
+
+                  return (
+                    <div
+                      key={ae.id}
+                      onClick={(ev) => {
+                        ev.stopPropagation();
+                        setSelectedAudioEditId(ae.id);
+                      }}
+                      onMouseDown={(ev) =>
+                        startRangeDrag(ev, ae.id, ae.start, ae.end, 'move', (ns, ne) =>
+                          update_audio_edit(ae.id, { start: ns, end: ne }),
+                        )
+                      }
+                      title={`${ae.label || (isMutedSeg ? 'Muted audio' : `Audio ${Math.round(effGain * 100)}%`)} (${s.toFixed(1)}s–${eTime.toFixed(1)}s) · Drag edges to resize`}
+                      style={{ left: `${leftPx}px`, width: `${widthPx}px` }}
+                      className={`absolute top-0.5 bottom-0.5 rounded-md border flex items-center overflow-hidden cursor-grab z-10 ${
+                        isMutedSeg
+                          ? active
+                            ? 'bg-rose-500/40 border-rose-300'
+                            : 'bg-rose-500/25 border-rose-400/70 hover:border-rose-300'
+                          : isDuckSeg
+                            ? active
+                              ? 'bg-amber-500/35 border-amber-300'
+                              : 'bg-amber-500/20 border-amber-400/60 hover:border-amber-300'
+                            : isBoostSeg
+                              ? active
+                                ? 'bg-cyan-500/35 border-cyan-300'
+                                : 'bg-cyan-500/20 border-cyan-400/60 hover:border-cyan-300'
+                              : active
+                                ? 'bg-emerald-500/35 border-emerald-200'
+                                : 'bg-emerald-500/20 border-emerald-300/70 hover:border-emerald-200'
+                      }`}
+                    >
+                      <div
+                        onMouseDown={(ev) =>
+                          startRangeDrag(ev, ae.id, ae.start, ae.end, 'left', (ns, ne) =>
+                            update_audio_edit(ae.id, { start: ns, end: ne }),
+                          )
+                        }
+                        className="w-1.5 h-full bg-white/15 hover:bg-white/60 cursor-ew-resize shrink-0"
+                      />
+                      <button
+                        type="button"
+                        onMouseDown={(ev) => ev.stopPropagation()}
+                        onClick={(ev) => {
+                          ev.stopPropagation();
+                          update_audio_edit(ae.id, {
+                            muted: !ae.muted,
+                            volume: !ae.muted ? 0 : 1,
+                            label: !ae.muted ? 'Muted audio' : 'Audio 100%',
+                          });
+                        }}
+                        title={isMutedSeg ? 'Unmute this audio segment' : 'Mute/cut this audio segment'}
+                        className="p-0.5 ml-0.5 text-slate-100 hover:text-amber-200 shrink-0 cursor-pointer"
+                      >
+                        {isMutedSeg ? (
+                          <VolumeX className="w-3 h-3 text-rose-200" />
+                        ) : (
+                          <Volume2 className="w-3 h-3 text-emerald-100" />
+                        )}
+                      </button>
+                      <span className="flex-1 px-1 text-[10px] font-medium text-slate-100 truncate">
+                        {isMutedSeg ? 'Muted' : `${Math.round(effGain * 100)}%`}
+                      </span>
+                      <button
+                        type="button"
+                        onMouseDown={(ev) => ev.stopPropagation()}
+                        onClick={(ev) => {
+                          ev.stopPropagation();
+                          delete_audio_edit(ae.id);
+                        }}
+                        className="p-0.5 text-slate-200 hover:text-red-300 shrink-0 cursor-pointer"
+                        title="Restore original audio (delete audio segment)"
+                      >
+                        <X className="w-3 h-3" />
+                      </button>
+                      <div
+                        onMouseDown={(ev) =>
+                          startRangeDrag(ev, ae.id, ae.start, ae.end, 'right', (ns, ne) =>
+                            update_audio_edit(ae.id, { start: ns, end: ne }),
+                          )
+                        }
+                        className="w-1.5 h-full bg-white/15 hover:bg-white/60 cursor-ew-resize shrink-0"
+                      />
+                    </div>
+                  );
+                })}
               </div>
 
               {/* SFX Track */}
@@ -1060,6 +1672,7 @@ export const BottomTimeline: React.FC = () => {
                     : Math.max(0, sc.trimStart ?? 0);
                   const sourceDur = Math.max(
                     Math.max(0, sc.trimStart ?? 0) + sc.duration,
+                    sc.sourceDuration ?? 0,
                     matchedAsset?.duration ?? 0,
                   );
                   const s = drag ? drag.start : sc.start;
@@ -1107,6 +1720,107 @@ export const BottomTimeline: React.FC = () => {
                         onMouseDown={(ev) => startSfxDrag(ev, sc, 'right', sourceDur)}
                         title="Drag to trim SFX end / duration"
                         className="w-1.5 h-full bg-emerald-400/25 hover:bg-emerald-300 cursor-ew-resize shrink-0"
+                      />
+                    </div>
+                  );
+                })}
+
+                {/* Interactive Video Audio Mute / Cut / Volume Segments */}
+                {audioEdits.map((ae) => {
+                  const drag =
+                    rangeDragPreview && rangeDragPreview.id === ae.id ? rangeDragPreview : null;
+                  const s = drag ? drag.start : ae.start;
+                  const eTime = drag ? drag.end : ae.end;
+                  const leftPx = s * timelineZoom;
+                  const widthPx = Math.max(26, (eTime - s) * timelineZoom);
+                  const active = selectedAudioEditId === ae.id;
+                  const effGain = ae.muted ? 0 : ae.volume;
+                  const isMutedSeg = ae.muted || effGain <= 0.001;
+                  const isBoostSeg = !isMutedSeg && effGain > 1.01;
+                  const isDuckSeg = !isMutedSeg && effGain < 0.99;
+
+                  return (
+                    <div
+                      key={ae.id}
+                      onClick={(ev) => {
+                        ev.stopPropagation();
+                        setSelectedAudioEditId(ae.id);
+                      }}
+                      onMouseDown={(ev) =>
+                        startRangeDrag(ev, ae.id, ae.start, ae.end, 'move', (ns, ne) =>
+                          update_audio_edit(ae.id, { start: ns, end: ne }),
+                        )
+                      }
+                      title={`${ae.label || (isMutedSeg ? 'Muted audio' : `Audio ${Math.round(effGain * 100)}%`)} (${s.toFixed(1)}s–${eTime.toFixed(1)}s) · Drag edges to resize`}
+                      style={{ left: `${leftPx}px`, width: `${widthPx}px` }}
+                      className={`absolute top-0.5 bottom-0.5 rounded-md border flex items-center overflow-hidden cursor-grab z-10 ${
+                        isMutedSeg
+                          ? active
+                            ? 'bg-rose-500/40 border-rose-300'
+                            : 'bg-rose-500/25 border-rose-400/70 hover:border-rose-300'
+                          : isDuckSeg
+                            ? active
+                              ? 'bg-amber-500/35 border-amber-300'
+                              : 'bg-amber-500/20 border-amber-400/60 hover:border-amber-300'
+                            : isBoostSeg
+                              ? active
+                                ? 'bg-cyan-500/35 border-cyan-300'
+                                : 'bg-cyan-500/20 border-cyan-400/60 hover:border-cyan-300'
+                              : active
+                                ? 'bg-emerald-500/35 border-emerald-200'
+                                : 'bg-emerald-500/20 border-emerald-300/70 hover:border-emerald-200'
+                      }`}
+                    >
+                      <div
+                        onMouseDown={(ev) =>
+                          startRangeDrag(ev, ae.id, ae.start, ae.end, 'left', (ns, ne) =>
+                            update_audio_edit(ae.id, { start: ns, end: ne }),
+                          )
+                        }
+                        className="w-1.5 h-full bg-white/15 hover:bg-white/60 cursor-ew-resize shrink-0"
+                      />
+                      <button
+                        type="button"
+                        onMouseDown={(ev) => ev.stopPropagation()}
+                        onClick={(ev) => {
+                          ev.stopPropagation();
+                          update_audio_edit(ae.id, {
+                            muted: !ae.muted,
+                            volume: !ae.muted ? 0 : 1,
+                            label: !ae.muted ? 'Muted audio' : 'Audio 100%',
+                          });
+                        }}
+                        title={isMutedSeg ? 'Unmute this audio segment' : 'Mute/cut this audio segment'}
+                        className="p-0.5 ml-0.5 text-slate-100 hover:text-amber-200 shrink-0 cursor-pointer"
+                      >
+                        {isMutedSeg ? (
+                          <VolumeX className="w-3 h-3 text-rose-200" />
+                        ) : (
+                          <Volume2 className="w-3 h-3 text-emerald-100" />
+                        )}
+                      </button>
+                      <span className="flex-1 px-1 text-[10px] font-medium text-slate-100 truncate">
+                        {isMutedSeg ? 'Muted' : `${Math.round(effGain * 100)}%`}
+                      </span>
+                      <button
+                        type="button"
+                        onMouseDown={(ev) => ev.stopPropagation()}
+                        onClick={(ev) => {
+                          ev.stopPropagation();
+                          delete_audio_edit(ae.id);
+                        }}
+                        className="p-0.5 text-slate-200 hover:text-red-300 shrink-0 cursor-pointer"
+                        title="Restore original audio (delete audio segment)"
+                      >
+                        <X className="w-3 h-3" />
+                      </button>
+                      <div
+                        onMouseDown={(ev) =>
+                          startRangeDrag(ev, ae.id, ae.start, ae.end, 'right', (ns, ne) =>
+                            update_audio_edit(ae.id, { start: ns, end: ne }),
+                          )
+                        }
+                        className="w-1.5 h-full bg-white/15 hover:bg-white/60 cursor-ew-resize shrink-0"
                       />
                     </div>
                   );

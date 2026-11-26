@@ -144,8 +144,6 @@ def _transcribe_audio_chunked(
                 all_text_parts.append(txt)
             all_words.extend(words)
             all_segments.extend(segments)
-            if not words and not segments:
-                break
             chunk_idx += 1
 
     if not all_words and not all_segments:
@@ -363,11 +361,16 @@ def transcribe_audio_slices_groq(
 
 
 def load_cached_transcript(project_id: str, transcripts_dir: Path) -> Optional[Dict[str, Any]]:
-    cache_path = transcripts_dir / f"{project_id}.json"
-    if not cache_path.exists():
+    base_dir = transcripts_dir.resolve()
+    cache_path = (base_dir / f"{project_id}.json").resolve()
+    if not cache_path.is_relative_to(base_dir) or not cache_path.is_file():
         return None
-    with cache_path.open("r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with cache_path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except (json.JSONDecodeError, OSError):
+        return None
 
 
 def detect_pause_gaps(transcript: Dict[str, Any], min_gap: float = 0.7) -> List[Dict[str, float]]:
@@ -375,6 +378,7 @@ def detect_pause_gaps(transcript: Dict[str, Any], min_gap: float = 0.7) -> List[
     Finds silent gaps >= min_gap seconds between consecutive Groq Whisper word timestamps.
     Leaves a small 0.06s natural breath buffer on both sides so cuts sound crisp, not clipped.
     """
+    min_gap = max(0.2, float(min_gap or 0.7))
     words = transcript.get("words") or []
     if len(words) < 2:
         return []
@@ -384,7 +388,7 @@ def detect_pause_gaps(transcript: Dict[str, Any], min_gap: float = 0.7) -> List[
 
     # Check leading silence before first word
     first_start = float(words[0]["start"])
-    if first_start >= min_gap + breath_pad:
+    if first_start >= min_gap + breath_pad and first_start - breath_pad >= 0.25:
         gaps.append({"start": 0.0, "end": round(first_start - breath_pad, 2)})
 
     for i in range(len(words) - 1):
@@ -459,7 +463,7 @@ def _chunk_to_caption(chunk: List[Dict[str, Any]]) -> CaptionItem:
     return CaptionItem(
         id=f"cap_{uuid.uuid4().hex[:8]}",
         start=word_items[0].start,
-        end=word_items[-1].end,
+        end=round(max(word_items[0].start + 0.15, max(w.end for w in word_items)), 3),
         text=" ".join(w.word for w in word_items),
         isManuallyEdited=False,
         highlightedWords=[],

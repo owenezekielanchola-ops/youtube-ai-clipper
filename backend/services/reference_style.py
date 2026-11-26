@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 import json
 import os
+from pathlib import Path
 import re
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
@@ -21,6 +22,7 @@ from services.model_registry import (
 from services.nvidia_client import call_nvidia_chat, is_nvidia_configured
 from services.sfx_library import find_best_matching_sfx
 from services.transcription import build_captions_from_transcript, detect_pause_gaps
+from services.tts_service import materialize_voiceover_tool_call
 from services.visual_planner import analyze_user_clip_scenes_for_reference
 from services.youtube_ingest import _apply_ytdlp_common_opts
 
@@ -52,6 +54,22 @@ _VALID_ZOOM_STYLES = {"punch_in", "zoom_in", "zoom_out", "mixed", "none"}
 _VALID_SPEED_STYLES = {"none", "energetic_ramps", "slightly_fast", "dramatic_slowmo"}
 _VALID_SFX_DENSITY = {"none", "light", "medium", "heavy"}
 _VALID_DRAWING_STYLES = {"none", "arrows_highlights", "circles"}
+_ALLOWED_REFERENCE_TOOLS = {
+    "change_video_format",
+    "generate_auto_captions",
+    "add_caption",
+    "change_caption_style",
+    "remove_time_ranges",
+    "set_clip_speed",
+    "add_zoom_effect",
+    "delete_zoom_effect",
+    "set_video_crop",
+    "add_drawing",
+    "add_sfx_clip",
+    "generate_voiceover",
+    "edit_video_audio",
+    "delete_audio_edit",
+}
 
 
 def _strip_json_payload(raw_text: str) -> Dict[str, Any]:
@@ -149,8 +167,8 @@ def _sanitize_style_profile(raw: Dict[str, Any]) -> Dict[str, Any]:
     for bt in raw.get("reference_beats") or []:
         if not isinstance(bt, dict):
             continue
-        bs = _clamp_float(bt.get("start"), 0.0, 600.0, 0.0)
-        be = _clamp_float(bt.get("end"), bs + 0.3, 600.0, bs + 2.0)
+        bs = _clamp_float(bt.get("start"), 0.0, 599.0, 0.0)
+        be = min(600.0, max(bs + 0.3, _clamp_float(bt.get("end"), 0.0, 600.0, bs + 2.0)))
         mtype = str(bt.get("moment_type") or "highlight").strip().lower()[:30]
         what = str(bt.get("what_is_happening") or bt.get("description") or "").strip()[:200]
         edits = [
@@ -233,7 +251,12 @@ def analyze_reference_youtube_style(
 ) -> Tuple[Dict[str, Any], str]:
     clean_url = reference_url.strip()
     note = (custom_instruction or "").strip()
-    note_clause = f"\nUser extra instruction: {note}" if note else ""
+    note_clause = (
+        f"\nIMPORTANT USER DIRECTIVE TO BLEND WITH REFERENCE: {note}\n"
+        "Combine this user prompt together with the reference clip's editing feel rather than ignoring either."
+        if note
+        else ""
+    )
     deep_clause = (
         "\nDEEP ANALYSIS MODE: Study EVERY visual cut, pacing shift, zoom intensity/timing, "
         "caption styling, sound effect cue, and extract 5-10 detailed chronological `reference_beats` "
@@ -285,7 +308,7 @@ def analyze_reference_youtube_style(
     )
     gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
     if gemini_key and gemini_key != "your_gemini_api_key_here" and use_direct_uri:
-        client = genai.Client(api_key=gemini_key)
+        client = genai.Client(api_key=gemini_key, http_options=types.HttpOptions(timeout=45000))
         quota_failures = 0
         for model_id in get_gemini_models_chain()[:3]:
             try:
@@ -508,6 +531,143 @@ def _map_tl_after_cuts_and_speed(
     return round(max(0.0, min(max_dur, post_cut_t + delta_speed)), 2)
 
 
+_REF_TTS_KEYWORDS = (
+    "text to speech",
+    "text-to-speech",
+    "tts",
+    "voiceover",
+    "voice over",
+    "narrat",
+    "ai voice",
+    "speak ",
+    "read it out",
+)
+_REF_INTRO_KEYWORDS = (
+    "intro caption",
+    "intro hook",
+    "opening caption",
+    "teaser caption",
+    "hook caption",
+    "what will happen",
+    "what's about to happen",
+    "what is gonna happen",
+    "what will gonna happen",
+    "gonna happen",
+)
+
+
+def _finalize_reference_plan(
+    tool_calls: List[ToolCallSchema],
+    sfx_dir: Optional[Path],
+    project_state: ProjectState,
+    effective_dur: float,
+) -> Tuple[List[ToolCallSchema], List[SfxAsset], List[str]]:
+    """Materializes any `generate_voiceover` calls once into playable MP3 SFX + synced captions."""
+    final_calls: List[ToolCallSchema] = []
+    generated_assets: List[SfxAsset] = []
+    notes: List[str] = []
+    static_calls = [tc for tc in tool_calls if tc.name != "generate_voiceover"]
+    for tc in tool_calls:
+        if tc.name != "generate_voiceover":
+            final_calls.append(tc)
+            continue
+        vo_calls, asset, note = materialize_voiceover_tool_call(
+            tc.arguments or {},
+            project_state,
+            sfx_dir,
+            existing_tool_calls=final_calls + static_calls,
+            effective_dur=effective_dur,
+        )
+        final_calls.extend(vo_calls)
+        if asset is not None:
+            generated_assets.append(asset)
+        if note:
+            notes.append(note)
+
+    # If leading silence starting at c0_start was cut via remove_time_ranges, anchor opening intro_hook past that cut
+    c0_src_s = float(project_state.tracks.clips[0].sourceStart) if project_state.tracks.clips else 0.0
+    max_leading_cut_end = c0_src_s
+    for tc in final_calls:
+        if tc.name == "remove_time_ranges":
+            for rng in (tc.arguments or {}).get("ranges") or []:
+                if isinstance(rng, dict):
+                    rs = float(rng.get("start") or 0.0)
+                    re_v = float(rng.get("end") or 0.0)
+                    if rs <= c0_src_s + 0.25 and re_v > max_leading_cut_end:
+                        max_leading_cut_end = re_v
+    if max_leading_cut_end > c0_src_s + 0.15:
+        for tc in final_calls:
+            if tc.name == "add_caption" and str((tc.arguments or {}).get("kind") or "") == "intro_hook":
+                args = dict(tc.arguments or {})
+                cur_s = float(args.get("start") or 0.0)
+                cur_e = float(args.get("end") or cur_s + 3.0)
+                if cur_s < max_leading_cut_end - 0.1:
+                    span = max(1.8, cur_e - cur_s)
+                    args["start"] = round(max_leading_cut_end, 2)
+                    args["end"] = round(max_leading_cut_end + span, 2)
+                    tc.arguments = args
+    return final_calls, generated_assets, notes
+
+
+def _describe_planned_edits(
+    tool_calls: List[ToolCallSchema],
+    auto_captions: Optional[List[CaptionItem]],
+    generated_assets: List[SfxAsset],
+) -> List[str]:
+    """Builds clear user-facing bullets explaining what edits will run when Accepted."""
+    bullets: List[str] = []
+    zoom_cnt = sum(1 for tc in tool_calls if tc.name == "add_zoom_effect")
+    draw_cnt = sum(1 for tc in tool_calls if tc.name == "add_drawing")
+    cut_calls = [tc for tc in tool_calls if tc.name == "remove_time_ranges"]
+    vo_ids = {a.id for a in generated_assets}
+    sfx_cnt = sum(
+        1
+        for tc in tool_calls
+        if tc.name == "add_sfx_clip" and str((tc.arguments or {}).get("asset_id") or "") not in vo_ids
+    )
+    for tc in tool_calls:
+        args = tc.arguments or {}
+        if tc.name == "change_video_format":
+            bullets.append(f"• Aspect Ratio: switch canvas to {args.get('aspect_ratio', '9:16')}")
+        elif tc.name == "generate_auto_captions":
+            cnt = len(auto_captions) if auto_captions else 0
+            bullets.append(f"• Subtitles: generate {cnt} synced transcript captions" if cnt else "• Subtitles: generate synced transcript captions")
+        elif tc.name == "change_caption_style":
+            bullets.append(
+                f"• Caption Style: {args.get('preset', 'karaoke')} ({args.get('position', 'bottom')}, {args.get('highlight_color', '#FACC15')})"
+            )
+        elif tc.name == "add_caption" and str(args.get("kind") or "") == "intro_hook":
+            bullets.append(f"• Intro Hook Caption: \"{args.get('text', '')}\" at {float(args.get('start', 0)):.1f}s")
+        elif tc.name == "set_clip_speed":
+            bullets.append(
+                f"• Speed Ramp: {args.get('speed', 1.25)}x from {float(args.get('start_time', 0)):.1f}s to {float(args.get('end_time', 0)):.1f}s"
+            )
+        elif tc.name == "set_video_crop":
+            if "start" in args and "end" in args:
+                bullets.append(f"• Timed Crop: focus subject from {float(args['start']):.1f}s to {float(args['end']):.1f}s")
+            else:
+                bullets.append("• Crop: reframe video to focused subject box")
+        elif tc.name == "edit_video_audio":
+            if args.get("muted", True):
+                bullets.append(f"• Video Audio: mute original audio from {float(args.get('start', 0)):.1f}s to {float(args.get('end', 0)):.1f}s")
+            else:
+                bullets.append(f"• Video Audio: set volume to {round(float(args.get('volume', 1.0)) * 100)}% from {float(args.get('start', 0)):.1f}s to {float(args.get('end', 0)):.1f}s")
+        elif tc.name == "delete_audio_edit":
+            bullets.append("• Video Audio: restore original audio volume")
+    if cut_calls:
+        total_cuts = sum(len((tc.arguments or {}).get("ranges") or []) for tc in cut_calls)
+        bullets.append(f"• Pacing Cuts: remove {total_cuts} silent/dead-air pause gap(s)")
+    if zoom_cnt:
+        bullets.append(f"• Zooms: add {zoom_cnt} targeted punch/zoom effect(s)")
+    if draw_cnt:
+        bullets.append(f"• Screen Callouts: add {draw_cnt} arrow/circle annotation(s)")
+    if sfx_cnt:
+        bullets.append(f"• Sound Effects: place {sfx_cnt} SFX clip(s) matched to moments")
+    for a in generated_assets:
+        bullets.append(f"• AI Voiceover (TTS.ai): \"{a.description.split(':', 1)[-1].strip()}\" ({a.duration:.1f}s MP3 audio + preview below)")
+    return bullets
+
+
 def apply_reference_style_to_project(
     profile: Dict[str, Any],
     project_state: ProjectState,
@@ -515,6 +675,8 @@ def apply_reference_style_to_project(
     sfx_assets: List[SfxAsset],
     custom_instruction: Optional[str] = None,
     user_scene_analysis: Optional[Dict[str, Any]] = None,
+    sfx_dir: Optional[Path] = None,
+    generated_assets_out: Optional[List[SfxAsset]] = None,
 ) -> Tuple[List[ToolCallSchema], Optional[List[CaptionItem]], str]:
     clips = project_state.tracks.clips
     raw_tl_dur = (
@@ -646,6 +808,8 @@ def apply_reference_style_to_project(
                 arguments={"start_time": 0.0, "end_time": end_full, "speed": 1.15},
             )
         )
+        speed_ops.append((0.0, end_full, 1.15))
+        effective_dur = max(1.5, round(effective_dur / 1.15, 2))
         notes.append("1.15x brisk speed")
     elif speed_style == "energetic_ramps" and effective_dur >= 8.0:
         s_t = round(effective_dur * 0.25, 2)
@@ -658,6 +822,8 @@ def apply_reference_style_to_project(
                     arguments={"start_time": s_t, "end_time": e_t, "speed": 1.5},
                 )
             )
+            speed_ops.append((s_t, e_t, 1.5))
+            effective_dur = max(1.5, round(effective_dur + (e_t - s_t) * (1.0 / 1.5 - 1.0), 2))
             notes.append(f"1.5x ramp ({s_t}s–{e_t}s)")
     elif speed_style == "dramatic_slowmo" and effective_dur >= 6.0:
         s_t = round(effective_dur * 0.58, 2)
@@ -670,6 +836,8 @@ def apply_reference_style_to_project(
                     arguments={"start_time": s_t, "end_time": e_t, "speed": 0.75},
                 )
             )
+            speed_ops.append((s_t, e_t, 0.75))
+            effective_dur = max(1.5, round(effective_dur + (e_t - s_t) * (1.0 / 0.75 - 1.0), 2))
             notes.append(f"0.75x slow-mo ({s_t}s–{e_t}s)")
 
     # Zoom effects (prioritize real funny/reaction/hook/action moments spotted in your clip!)
@@ -875,12 +1043,64 @@ def apply_reference_style_to_project(
         )
         notes.append("circle callout")
 
+    custom_low = (custom_instruction or "").lower()
+    wants_vo = any(k in custom_low for k in _REF_TTS_KEYWORDS)
+    wants_intro_hook = wants_vo or any(k in custom_low for k in _REF_INTRO_KEYWORDS)
+    if wants_intro_hook and not any(
+        tc.name in {"generate_voiceover", "add_caption"} and str((tc.arguments or {}).get("kind") or "") == "intro_hook"
+        for tc in tool_calls
+    ):
+        quoted = re.search(r"[\"']([^\"']{4,110})[\"']", custom_instruction or "")
+        if quoted:
+            hook_line = quoted.group(1).strip()
+        elif user_moments:
+            desc = str(user_moments[0].get("description") or "").strip().rstrip(".")
+            hook_line = f"Watch what happens here: {desc[:70]}" if desc else "Watch what happens next!"
+        elif transcript and (transcript.get("segments") or []):
+            first_seg = str(transcript["segments"][0].get("text") or "").strip()
+            hook_line = first_seg[:80] if first_seg else "Wait until you see what happens next!"
+        else:
+            hook_line = "Wait until you see what happens next!"
+
+        if wants_vo:
+            tool_calls.append(
+                ToolCallSchema(
+                    id=f"tc_{uuid.uuid4().hex[:8]}",
+                    name="generate_voiceover",
+                    arguments={"text": hook_line, "start": 0.0, "also_add_caption": True},
+                )
+            )
+        else:
+            c0_s = round(float(clips[0].sourceStart), 2) if clips else 0.0
+            c0_e = round(min(float(clips[0].sourceEnd), c0_s + 3.2), 2) if clips else 3.2
+            tool_calls.append(
+                ToolCallSchema(
+                    id=f"tc_{uuid.uuid4().hex[:8]}",
+                    name="add_caption",
+                    arguments={"start": c0_s, "end": c0_e, "text": hook_line, "kind": "intro_hook"},
+                )
+            )
+            notes.append("intro hook caption")
+
+    tool_calls, generated_assets, vo_notes = _finalize_reference_plan(
+        tool_calls, sfx_dir, project_state, effective_dur
+    )
+    notes.extend(vo_notes)
+    if generated_assets_out is not None and generated_assets:
+        generated_assets_out.extend(generated_assets)
+
     summary = str(profile.get("summary") or "Cloned reference editing style.")
+    if custom_instruction and custom_instruction.strip():
+        summary = f"{summary} Combined with your note: \"{custom_instruction.strip()}\"."
     style_card = (
         f"Style profile: {ratio} · {profile.get('pacing', 'fast')} pacing · "
         f"{profile.get('caption_preset', 'karaoke')} captions · {zoom_style} zooms · {sfx_density} SFX"
     )
-    msg_parts = [summary, style_card]
+    msg_parts = [f"Proposed Edit Plan (Review & click Accept & Apply Edits below):\n{summary}", style_card]
+
+    plan_bullets = _describe_planned_edits(tool_calls, auto_captions, generated_assets)
+    if plan_bullets:
+        msg_parts.append("What this will do:\n" + "\n".join(plan_bullets))
 
     ref_beats: List[Dict[str, Any]] = list(profile.get("reference_beats") or [])
     if ref_beats:
@@ -898,9 +1118,540 @@ def apply_reference_style_to_project(
         ]
         msg_parts.append("Matched moments in your clip:\n" + "\n".join(um_lines))
 
-    msg_parts.append(f"Applied edits: {', '.join(notes)}.")
+    msg_parts.append(f"Ready to apply: {', '.join(notes)}.")
     message = "\n\n".join(msg_parts)
     return tool_calls, auto_captions, message
+
+
+def _build_available_tools_manifest(sfx_assets: List[SfxAsset]) -> str:
+    sfx_list = [
+        {"id": a.id, "name": a.name, "tags": a.tags, "description": a.description, "duration": a.duration}
+        for a in sfx_assets
+    ]
+    return (
+        "ALLOWED EDITOR TOOLS ONLY (you are FORBIDDEN from inventing any other tool or effect):\n"
+        "- change_video_format(aspect_ratio: '9:16'|'16:9'|'1:1')\n"
+        "- generate_auto_captions() [generates subtitles from cached transcript]\n"
+        "- add_caption(start: float SOURCE sec, end: float SOURCE sec, text: string, kind: 'intro_hook'|'subtitle') "
+        "[for opening teaser/hook anchor at active_clips[0].sourceStart]\n"
+        "- change_caption_style(preset: 'karaoke'|'bold_social'|'yellow_highlight'|'minimal', position: 'top'|'middle'|'bottom', font_size: int 20..44, highlight_color: '#RRGGBB', is_bold: bool)\n"
+        "- remove_time_ranges(ranges: [{start: SOURCE sec, end: SOURCE sec}]) [use ONLY pre-detected pauses or bad dead air]\n"
+        "- set_clip_speed(start_time: TL sec, end_time: TL sec, speed: 0.25..4.0)\n"
+        "- add_zoom_effect(start: TL sec, end: TL sec, kind: 'punch_in'|'zoom_in'|'zoom_out', start_scale: 1.0..2.5, end_scale: 1.1..2.5, focus_x: 0..1, focus_y: 0..1, easing: 'instant'|'linear'|'ease_in_out')\n"
+        "- delete_zoom_effect(zoom_id: string)\n"
+        "- set_video_crop(x: 0..0.9, y: 0..0.9, w: 0.1..1.0, h: 0.1..1.0, start?: TL sec, end?: TL sec)\n"
+        "- edit_video_audio(start: TL sec, end: TL sec, muted: bool, volume: 0.0..2.0, label?: string) "
+        "[mutes/cuts/ducks/boosts ONLY original video audio without cutting video frames or SFX/TTS]\n"
+        "- delete_audio_edit(audio_edit_id: string) [or 'all' to restore original video audio]\n"
+        "- add_drawing(start: TL sec, end: TL sec, tool: 'arrow'|'circle'|'rect'|'line'|'highlight', points: [{x,y}, ...], color: '#RRGGBB', stroke_width: 2..24)\n"
+        f"- add_sfx_clip(start: TL sec, asset_id: string, sfx_name: string, volume: 0.1..1.0) "
+        f"[MUST pick strictly from Uploaded SFX Library below; if empty, DO NOT emit add_sfx_clip!]\n"
+        "- generate_voiceover(text: string, start?: TL sec default 0.0, voice?: 'af_bella'|'af_heart'|'am_adam'|'am_michael', speed?: 0.7..1.5, also_add_caption?: bool default true) "
+        "[synthesizes an AI TTS.ai spoken voiceover MP3 + synced intro_hook caption whenever user asks for TTS/voiceover/narration OR reference opens with a spoken teaser hook]\n"
+        f"Uploaded SFX Library ({len(sfx_list)} file(s)): {json.dumps(sfx_list)}"
+    )
+
+
+def _validate_and_sanitize_ai_reference_calls(
+    raw_tool_calls: List[Dict[str, Any]],
+    project_state: ProjectState,
+    transcript: Optional[Dict[str, Any]],
+    sfx_assets: List[SfxAsset],
+    effective_dur: float,
+) -> Tuple[List[ToolCallSchema], Optional[List[CaptionItem]], List[str]]:
+    """
+    Strictly enforces that AI-planned Reference edits ONLY call real editor tools, real uploaded SFX,
+    and clamped valid timestamps/coordinates, while preventing overlapping zooms/SFX collisions.
+    """
+    clips = project_state.tracks.clips or []
+    clip0 = clips[0] if clips else None
+    max_src = float(project_state.sourceVideo.originalDuration or effective_dur or 10.0)
+    dur_tl = max(0.5, float(effective_dur or 10.0))
+
+    tool_calls: List[ToolCallSchema] = []
+    auto_captions: Optional[List[CaptionItem]] = None
+    notes: List[str] = []
+    deleted_zoom_ids: set[str] = set()
+    used_sfx_ids: set[str] = set()
+    placed_sfx_starts: List[float] = []
+
+    for item in raw_tool_calls:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if name not in _ALLOWED_REFERENCE_TOOLS:
+            continue
+        raw_args = item.get("arguments") or {}
+        if not isinstance(raw_args, dict):
+            raw_args = {}
+
+        if name == "change_video_format":
+            ratio = str(raw_args.get("aspect_ratio") or "9:16").strip()
+            if ratio not in _VALID_RATIOS:
+                ratio = "9:16"
+            tool_calls.append(ToolCallSchema(id=f"tc_{uuid.uuid4().hex[:8]}", name=name, arguments={"aspect_ratio": ratio}))
+            notes.append(f"format {ratio}")
+
+        elif name == "generate_auto_captions":
+            if transcript:
+                auto_captions = build_captions_from_transcript(transcript)
+                tool_calls.append(ToolCallSchema(id=f"tc_{uuid.uuid4().hex[:8]}", name=name, arguments={}))
+                notes.append("auto captions")
+
+        elif name == "add_caption":
+            txt = str(raw_args.get("text") or "").strip()
+            if not txt:
+                continue
+            kind = str(raw_args.get("kind") or "subtitle").strip().lower()
+            if kind not in {"subtitle", "intro_hook"}:
+                kind = "subtitle"
+            s_val = _clamp_float(raw_args.get("start"), 0.0, max(0.0, max_src - 0.5), 0.0)
+            e_val = min(max_src, max(s_val + 0.5, _clamp_float(raw_args.get("end"), 0.0, max_src, min(max_src, s_val + 3.2))))
+            if clip0 is not None and kind == "intro_hook":
+                c0s = max(0.0, float(clip0.sourceStart))
+                c0e = max(c0s + 0.5, float(clip0.sourceEnd))
+                span = max(1.8, min(4.5, e_val - s_val))
+                if s_val < c0s - 0.1 or s_val > c0s + 1.5:
+                    s_val = round(c0s, 2)
+                    e_val = round(min(c0e, c0s + span), 2)
+            tool_calls.append(
+                ToolCallSchema(
+                    id=f"tc_{uuid.uuid4().hex[:8]}",
+                    name=name,
+                    arguments={"start": s_val, "end": e_val, "text": txt, "kind": kind},
+                )
+            )
+            notes.append("intro hook caption" if kind == "intro_hook" else "custom caption")
+
+        elif name == "change_caption_style":
+            preset = str(raw_args.get("preset") or "karaoke").strip().lower()
+            pos = str(raw_args.get("position") or "bottom").strip().lower()
+            try:
+                fsize = max(16, min(56, int(raw_args.get("font_size", 30))))
+            except (TypeError, ValueError):
+                fsize = 30
+            args_out = {
+                "preset": preset if preset in _VALID_PRESETS else "karaoke",
+                "position": pos if pos in _VALID_CAP_POS else "bottom",
+                "font_size": fsize,
+                "highlight_color": str(raw_args.get("highlight_color") or "#FACC15"),
+                "is_bold": bool(raw_args.get("is_bold", True)),
+            }
+            tool_calls.append(ToolCallSchema(id=f"tc_{uuid.uuid4().hex[:8]}", name=name, arguments=args_out))
+            notes.append(f"{args_out['preset']} style")
+
+        elif name == "remove_time_ranges":
+            clean_ranges = []
+            for r in raw_args.get("ranges") or []:
+                if not isinstance(r, dict):
+                    continue
+                rs = _clamp_float(r.get("start"), 0.0, max_src - 0.15, 0.0)
+                re_v = _clamp_float(r.get("end"), rs, max_src, rs)
+                if re_v > rs + 0.15:
+                    clean_ranges.append({"start": rs, "end": re_v})
+            if clean_ranges:
+                tool_calls.append(ToolCallSchema(id=f"tc_{uuid.uuid4().hex[:8]}", name=name, arguments={"ranges": clean_ranges}))
+                notes.append(f"cut {len(clean_ranges)} gap(s)")
+
+        elif name == "set_clip_speed":
+            st_t = _clamp_float(raw_args.get("start_time"), 0.0, max(0.0, dur_tl - 0.3), 0.0)
+            en_t = min(dur_tl, max(st_t + 0.3, _clamp_float(raw_args.get("end_time"), 0.0, dur_tl, min(dur_tl, st_t + 3.0))))
+            spd = _clamp_float(raw_args.get("speed"), 0.25, 4.0, 1.25)
+            tool_calls.append(
+                ToolCallSchema(
+                    id=f"tc_{uuid.uuid4().hex[:8]}",
+                    name=name,
+                    arguments={"start_time": st_t, "end_time": en_t, "speed": spd},
+                )
+            )
+            notes.append(f"{spd}x speed")
+
+        elif name == "add_zoom_effect":
+            zs = _clamp_float(raw_args.get("start"), 0.0, max(0.0, dur_tl - 0.4), 0.0)
+            ze = min(dur_tl, max(zs + 0.4, _clamp_float(raw_args.get("end"), 0.0, dur_tl, min(dur_tl, zs + 2.2))))
+            kind = str(raw_args.get("kind") or "punch_in").strip().lower()
+            if kind not in {"punch_in", "zoom_in", "zoom_out"}:
+                kind = "punch_in"
+            easing = str(raw_args.get("easing") or ("instant" if kind == "punch_in" else "ease_in_out")).strip().lower()
+            if easing not in {"instant", "linear", "ease_in_out"}:
+                easing = "ease_in_out"
+            for ez in project_state.tracks.zooms or []:
+                if ez.id not in deleted_zoom_ids and max(float(ez.start), zs) < min(float(ez.end), ze) + 0.15:
+                    tool_calls.append(ToolCallSchema(id=f"tc_{uuid.uuid4().hex[:8]}", name="delete_zoom_effect", arguments={"zoom_id": ez.id}))
+                    deleted_zoom_ids.add(ez.id)
+            tool_calls.append(
+                ToolCallSchema(
+                    id=f"tc_{uuid.uuid4().hex[:8]}",
+                    name=name,
+                    arguments={
+                        "start": zs,
+                        "end": ze,
+                        "kind": kind,
+                        "start_scale": _clamp_float(raw_args.get("start_scale"), 1.0, 3.0, 1.0 if kind != "zoom_out" else 1.3),
+                        "end_scale": _clamp_float(raw_args.get("end_scale"), 1.0, 3.0, 1.32 if kind != "zoom_out" else 1.0),
+                        "focus_x": _clamp_float(raw_args.get("focus_x"), 0.0, 1.0, 0.5),
+                        "focus_y": _clamp_float(raw_args.get("focus_y"), 0.0, 1.0, 0.45),
+                        "easing": easing,
+                    },
+                )
+            )
+
+        elif name == "delete_zoom_effect":
+            zid = str(raw_args.get("zoom_id") or "").strip()
+            if zid and zid not in deleted_zoom_ids:
+                tool_calls.append(ToolCallSchema(id=f"tc_{uuid.uuid4().hex[:8]}", name=name, arguments={"zoom_id": zid}))
+                deleted_zoom_ids.add(zid)
+
+        elif name == "set_video_crop":
+            cx = _clamp_float(raw_args.get("x"), 0.0, 0.9, 0.0)
+            cy = _clamp_float(raw_args.get("y"), 0.0, 0.9, 0.0)
+            cw = _clamp_float(raw_args.get("w"), 0.1, round(1.0 - cx, 2), round(1.0 - cx, 2))
+            ch = _clamp_float(raw_args.get("h"), 0.1, round(1.0 - cy, 2), round(1.0 - cy, 2))
+            c_args: Dict[str, Any] = {"x": cx, "y": cy, "w": cw, "h": ch}
+            if raw_args.get("start") is not None and raw_args.get("end") is not None:
+                cs = _clamp_float(raw_args.get("start"), 0.0, max(0.0, dur_tl - 0.3), 0.0)
+                ce = _clamp_float(raw_args.get("end"), cs + 0.3, dur_tl, min(dur_tl, cs + 2.5))
+                c_args["start"] = cs
+                c_args["end"] = ce
+            tool_calls.append(ToolCallSchema(id=f"tc_{uuid.uuid4().hex[:8]}", name=name, arguments=c_args))
+            notes.append("crop")
+
+        elif name == "add_drawing":
+            d_tool = str(raw_args.get("tool") or "arrow").strip().lower()
+            if d_tool not in {"freehand", "line", "arrow", "circle", "rect", "highlight"}:
+                d_tool = "arrow"
+            pts = [
+                {"x": _clamp_float(pt.get("x"), 0.0, 1.0, 0.5), "y": _clamp_float(pt.get("y"), 0.0, 1.0, 0.5)}
+                for pt in (raw_args.get("points") or [])
+                if isinstance(pt, dict)
+            ]
+            if len(pts) < 2:
+                continue
+            ds = _clamp_float(raw_args.get("start"), 0.0, max(0.0, dur_tl - 0.4), 0.5)
+            de = min(dur_tl, max(ds + 0.4, _clamp_float(raw_args.get("end"), 0.0, dur_tl, min(dur_tl, ds + 2.0))))
+            try:
+                sw_int = max(2, min(24, int(float(raw_args.get("stroke_width") or 6))))
+            except (TypeError, ValueError):
+                sw_int = 6
+            tool_calls.append(
+                ToolCallSchema(
+                    id=f"tc_{uuid.uuid4().hex[:8]}",
+                    name=name,
+                    arguments={
+                        "start": ds,
+                        "end": de,
+                        "tool": d_tool,
+                        "points": pts[:12],
+                        "color": str(raw_args.get("color") or "#FACC15"),
+                        "stroke_width": sw_int,
+                        "opacity": 1.0,
+                    },
+                )
+            )
+            notes.append(f"{d_tool} drawing")
+
+        elif name == "add_sfx_clip":
+            if not sfx_assets:
+                continue
+            aid = str(raw_args.get("asset_id") or "").strip()
+            sname = str(raw_args.get("sfx_name") or "").strip()
+            st = _clamp_float(raw_args.get("start"), 0.0, max(0.0, dur_tl - 0.25), 0.0)
+            if any(abs(st - ps) < 1.5 for ps in placed_sfx_starts):
+                continue
+            asset = next((a for a in sfx_assets if a.id == aid), None) if aid else None
+            if asset is None:
+                asset = find_best_matching_sfx(
+                    sfx_assets, sname or "whoosh", exclude_ids=used_sfx_ids if used_sfx_ids else None
+                ) or find_best_matching_sfx(sfx_assets, sname or "whoosh")
+            if asset is None:
+                continue
+            used_sfx_ids.add(asset.id)
+            placed_sfx_starts.append(st)
+            play_dur = round(min(float(asset.duration), 2.6, max(0.4, dur_tl - st)), 3)
+            tool_calls.append(
+                ToolCallSchema(
+                    id=f"tc_{uuid.uuid4().hex[:8]}",
+                    name=name,
+                    arguments={
+                        "start": st,
+                        "asset_id": asset.id,
+                        "sfx_name": asset.name,
+                        "name": asset.name,
+                        "url": asset.url,
+                        "duration": play_dur,
+                        "volume": _clamp_float(raw_args.get("volume"), 0.1, 1.0, 0.8),
+                    },
+                )
+            )
+
+        elif name == "generate_voiceover":
+            spoken = " ".join(str(raw_args.get("text") or "").strip().split())
+            if not spoken:
+                continue
+            st_vo = _clamp_float(raw_args.get("start"), 0.0, max(0.0, dur_tl - 0.4), 0.0)
+            tool_calls.append(
+                ToolCallSchema(
+                    id=f"tc_{uuid.uuid4().hex[:8]}",
+                    name="generate_voiceover",
+                    arguments={
+                        "text": spoken[:320],
+                        "start": st_vo,
+                        "voice": str(raw_args.get("voice") or "af_bella").strip() or "af_bella",
+                        "speed": _clamp_float(raw_args.get("speed"), 0.7, 1.5, 1.05),
+                        "also_add_caption": bool(raw_args.get("also_add_caption", True)),
+                        "volume": _clamp_float(raw_args.get("volume"), 0.2, 1.0, 0.95),
+                    },
+                )
+            )
+            notes.append("AI TTS voiceover")
+
+        elif name == "edit_video_audio":
+            ae_s = _clamp_float(raw_args.get("start"), 0.0, max(0.0, dur_tl - 0.15), 0.0)
+            ae_e = min(dur_tl, max(ae_s + 0.15, _clamp_float(raw_args.get("end"), 0.0, dur_tl, min(dur_tl, ae_s + 3.0))))
+            is_muted = bool(raw_args.get("muted", True))
+            vol_val = 0.0 if is_muted else _clamp_float(raw_args.get("volume"), 0.0, 2.0, 0.25)
+            lbl = str(raw_args.get("label") or "").strip()[:60]
+            ae_args: Dict[str, Any] = {
+                "start": ae_s,
+                "end": ae_e,
+                "muted": is_muted,
+                "volume": vol_val,
+            }
+            if lbl:
+                ae_args["label"] = lbl
+            tool_calls.append(ToolCallSchema(id=f"tc_{uuid.uuid4().hex[:8]}", name="edit_video_audio", arguments=ae_args))
+            notes.append("muted video audio" if is_muted else f"video audio {round(vol_val * 100)}%")
+
+        elif name == "delete_audio_edit":
+            aid = str(raw_args.get("audio_edit_id") or "").strip()
+            if aid:
+                tool_calls.append(ToolCallSchema(id=f"tc_{uuid.uuid4().hex[:8]}", name="delete_audio_edit", arguments={"audio_edit_id": aid}))
+                notes.append("restored video audio")
+
+    zoom_cnt = sum(1 for tc in tool_calls if tc.name == "add_zoom_effect")
+    sfx_cnt = sum(1 for tc in tool_calls if tc.name == "add_sfx_clip")
+    if zoom_cnt:
+        notes.append(f"{zoom_cnt} zoom(s)")
+    if sfx_cnt:
+        notes.append(f"{sfx_cnt} MP3 SFX")
+    return tool_calls, auto_captions, notes
+
+
+def _plan_reference_edits_with_ai(
+    profile: Dict[str, Any],
+    project_state: ProjectState,
+    transcript: Optional[Dict[str, Any]],
+    sfx_assets: List[SfxAsset],
+    custom_instruction: Optional[str] = None,
+    user_scene_analysis: Optional[Dict[str, Any]] = None,
+    deep_think: bool = False,
+    sfx_dir: Optional[Path] = None,
+    generated_assets_out: Optional[List[SfxAsset]] = None,
+) -> Optional[Tuple[List[ToolCallSchema], Optional[List[CaptionItem]], str, str]]:
+    """
+    AI Fit-Critic & Tool-Restricted Reference Workflow:
+    Compares the reference editing style + user prompt against what is genuinely happening
+    in the user's clip, confirms which techniques fit vs which to skip, explains the full plan
+    for approval, and outputs ONLY validated calls to real editor tools.
+    """
+    groq_key = os.getenv("GROQ_API_KEY", "").strip()
+    gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+    has_groq = bool(groq_key and groq_key != "your_groq_api_key_here")
+    has_gemini = bool(gemini_key and gemini_key != "your_gemini_api_key_here")
+    has_nvidia = is_nvidia_configured()
+    if not (has_groq or has_nvidia or has_gemini):
+        return None
+
+    clips = project_state.tracks.clips or []
+    raw_tl_dur = (
+        sum(float(c.duration) for c in clips)
+        if clips
+        else float(project_state.sourceVideo.originalDuration or 10.0)
+    )
+    raw_pauses = detect_pause_gaps(transcript, min_gap=0.65) if transcript else []
+    pauses: List[Dict[str, float]] = []
+    if clips and raw_pauses:
+        for p in raw_pauses:
+            ps = float(p.get("start", 0.0))
+            pe = float(p.get("end", 0.0))
+            for c in clips:
+                os_val = max(ps, float(c.sourceStart))
+                oe_val = min(pe, float(c.sourceEnd))
+                if oe_val - os_val >= 0.2:
+                    pauses.append({"start": round(os_val, 2), "end": round(oe_val, 2)})
+        pauses = pauses[:15]
+    else:
+        pauses = raw_pauses[:15]
+    seg_lines = [
+        f"[{float(s.get('start', 0)):.1f}s-{float(s.get('end', 0)):.1f}s] {str(s.get('text') or '').strip()}"
+        for s in ((transcript or {}).get("segments") or [])[:35]
+        if str(s.get("text") or "").strip()
+    ]
+    manifest = _build_available_tools_manifest(sfx_assets)
+    sys_prompt = (
+        "You are an expert Video Editing Workflow Critic.\n"
+        "You are cloning a REFERENCE style onto a USER'S VIDEO CLIP.\n"
+        "RULES:\n"
+        "1. COMBINE REFERENCE + USER PROMPT: Blend the Reference Style Profile with EVERY concrete request in `User Custom Instruction` (e.g., if user asks for TTS/voiceover, intro hook caption, specific ratio, focus, or speed, execute it cleanly alongside matching reference techniques).\n"
+        "2. COMPARE & CONFIRM FIT FIRST: Check each technique from Reference Style against what is ACTUALLY happening in the user's clip (`user_scene_analysis` and transcript). "
+        "Confirm ('verdict': 'apply') ONLY edits that genuinely elevate this clip (e.g. punch-in zooms/laugh SFX only on real funny/reaction/punchline moments; arrows only if pointing at a real visible object). "
+        "Skip ('verdict': 'skip') anything that doesn't fit this clip's mood, length, or missing assets.\n"
+        "3. RESTRICTED TOOLS ONLY: Emit `tool_calls` using EXCLUSIVELY the allowed tools and uploaded SFX listed below — NEVER invent unsupported effects.\n"
+        "4. INTRO HOOK & TTS VOICEOVER: If the user asks for Text-to-Speech/TTS/voiceover OR an opening spoken teaser hook explaining what happens, call `generate_voiceover(text=..., start=0.0, also_add_caption=true)` with ONE concise curiosity sentence (<= 14 words). If they want caption-only without audio, call `add_caption(start=clips[0].sourceStart, ..., kind='intro_hook')`.\n"
+        "5. EXPLAIN CLEARLY FIRST: Write `workflow_summary` as a clear 2-3 sentence explanation for the user describing what these edits will actually do to their clip before they click Accept.\n"
+        "6. TIMING RULES: Zooms/speed/drawings/SFX/voiceover use Timeline seconds (`0.0..duration`); `add_caption` & `remove_time_ranges` use SOURCE seconds.\n"
+        "Output VALID JSON ONLY matching:\n"
+        "{\n"
+        '  "fit_checks": [{"technique": "short name", "verdict": "apply"|"skip", "reason": "1-sentence justification matching user clip"}],\n'
+        '  "workflow_summary": "1-2 sentences summarizing confirmed plan",\n'
+        '  "tool_calls": [{"name": "<allowed_tool_name>", "arguments": {...}}]\n'
+        "}\n\n"
+        f"{manifest}"
+    )
+    user_ctx = (
+        f"Reference Style Profile:\n{json.dumps(profile, indent=2)}\n\n"
+        f"User Custom Instruction: {(custom_instruction or '').strip() or 'None'}\n"
+        f"Target Effective Duration (TL sec): {raw_tl_dur:.2f}s\n"
+        f"Active Clips: {json.dumps([c.model_dump() for c in clips[:10]])}\n"
+        f"Existing Zooms: {json.dumps([z.model_dump() for z in (project_state.tracks.zooms or [])[:10]])}\n"
+        f"Pre-detected Pause Gaps (SRC sec): {json.dumps(pauses)}\n"
+        f"User Clip Scene Analysis (Stage 1 Vision): {json.dumps(user_scene_analysis or {})}\n"
+        f"Transcript Excerpt:\n" + "\n".join(seg_lines[:30])
+    )
+
+    def _parse_and_validate(raw_txt: str) -> Dict[str, Any]:
+        obj = _strip_json_payload(raw_txt)
+        raw_checks = obj.get("fit_checks") or []
+        raw_tcs = obj.get("tool_calls") or []
+        if not isinstance(raw_checks, list) or not isinstance(raw_tcs, list):
+            raise ValueError("Missing fit_checks or tool_calls")
+        checks: List[Dict[str, str]] = []
+        for fc in raw_checks[:8]:
+            if isinstance(fc, dict) and fc.get("technique"):
+                v = str(fc.get("verdict") or "apply").strip().lower()
+                checks.append(
+                    {
+                        "technique": str(fc["technique"]).strip()[:45],
+                        "verdict": v if v in {"apply", "skip"} else "apply",
+                        "reason": str(fc.get("reason") or "").strip()[:180],
+                    }
+                )
+        tcs, auto_caps, notes = _validate_and_sanitize_ai_reference_calls(
+            raw_tcs, project_state, transcript, sfx_assets, raw_tl_dur
+        )
+        if not tcs or not checks:
+            raise ValueError("AI workflow produced no valid calls or fit checks")
+        return {
+            "fit_checks": checks,
+            "workflow_summary": str(obj.get("workflow_summary") or profile.get("summary") or "Confirmed AI reference workflow.").strip()[:350],
+            "tool_calls": tcs,
+            "auto_captions": auto_caps,
+            "notes": notes,
+        }
+
+    cands: List[Dict[str, Any]] = []
+    if has_groq:
+        g_cli = Groq(api_key=groq_key, timeout=22.0)
+        for gid in get_tool_models_chain()[:2]:
+            def _run_g(m_id: str = gid) -> Dict[str, Any]:
+                comp = g_cli.chat.completions.create(
+                    model=m_id,
+                    messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_ctx}],
+                    temperature=0.15,
+                )
+                return _parse_and_validate(str(comp.choices[0].message.content or ""))
+            cands.append({"provider": "groq", "model": gid, "fn": _run_g})
+
+    if has_nvidia:
+        for nid in get_nvidia_fast_models_chain()[:2]:
+            def _run_nv(m_id: str = nid) -> Dict[str, Any]:
+                raw = call_nvidia_chat(
+                    model_id=m_id,
+                    messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_ctx}],
+                    temperature=0.15,
+                    max_tokens=2800 if deep_think else 1800,
+                    timeout=35.0 if deep_think else 18.0,
+                    enable_thinking=None if deep_think else False,
+                )
+                return _parse_and_validate(raw)
+            cands.append({"provider": "nvidia", "model": nid, "fn": _run_nv})
+
+    if has_gemini:
+        for gem_id in get_gemini_models_chain()[:1]:
+            def _run_gem(m_id: str = gem_id) -> Dict[str, Any]:
+                cli = genai.Client(api_key=gemini_key, http_options=types.HttpOptions(timeout=45000))
+                resp = cli.models.generate_content(
+                    model=m_id,
+                    contents=user_ctx,
+                    config=types.GenerateContentConfig(
+                        system_instruction=sys_prompt,
+                        response_mime_type="application/json",
+                        temperature=0.15,
+                    ),
+                )
+                return _parse_and_validate(resp.text or "")
+            cands.append({"provider": "gemini", "model": gem_id, "fn": _run_gem})
+
+    try:
+        res_dict, winner = race_ai_candidates(
+            cands,
+            validate_fn=lambda d: d if isinstance(d, dict) and d.get("tool_calls") else None,
+            label="ref_ai_workflow_deep" if deep_think else "ref_ai_workflow",
+            max_workers=3,
+            per_race_timeout=42.0 if deep_think else 22.0,
+            hedge_delay_sec=0.0,
+        )
+    except Exception:
+        return None
+
+    final_calls, generated_assets, vo_notes = _finalize_reference_plan(
+        res_dict["tool_calls"], sfx_dir, project_state, raw_tl_dur
+    )
+    all_notes = list(res_dict["notes"]) + vo_notes
+    if generated_assets_out is not None and generated_assets:
+        generated_assets_out.extend(generated_assets)
+
+    ratio = str(profile.get("target_aspect_ratio") or "9:16")
+    style_card = (
+        f"Style profile: {ratio} · {profile.get('pacing', 'fast')} pacing · "
+        f"{profile.get('caption_preset', 'karaoke')} captions · {profile.get('zoom_style', 'punch_in')} zooms"
+    )
+    msg_parts = [
+        f"Proposed Edit Plan (Review & click Accept & Apply Edits below):\n{res_dict['workflow_summary']}",
+        style_card,
+    ]
+    plan_bullets = _describe_planned_edits(final_calls, res_dict["auto_captions"], generated_assets)
+    if plan_bullets:
+        msg_parts.append("What this will do:\n" + "\n".join(plan_bullets))
+
+    check_lines = [
+        f"{'✅ Apply' if fc['verdict'] == 'apply' else '⏭️ Skip'} ({fc['technique']}): {fc['reason']}"
+        for fc in res_dict["fit_checks"]
+    ]
+    msg_parts.append("AI Fit Confirmation:\n" + "\n".join(check_lines))
+
+    ref_beats: List[Dict[str, Any]] = list(profile.get("reference_beats") or [])
+    if ref_beats:
+        msg_parts.append(
+            "Reference breakdown:\n"
+            + "\n".join(
+                f"• [{b['start']:.1f}s–{b['end']:.1f}s] ({b['moment_type']}) {b['what_is_happening']}"
+                for b in ref_beats[:5]
+            )
+        )
+    user_moments: List[Dict[str, Any]] = list((user_scene_analysis or {}).get("detected_moments") or [])
+    if user_moments:
+        msg_parts.append(
+            "Matched moments in your clip:\n"
+            + "\n".join(
+                f"• [{m['start']:.1f}s–{m['end']:.1f}s] ({m.get('moment_type', 'moment')}) {m.get('description', '')}"
+                for m in user_moments[:5]
+            )
+        )
+    if all_notes:
+        msg_parts.append(f"Ready to apply: {', '.join(all_notes)}.")
+    winner_tag = f"{winner['provider']}:{winner['model']}"
+    return final_calls, res_dict["auto_captions"], "\n\n".join(msg_parts), winner_tag
 
 
 def clone_reference_style_for_project(
@@ -912,13 +1663,14 @@ def clone_reference_style_for_project(
     custom_instruction: Optional[str] = None,
     transcript_tl_text: str = "",
     deep_think: bool = False,
+    sfx_dir: Optional[Path] = None,
 ) -> Tuple[Dict[str, Any], List[ToolCallSchema], Optional[List[CaptionItem]], str, str]:
     """
     Two-side Gemini/NVIDIA Reference Cloner:
     1. Watches reference YouTube URL -> extracts style profile & beat breakdown ('what happens').
-    2. Watches YOUR active timeline clip via Visual Planner (if downloaded & vision configured)
-       -> spots funny/reaction/action moments & subject coordinates in your clip.
-    3. Runs both analyses concurrently and applies reference beats onto your clip's real moments.
+    2. Watches YOUR active timeline clip via Visual Planner -> spots funny/reaction/action moments.
+    3. Runs AI Fit-Critic & Tool-Restricted Workflow to confirm what fits this clip (falling back to
+       deterministic apply_reference_style_to_project if unavailable) + prepares TTS previews before Accept.
     """
     user_scene: Optional[Dict[str, Any]] = None
     if project_state.tracks.clips and downloads_dir is not None:
@@ -949,19 +1701,40 @@ def clone_reference_style_for_project(
             deep_think=deep_think,
         )
 
-    tool_calls, auto_captions, summary_msg = apply_reference_style_to_project(
+    gen_assets: List[SfxAsset] = []
+    ai_planned = _plan_reference_edits_with_ai(
         profile=profile,
         project_state=project_state,
         transcript=transcript,
         sfx_assets=sfx_assets,
         custom_instruction=custom_instruction,
         user_scene_analysis=user_scene,
+        deep_think=deep_think,
+        sfx_dir=sfx_dir,
+        generated_assets_out=gen_assets,
     )
-    if user_scene:
+    if ai_planned is not None:
+        tool_calls, auto_captions, summary_msg, wf_winner = ai_planned
+        route_label = f"{route_label} -> ai-workflow ({wf_winner})"
+    else:
+        tool_calls, auto_captions, summary_msg = apply_reference_style_to_project(
+            profile=profile,
+            project_state=project_state,
+            transcript=transcript,
+            sfx_assets=sfx_assets,
+            custom_instruction=custom_instruction,
+            user_scene_analysis=user_scene,
+            sfx_dir=sfx_dir,
+            generated_assets_out=gen_assets,
+        )
+    if user_scene or gen_assets:
         profile = dict(profile)
-        profile["matched_user_moments"] = user_scene.get("detected_moments", [])
-        if user_scene.get("planner_model"):
-            route_label = f"{route_label} + clip-vision ({user_scene['planner_model']})"
-    if deep_think:
+        if user_scene:
+            profile["matched_user_moments"] = user_scene.get("detected_moments", [])
+            if user_scene.get("planner_model"):
+                route_label = f"{route_label} + clip-vision ({user_scene['planner_model']})"
+        if gen_assets:
+            profile["generated_assets"] = [a.model_dump() for a in gen_assets]
+    if deep_think and "[Deep Think]" not in route_label:
         route_label = f"{route_label} [Deep Think]"
     return profile, tool_calls, auto_captions, summary_msg, route_label

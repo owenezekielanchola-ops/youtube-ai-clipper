@@ -14,6 +14,7 @@ class CaptionItem(BaseModel):
     end: float
     text: str
     isManuallyEdited: bool = False
+    captionKind: Literal["subtitle", "intro_hook"] = "subtitle"
     highlightedWords: List[str] = Field(default_factory=list)
     words: List[WordTimestamp] = Field(default_factory=list)
 
@@ -85,6 +86,15 @@ class SfxClipItem(BaseModel):
     volume: float = 0.85
 
 
+class AudioEditItem(BaseModel):
+    id: str
+    start: float
+    end: float
+    muted: bool = True
+    volume: float = 0.0
+    label: Optional[str] = None
+
+
 class HeatmapPoint(BaseModel):
     start_time: float
     end_time: float
@@ -146,6 +156,7 @@ class TracksState(BaseModel):
     zooms: List[ZoomEffectItem] = Field(default_factory=list)
     drawings: List[DrawingItem] = Field(default_factory=list)
     sfx: List[SfxClipItem] = Field(default_factory=list)
+    audioEdits: List[AudioEditItem] = Field(default_factory=list)
 
 
 class CaptionStyle(BaseModel):
@@ -208,6 +219,8 @@ class AiEditResponse(BaseModel):
     tool_calls: List[ToolCallSchema] = Field(default_factory=list)
     auto_captions: Optional[List[CaptionItem]] = None
     route_used: str = "groq"
+    requires_confirmation: bool = False
+    generated_assets: List[SfxAsset] = Field(default_factory=list)
 
 
 class AutoCaptionsRequest(BaseModel):
@@ -218,7 +231,7 @@ class AutoCaptionsRequest(BaseModel):
 
 class DetectPausesRequest(BaseModel):
     project_id: str
-    min_gap: float = 0.7
+    min_gap: float = Field(default=0.7, ge=0.2, le=30.0)
 
 
 class ExportRequest(BaseModel):
@@ -253,10 +266,20 @@ class ReferenceStyleResponse(BaseModel):
     tool_calls: List[ToolCallSchema] = Field(default_factory=list)
     auto_captions: Optional[List[CaptionItem]] = None
     route_used: str = "reference-style"
+    requires_confirmation: bool = True
+    generated_assets: List[SfxAsset] = Field(default_factory=list)
+
+
+class TtsGenerateRequest(BaseModel):
+    text: str
+    voice: Optional[str] = None
+    model: Optional[str] = None
+    speed: float = 1.0
+    name: Optional[str] = None
 
 
 # ==============================================================================
-# 21 SHARED TOOLS DEFINITIONS (OpenAI / Groq Tool Calling & Gemini Schema)
+# 23 SHARED TOOLS DEFINITIONS (OpenAI / Groq Tool Calling & Gemini Schema)
 # ==============================================================================
 
 SHARED_TOOLS_DEFINITIONS: List[Dict[str, Any]] = [
@@ -420,13 +443,22 @@ SHARED_TOOLS_DEFINITIONS: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "add_caption",
-            "description": "Adds a new manual caption block at the specified source time range.",
+            "description": (
+                "Adds a manual or TTS-ready intro hook caption block in SOURCE video seconds. "
+                "For an opening intro/teaser caption (e.g. 'Look at what this person is gonna do to get GTA VI'), "
+                "anchor start at clips[0].sourceStart (to sourceStart + 3.2) and set kind='intro_hook'."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "start": {"type": "number"},
-                    "end": {"type": "number"},
-                    "text": {"type": "string"}
+                    "start": {"type": "number", "description": "Source timestamp start (seconds; use clips[0].sourceStart for intro hooks)."},
+                    "end": {"type": "number", "description": "Source timestamp end (seconds)."},
+                    "text": {"type": "string", "description": "Caption or TTS-ready intro hook text."},
+                    "kind": {
+                        "type": "string",
+                        "enum": ["subtitle", "intro_hook"],
+                        "description": "Use 'intro_hook' for an opening teaser/hook caption previewing what happens next (TTS-ready); default 'subtitle'."
+                    }
                 },
                 "required": ["start", "end", "text"]
             }
@@ -742,6 +774,69 @@ SHARED_TOOLS_DEFINITIONS: List[Dict[str, Any]] = [
                     }
                 },
                 "required": ["x", "y", "w", "h"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_voiceover",
+            "description": (
+                "Generates an AI Text-to-Speech (TTS) spoken voiceover MP3 via TTS.ai and adds it to the timeline SFX/voice track, "
+                "optionally synced with an intro_hook caption at the opening of the clip. "
+                "Use whenever the user asks for AI voiceover, narration, text-to-speech, TTS, or a spoken intro hook."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "Spoken line to synthesize into voiceover audio (keep concise and natural for TTS)."},
+                    "start": {"type": "number", "description": "Timeline start time in seconds (default 0.0 for opening intro hook)."},
+                    "voice": {"type": "string", "description": "Optional TTS.ai voice ID (default 'af_bella'; others: 'af_heart', 'am_adam', 'am_michael', 'bm_george')."},
+                    "speed": {"type": "number", "description": "Speech rate multiplier (0.7 to 1.5, default 1.05)."},
+                    "also_add_caption": {"type": "boolean", "description": "If true (default), also add a synced caption for this line."},
+                    "volume": {"type": "number", "description": "Voiceover track volume 0.2 to 1.0 (default 0.95)."}
+                },
+                "required": ["text"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_video_audio",
+            "description": (
+                "Mutes, cuts/deletes, ducks, or boosts ONLY the original video audio over a timeline interval "
+                "without cutting video footage or muting SFX/TTS voiceovers. "
+                "Use muted=true (volume=0.0) when the user asks to mute, silence, delete, or cut part of the video audio; "
+                "use muted=false with volume=0.0..2.0 (e.g. 0.25 or 1.5) to duck or boost video audio volume."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "start": {"type": "number", "description": "Timeline start timestamp in seconds (>= 0)."},
+                    "end": {"type": "number", "description": "Timeline end timestamp in seconds (> start)."},
+                    "muted": {"type": "boolean", "description": "True to mute/silence/cut original video audio over this range (default true)."},
+                    "volume": {"type": "number", "description": "Original video audio gain multiplier from 0.0 to 2.0 (default 0.0 when muted, else e.g. 0.25 or 1.5)."},
+                    "label": {"type": "string", "description": "Optional short label (e.g. 'Muted profanity', 'Ducked under VO')."}
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_audio_edit",
+            "description": (
+                "Deletes an existing video audio mute/volume region from Active Video Audio Edits to restore normal 100% audio. "
+                "Pass audio_edit_id='all' to unmute and restore all video audio."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "audio_edit_id": {"type": "string", "description": "The ID from Active Video Audio Edits, or 'all' to restore all video audio."}
+                },
+                "required": ["audio_edit_id"]
             }
         }
     }

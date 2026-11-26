@@ -96,7 +96,9 @@ export const TopNavbar: React.FC = () => {
 
   useEffect(() => {
     if (!showExportModal) return;
-    const ws = new WebSocket('ws://localhost:8000/ws/progress');
+    const baseUrl = API_BASE || window.location.origin;
+    const wsUrl = baseUrl.replace(/^http/i, 'ws') + '/ws/progress';
+    const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
     ws.onmessage = (evt) => {
       try {
@@ -133,12 +135,14 @@ export const TopNavbar: React.FC = () => {
   };
 
   const handleSaveProject = async () => {
+    let savedToServer = false;
     try {
-      await fetch(`${API_BASE}/api/projects/save`, {
+      const resp = await fetch(`${API_BASE}/api/projects/save`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ project_state: project }),
       });
+      savedToServer = resp.ok;
     } catch {
       // Allow local JSON download even if backend isn't reachable
     }
@@ -151,7 +155,11 @@ export const TopNavbar: React.FC = () => {
     a.download = `${project.projectId || 'project'}.json`;
     a.click();
     URL.revokeObjectURL(a.href);
-    setStatusBanner('Project saved to workspace_data/projects/ and downloaded JSON.');
+    setStatusBanner(
+      savedToServer
+        ? 'Project saved to workspace_data/projects/ and downloaded JSON.'
+        : 'Downloaded JSON locally (backend save unavailable).',
+    );
   };
 
   const handleOpenLoadModal = async () => {
@@ -168,12 +176,17 @@ export const TopNavbar: React.FC = () => {
   };
 
   const handleLoadFromBackend = async (projectId: string) => {
-    const resp = await fetch(`${API_BASE}/api/projects/${projectId}`);
-    if (resp.ok) {
+    try {
+      const safeId = encodeURIComponent(projectId);
+      const resp = await fetch(`${API_BASE}/api/projects/${safeId}`);
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+        throw new Error(err.detail || 'Failed to load project');
+      }
       const proj: ProjectState = await resp.json();
       let loadedTranscript = null;
       try {
-        const tResp = await fetch(`${API_BASE}/api/projects/${projectId}/transcript`);
+        const tResp = await fetch(`${API_BASE}/api/projects/${safeId}/transcript`);
         if (tResp.ok) {
           const tData = await tResp.json();
           loadedTranscript = tData?.transcript ?? null;
@@ -184,6 +197,10 @@ export const TopNavbar: React.FC = () => {
       loadProjectState(proj, loadedTranscript);
       useEditorStore.temporal.getState().clear();
       setShowLoadModal(false);
+    } catch (err) {
+      setStatusBanner(
+        `Could not load project: ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
   };
 
@@ -194,8 +211,17 @@ export const TopNavbar: React.FC = () => {
     const reader = new FileReader();
     reader.onload = () => {
       try {
-        const parsed = JSON.parse(String(reader.result)) as ProjectState;
-        loadProjectState(parsed);
+        const parsed = JSON.parse(String(reader.result)) as Partial<ProjectState>;
+        if (
+          !parsed ||
+          typeof parsed !== 'object' ||
+          typeof parsed.projectId !== 'string' ||
+          !parsed.tracks ||
+          !Array.isArray(parsed.tracks.clips)
+        ) {
+          throw new Error('Missing required projectId or tracks.clips');
+        }
+        loadProjectState(parsed as ProjectState);
         useEditorStore.temporal.getState().clear();
         setShowLoadModal(false);
       } catch {
@@ -206,6 +232,7 @@ export const TopNavbar: React.FC = () => {
   };
 
   const handleStartExport = async () => {
+    const exportProjectId = project.projectId;
     setIsExporting(true);
     setExportProgress(2);
     setExportStatus('Starting FFmpeg low-RAM render...');
@@ -224,10 +251,13 @@ export const TopNavbar: React.FC = () => {
         throw new Error(err.detail || 'Export failed');
       }
       const data = await resp.json();
+      if (useEditorStore.getState().project.projectId !== exportProjectId) return;
       setExportProgress(100);
       setExportStatus('Export complete!');
       setExportedFiles(data.files || []);
     } catch (err) {
+      if (useEditorStore.getState().project.projectId !== exportProjectId) return;
+      setExportProgress(0);
       setExportStatus(
         `Error: ${err instanceof Error ? err.message : String(err)}`,
       );
@@ -271,7 +301,7 @@ export const TopNavbar: React.FC = () => {
     <>
       <div className="shrink-0">
         {/* Row 1: Calm Main Studio Header */}
-        <header className="h-12 border-b border-[#272f40] bg-[#151922] px-3.5 flex items-center justify-between gap-3">
+        <header className="h-12 border-b border-[#272f40] bg-[#151922] px-3.5 flex items-center justify-between gap-3 overflow-x-auto">
           {/* Left: Brand, Project Name, & Import Toggle */}
           <div className="flex items-center gap-2.5 min-w-0">
             <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-amber-400 to-orange-500 flex items-center justify-center text-slate-950 font-bold shrink-0 shadow-sm">
@@ -282,7 +312,7 @@ export const TopNavbar: React.FC = () => {
               value={project.projectName}
               onChange={(e) => setProjectName(e.target.value)}
               aria-label="Project name"
-              className="bg-transparent border border-transparent hover:border-[#272f40] focus:border-amber-400/60 focus:bg-[#1c212d] rounded-lg px-2.5 py-1 text-sm font-semibold text-slate-100 w-44 lg:w-52 truncate outline-none transition"
+              className="bg-transparent border border-transparent hover:border-[#272f40] focus:border-amber-400/60 focus:bg-[#1c212d] rounded-lg px-2.5 py-1 text-sm font-semibold text-slate-100 min-w-[96px] flex-1 max-w-52 truncate outline-none transition"
             />
             {hasVideo && (
               <button
@@ -470,6 +500,9 @@ export const TopNavbar: React.FC = () => {
       {/* Load Project Modal */}
       {showLoadModal && (
         <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="Load Saved Project"
           className="fixed inset-0 z-50 bg-black/65 backdrop-blur-sm flex items-center justify-center p-4"
           onClick={() => setShowLoadModal(false)}
         >
@@ -546,6 +579,9 @@ export const TopNavbar: React.FC = () => {
       {/* Export Modal */}
       {showExportModal && (
         <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="Export Video and Subtitles"
           className="fixed inset-0 z-50 bg-black/65 backdrop-blur-sm flex items-center justify-center p-4"
           onClick={() => setShowExportModal(false)}
         >

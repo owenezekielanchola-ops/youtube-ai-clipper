@@ -88,13 +88,13 @@ def _format_vtt_time(seconds: float) -> str:
 
 def _map_captions_to_clips(
     captions: List[CaptionItem], clips: List[ClipItem]
-) -> List[Tuple[float, float, CaptionItem, float, float]]:
+) -> List[Tuple[float, float, CaptionItem, float, float, float]]:
     """
     Maps source-time captions onto the concatenated timeline of active clips
     while accounting for each clip's playback speed.
-    Returns list of (timeline_start, timeline_end, caption, overlap_start, overlap_end).
+    Returns list of (timeline_start, timeline_end, caption, overlap_start, overlap_end, clip_speed).
     """
-    mapped: List[Tuple[float, float, CaptionItem, float, float]] = []
+    mapped: List[Tuple[float, float, CaptionItem, float, float, float]] = []
     for clip in clips:
         clip_speed = max(0.25, min(4.0, float(getattr(clip, "speed", 1.0) or 1.0)))
         for cap in captions:
@@ -103,14 +103,14 @@ def _map_captions_to_clips(
             if overlap_end - overlap_start > 0.05:
                 tl_start = clip.timelineStart + (overlap_start - clip.sourceStart) / clip_speed
                 tl_end = clip.timelineStart + (overlap_end - clip.sourceStart) / clip_speed
-                mapped.append((tl_start, tl_end, cap, overlap_start, overlap_end))
+                mapped.append((tl_start, tl_end, cap, overlap_start, overlap_end, clip_speed))
     mapped.sort(key=lambda item: item[0])
     return mapped
 
 
 def _escape_ass_text(text: str) -> str:
     return (
-        text.replace("\\", "\\\\")
+        text.replace("\\", "\\\u200b")
         .replace("{", "｛")
         .replace("}", "｝")
         .replace("\r\n", "\n")
@@ -378,13 +378,16 @@ def generate_ass_subtitles(
             overlay_outline_color = "&H00000000"
             overlay_outline_px = 4
             overlay_shadow_px = 2
+        safe_font = (style.fontFamily or "Arial").split(",")[0].replace("\r", "").replace("\n", "").strip() or "Arial"
         overlay_style_line = (
-            f"\nStyle: CampaignOverlay,{style.fontFamily},{overlay_font_size},"
+            f"\nStyle: CampaignOverlay,{safe_font},{overlay_font_size},"
             f"{overlay_primary},{overlay_primary},{overlay_outline_color},&H80000000,"
             f"-1,0,0,0,100,100,2,0,{overlay_border_style},{overlay_outline_px},"
             f"{overlay_shadow_px},{overlay_align},{overlay_margin_x},{overlay_margin_x},{overlay_margin_v},1"
         )
 
+    safe_font_default = (style.fontFamily or "Arial").split(",")[0].replace("\r", "").replace("\n", "").strip() or "Arial"
+    safe_title = re.sub(r"[\r\n]+", " ", project_state.projectName or "Untitled").strip() or "Untitled"
     drawings = project_state.tracks.drawings
     has_drawings = len(drawings) > 0
     drawing_style_line = (
@@ -394,7 +397,7 @@ def generate_ass_subtitles(
     )
 
     header = f"""[Script Info]
-Title: {project_state.projectName}
+Title: {safe_title}
 ScriptType: v4.00+
 PlayResX: {res_x}
 PlayResY: {res_y}
@@ -402,7 +405,7 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,{style.fontFamily},{scaled_font_size},{style_primary},{style_secondary},{outline_ass},{back_ass},{bold_flag},0,0,0,100,100,0,0,{border_style},{outline_px},{shadow_px},{alignment},48,48,{margin_v},1{overlay_style_line}{drawing_style_line}
+Style: Default,{safe_font_default},{scaled_font_size},{style_primary},{style_secondary},{outline_ass},{back_ass},{bold_flag},0,0,0,100,100,0,0,{border_style},{outline_px},{shadow_px},{alignment},48,48,{margin_v},1{overlay_style_line}{drawing_style_line}
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -411,7 +414,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     mapped = _map_captions_to_clips(project_state.tracks.captions, clips)
     dialogue_lines: List[str] = []
 
-    for tl_start, tl_end, cap, overlap_start, overlap_end in mapped:
+    for tl_start, tl_end, cap, overlap_start, overlap_end, clip_speed in mapped:
         start_str = _format_ass_time(tl_start)
         end_str = _format_ass_time(tl_end)
         hl_set = {
@@ -422,13 +425,19 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
         if style.preset == "karaoke":
             parts: List[str] = []
-            if cap.words:
-                visible_words = [
-                    w for w in cap.words if w.end > overlap_start and w.start < overlap_end
-                ] or cap.words
-                if visible_words and visible_words[0].start > overlap_start + 0.05:
-                    lead_cs = max(1, int(round((visible_words[0].start - overlap_start) * 100)))
-                    parts.append(f"{{\\k{lead_cs}}}")
+            lead_tag = ""
+            visible_words = (
+                [w for w in cap.words if w.end > overlap_start and w.start < overlap_end]
+                if cap.words
+                else []
+            )
+            if visible_words:
+                if visible_words[0].start > overlap_start + 0.05:
+                    lead_cs = max(
+                        1,
+                        int(round(((visible_words[0].start - overlap_start) / clip_speed) * 100)),
+                    )
+                    lead_tag = f"{{\\k{lead_cs}}}"
                 for i, w in enumerate(visible_words):
                     w_start = max(overlap_start, w.start)
                     w_end = (
@@ -436,7 +445,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                         if i + 1 < len(visible_words)
                         else min(overlap_end, w.end)
                     )
-                    dur_cs = max(8, int(round((w_end - w_start) * 100)))
+                    dur_cs = max(8, int(round((max(0.0, w_end - w_start) / clip_speed) * 100)))
                     word_txt = _escape_ass_text(w.word)
                     clean_w = re.sub(r"[^\w']", "", w.word.lower())
                     if clean_w and clean_w in hl_set:
@@ -455,7 +464,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                             parts.append(f"{{\\k{per_cs}\\2c{highlight_ass}}}{escaped}{{\\2c{style_secondary}}}")
                         else:
                             parts.append(f"{{\\k{per_cs}}}{escaped}")
-            rendered_text = " ".join(parts) if parts else _escape_ass_text(cap.text)
+            rendered_text = f"{lead_tag}{' '.join(parts)}" if parts else _escape_ass_text(cap.text)
         elif style.preset == "bold_social":
             rendered_text = _style_tokens_with_highlights(
                 cap.text,
@@ -501,7 +510,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 def generate_srt_content(project_state: ProjectState) -> str:
     mapped = _map_captions_to_clips(project_state.tracks.captions, project_state.tracks.clips)
     blocks: List[str] = []
-    for idx, (tl_start, tl_end, cap, _, _) in enumerate(mapped, start=1):
+    for idx, (tl_start, tl_end, cap, _, _, _) in enumerate(mapped, start=1):
         clean_text = re.sub(
             r"\n{2,}", "\n", cap.text.replace("\r\n", "\n").replace("\r", "\n").strip()
         )
@@ -514,7 +523,7 @@ def generate_srt_content(project_state: ProjectState) -> str:
 def generate_vtt_content(project_state: ProjectState) -> str:
     mapped = _map_captions_to_clips(project_state.tracks.captions, project_state.tracks.clips)
     lines: List[str] = ["WEBVTT\n"]
-    for idx, (tl_start, tl_end, cap, _, _) in enumerate(mapped, start=1):
+    for idx, (tl_start, tl_end, cap, _, _, _) in enumerate(mapped, start=1):
         clean_text = re.sub(
             r"\n{2,}", "\n", cap.text.replace("\r\n", "\n").replace("\r", "\n").strip()
         )

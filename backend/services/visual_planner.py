@@ -1,9 +1,11 @@
+import copy
 import json
 import os
 import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -29,6 +31,7 @@ from services.youtube_ingest import _find_ffmpeg
 
 _KEYFRAME_CACHE: Dict[str, Tuple[float, List[Tuple[float, bytes]], float]] = {}
 _VISUAL_PLAN_CACHE: Dict[str, Tuple[float, Dict[str, Any], str]] = {}
+_CACHE_LOCK = threading.Lock()
 _CACHE_TTL_SEC = 600.0
 
 VISUAL_PLANNER_PHRASES = (
@@ -212,7 +215,7 @@ def _build_timeline_proxy_video(
 
     crop_filter = ""
     crop: Optional[VideoCropRect] = project_state.workspaceState.crop if include_existing_crop else None
-    if crop is not None:
+    if crop is not None and crop.start is None and crop.end is None:
         cx = max(0.0, min(0.9, float(crop.x)))
         cy = max(0.0, min(0.9, float(crop.y)))
         cw = max(0.1, min(1.0 - cx, float(crop.w)))
@@ -268,6 +271,7 @@ def _build_timeline_proxy_video(
             text=True,
             encoding="utf-8",
             errors="replace",
+            timeout=60,
         )
         if res.returncode != 0 or not seg_out.is_file():
             return None, total_tl_dur
@@ -304,6 +308,7 @@ def _build_timeline_proxy_video(
         text=True,
         encoding="utf-8",
         errors="replace",
+        timeout=60,
     )
     if concat_res.returncode != 0 or not final_proxy.is_file():
         return None, total_tl_dur
@@ -318,7 +323,7 @@ def _extract_timeline_keyframes(
     ffmpeg_bin = _find_ffmpeg()
     frames_dir = work_dir / "frames"
     frames_dir.mkdir(parents=True, exist_ok=True)
-    fps = max(0.15, min(2.0, max_frames / max(1.0, total_tl_dur)))
+    fps = max(0.002, min(2.0, max_frames / max(1.0, total_tl_dur)))
     cmd = [
         ffmpeg_bin,
         "-nostdin",
@@ -326,7 +331,7 @@ def _extract_timeline_keyframes(
         "-i",
         proxy_mp4.as_posix(),
         "-vf",
-        f"fps={fps:.4f}",
+        f"fps={fps:.5f}",
         "-frames:v",
         str(max_frames),
         "-q:v",
@@ -338,14 +343,14 @@ def _extract_timeline_keyframes(
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
+        timeout=60,
     )
     if res.returncode != 0:
         return []
     files = sorted(frames_dir.glob("f_*.jpg"))
     out: List[Tuple[float, bytes]] = []
-    step = total_tl_dur / max(1, len(files))
     for i, fp in enumerate(files):
-        ts = round(min(total_tl_dur, (i + 0.5) * step), 2)
+        ts = round(min(total_tl_dur, (i + 0.5) / fps), 2)
         out.append((ts, fp.read_bytes()))
     return out
 
@@ -402,8 +407,8 @@ def _sanitize_visual_plan(raw: Dict[str, Any], total_tl_dur: float) -> Dict[str,
     for mom in raw.get("detected_moments") or []:
         if not isinstance(mom, dict):
             continue
-        ms = _clamp(mom.get("start"), 0.0, max_t - 0.1, 0.0)
-        me = _clamp(mom.get("end"), ms + 0.3, max_t, min(max_t, ms + 2.5))
+        ms = _clamp(mom.get("start"), 0.0, max(0.0, max_t - 0.3), 0.0)
+        me = min(max_t, max(ms + 0.3, _clamp(mom.get("end"), 0.0, max_t, min(max_t, ms + 2.5))))
         mtype = str(mom.get("moment_type") or "highlight").strip().lower()
         if mtype not in valid_mtypes:
             mtype = "highlight"
@@ -424,9 +429,10 @@ def _sanitize_visual_plan(raw: Dict[str, Any], total_tl_dur: float) -> Dict[str,
         "delete_drawing",
         "add_sfx_clip",
         "delete_sfx_clip",
+        "edit_video_audio",
+        "delete_audio_edit",
         "set_clip_speed",
         "set_video_crop",
-        "remove_time_ranges",
         "change_caption_style",
         "change_video_format",
     }
@@ -438,8 +444,8 @@ def _sanitize_visual_plan(raw: Dict[str, Any], total_tl_dur: float) -> Dict[str,
             continue
         params = dict(step.get("params") or {})
         if action == "add_zoom_effect":
-            zs = _clamp(params.get("start"), 0.0, max_t - 0.25, 0.0)
-            ze = _clamp(params.get("end"), zs + 0.3, max_t, min(max_t, zs + 2.2))
+            zs = _clamp(params.get("start"), 0.0, max(0.0, max_t - 0.3), 0.0)
+            ze = min(max_t, max(zs + 0.3, _clamp(params.get("end"), 0.0, max_t, min(max_t, zs + 2.2))))
             kind = str(params.get("kind") or "punch_in")
             if kind not in {"punch_in", "zoom_in", "zoom_out"}:
                 kind = "punch_in"
@@ -462,8 +468,8 @@ def _sanitize_visual_plan(raw: Dict[str, Any], total_tl_dur: float) -> Dict[str,
                 ),
             }
         elif action == "add_drawing":
-            ds = _clamp(params.get("start"), 0.0, max_t - 0.25, 0.0)
-            de = _clamp(params.get("end"), ds + 0.3, max_t, min(max_t, ds + 2.5))
+            ds = _clamp(params.get("start"), 0.0, max(0.0, max_t - 0.3), 0.0)
+            de = min(max_t, max(ds + 0.3, _clamp(params.get("end"), 0.0, max_t, min(max_t, ds + 2.5))))
             d_tool = str(params.get("tool") or "arrow")
             if d_tool not in {"freehand", "line", "arrow", "circle", "rect", "highlight"}:
                 d_tool = "arrow"
@@ -497,8 +503,8 @@ def _sanitize_visual_plan(raw: Dict[str, Any], total_tl_dur: float) -> Dict[str,
             }
         elif action == "set_clip_speed":
             if params.get("start_time") is not None and params.get("end_time") is not None:
-                ss = _clamp(params.get("start_time"), 0.0, max_t - 0.2, 0.0)
-                se = _clamp(params.get("end_time"), ss + 0.2, max_t, min(max_t, ss + 3.0))
+                ss = _clamp(params.get("start_time"), 0.0, max(0.0, max_t - 0.25), 0.0)
+                se = min(max_t, max(ss + 0.25, _clamp(params.get("end_time"), 0.0, max_t, min(max_t, ss + 3.0))))
                 params = {
                     "start_time": ss,
                     "end_time": se,
@@ -514,7 +520,28 @@ def _sanitize_visual_plan(raw: Dict[str, Any], total_tl_dur: float) -> Dict[str,
                     ),
                 }
         elif action == "delete_zoom_effect":
-            params = {"zoom_id": str(params.get("zoom_id") or "").strip()}
+            zid = str(params.get("zoom_id") or "").strip()
+            if not zid:
+                continue
+            params = {"zoom_id": zid}
+        elif action == "edit_video_audio":
+            ae_s = _clamp(params.get("start"), 0.0, max(0.0, max_t - 0.15), 0.0)
+            ae_e = min(max_t, max(ae_s + 0.15, _clamp(params.get("end"), 0.0, max_t, min(max_t, ae_s + 3.0))))
+            is_muted = bool(params.get("muted", True))
+            vol_val = 0.0 if is_muted else _clamp(params.get("volume"), 0.0, 2.0, 0.25)
+            lbl = str(params.get("label") or "").strip()[:60]
+            params = {
+                "start": ae_s,
+                "end": ae_e,
+                "muted": is_muted,
+                "volume": vol_val,
+                **({"label": lbl} if lbl else {}),
+            }
+        elif action == "delete_audio_edit":
+            aid = str(params.get("audio_edit_id") or "").strip()
+            if not aid:
+                continue
+            params = {"audio_edit_id": aid}
         elif action == "set_video_crop":
             cx = _clamp(params.get("x"), 0.0, 0.9, 0.0)
             cy = _clamp(params.get("y"), 0.0, 0.9, 0.0)
@@ -524,8 +551,8 @@ def _sanitize_visual_plan(raw: Dict[str, Any], total_tl_dur: float) -> Dict[str,
             raw_end = params.get("end")
             params = {"x": cx, "y": cy, "w": cw, "h": ch}
             if raw_start is not None or raw_end is not None:
-                cs = _clamp(raw_start, 0.0, max_t - 0.25, 0.0)
-                ce = _clamp(raw_end, cs + 0.3, max_t, min(max_t, cs + 3.5))
+                cs = _clamp(raw_start, 0.0, max(0.0, max_t - 0.3), 0.0)
+                ce = min(max_t, max(cs + 0.3, _clamp(raw_end, 0.0, max_t, min(max_t, cs + 3.5))))
                 params["start"] = cs
                 params["end"] = ce
 
@@ -611,7 +638,7 @@ def plan_visual_edits_with_gemini(
         wants_crop = "crop" in prompt.lower()
     include_crop = not wants_crop
     include_aspect_pad = not wants_crop
-    crop_obj = project_state.workspaceState.crop if include_crop else None
+    crop_obj = project_state.workspaceState.crop if (include_crop and (project_state.workspaceState.crop is None or (project_state.workspaceState.crop.start is None and project_state.workspaceState.crop.end is None))) else None
     crop_sig = (
         f"{crop_obj.x:.3f},{crop_obj.y:.3f},{crop_obj.w:.3f},{crop_obj.h:.3f}"
         if crop_obj is not None
@@ -630,25 +657,37 @@ def plan_visual_edits_with_gemini(
     )
     now_ts = time.time()
     zooms_sig = ",".join(f"{z.id}:{z.start:.1f}" for z in (project_state.tracks.zooms or [])[:10])
+    sfx_sig = "|".join(
+        f"{a.id}:{a.name}:{','.join(a.tags[:3])}" for a in (sfx_assets or [])[:25]
+    )
+    playhead_sig = round(float(project_state.workspaceState.playheadPosition or 0.0), 1)
+    timed_crop_obj = project_state.workspaceState.crop
+    timed_crop_sig = (
+        f"{timed_crop_obj.x:.2f},{timed_crop_obj.y:.2f},{timed_crop_obj.w:.2f},{timed_crop_obj.h:.2f},{timed_crop_obj.start},{timed_crop_obj.end}"
+        if timed_crop_obj is not None
+        else "none"
+    )
     brief_sig = str((director_brief or {}).get("vision_brief") or "").strip().lower()
-    plan_cache_key = f"{kf_cache_key}::{len(sfx_assets or [])}::{zooms_sig}::{prompt.strip().lower()}::{brief_sig}"
+    plan_cache_key = f"{kf_cache_key}::{sfx_sig}::{playhead_sig}::{timed_crop_sig}::{zooms_sig}::{prompt.strip().lower()}::{brief_sig}"
 
-    cached_plan = _VISUAL_PLAN_CACHE.get(plan_cache_key)
+    with _CACHE_LOCK:
+        cached_plan = _VISUAL_PLAN_CACHE.get(plan_cache_key)
     if cached_plan and (now_ts - cached_plan[0]) < _CACHE_TTL_SEC:
         print("[VisualPlanner] Reusing cached scene plan (0ms)", flush=True)
-        return dict(cached_plan[1]), f"{cached_plan[2]} [cached]"
+        return copy.deepcopy(cached_plan[1]), f"{cached_plan[2]} [cached]"
 
     work_dir = Path(tempfile.mkdtemp(prefix="visplan_"))
     uploaded_file = None
 
     try:
-        cached_kf = _KEYFRAME_CACHE.get(kf_cache_key)
+        with _CACHE_LOCK:
+            cached_kf = _KEYFRAME_CACHE.get(kf_cache_key)
         keyframes: List[Tuple[float, bytes]] = []
         total_tl_dur = 0.0
         proxy_mp4: Optional[Path] = None
 
         if cached_kf and (now_ts - cached_kf[0]) < _CACHE_TTL_SEC and cached_kf[1]:
-            keyframes = cached_kf[1]
+            keyframes = list(cached_kf[1])
             total_tl_dur = cached_kf[2]
             print(f"[VisualPlanner] Reusing {len(keyframes)} cached keyframes", flush=True)
         else:
@@ -672,9 +711,12 @@ def plan_visual_edits_with_gemini(
                 proxy_mp4, work_dir, total_tl_dur, max_frames=frame_budget
             )
             if keyframes:
-                if len(_KEYFRAME_CACHE) >= 8:
-                    _KEYFRAME_CACHE.pop(next(iter(_KEYFRAME_CACHE)))
-                _KEYFRAME_CACHE[kf_cache_key] = (now_ts, keyframes, total_tl_dur)
+                with _CACHE_LOCK:
+                    if len(_KEYFRAME_CACHE) >= 8:
+                        oldest_kf = next(iter(_KEYFRAME_CACHE), None)
+                        if oldest_kf is not None:
+                            _KEYFRAME_CACHE.pop(oldest_kf, None)
+                    _KEYFRAME_CACHE[kf_cache_key] = (now_ts, list(keyframes), total_tl_dur)
 
         sfx_summary = [
             {
@@ -786,7 +828,9 @@ def plan_visual_edits_with_gemini(
                 gem_contents: List[Any] = [*gem_parts, prompt_context]
                 for g_model in get_gemini_models_chain()[:3]:
                     def _run_gem(m_id: str = g_model) -> str:
-                        g_client = genai.Client(api_key=gemini_key)
+                        g_client = genai.Client(
+                            api_key=gemini_key, http_options=types.HttpOptions(timeout=45000)
+                        )
                         resp = g_client.models.generate_content(
                             model=m_id,
                             contents=gem_contents,
@@ -837,16 +881,21 @@ def plan_visual_edits_with_gemini(
                         hedge_delay_sec=0.0,
                     )
                     tag = f"{winner['provider']}:{winner['model']} ({winner['latency_ms']:.0f}ms)"
-                    if len(_VISUAL_PLAN_CACHE) >= 16:
-                        _VISUAL_PLAN_CACHE.pop(next(iter(_VISUAL_PLAN_CACHE)))
-                    _VISUAL_PLAN_CACHE[plan_cache_key] = (now_ts, dict(sanitized), tag)
+                    with _CACHE_LOCK:
+                        if len(_VISUAL_PLAN_CACHE) >= 16:
+                            oldest_plan = next(iter(_VISUAL_PLAN_CACHE), None)
+                            if oldest_plan is not None:
+                                _VISUAL_PLAN_CACHE.pop(oldest_plan, None)
+                        _VISUAL_PLAN_CACHE[plan_cache_key] = (now_ts, copy.deepcopy(sanitized), tag)
                     return sanitized, tag
                 except Exception:
                     pass
 
         # 2. Fallback: upload proxy MP4 to Gemini Files API if keyframe race failed
         if has_gemini:
-            client = genai.Client(api_key=gemini_key)
+            client = genai.Client(
+                api_key=gemini_key, http_options=types.HttpOptions(timeout=60000)
+            )
             if proxy_mp4 is None:
                 proxy_mp4, total_tl_dur = _build_timeline_proxy_video(
                     project_state,
@@ -893,7 +942,9 @@ def plan_visual_edits_with_gemini(
     finally:
         if uploaded_file is not None and getattr(uploaded_file, "name", None) and has_gemini:
             try:
-                genai.Client(api_key=gemini_key).files.delete(name=uploaded_file.name)
+                genai.Client(
+                    api_key=gemini_key, http_options=types.HttpOptions(timeout=15000)
+                ).files.delete(name=uploaded_file.name)
             except Exception:
                 pass
         shutil.rmtree(work_dir, ignore_errors=True)

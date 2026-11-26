@@ -1,6 +1,7 @@
 export type AspectRatio = '16:9' | '9:16' | '1:1';
 export type CaptionPreset = 'karaoke' | 'bold_social' | 'yellow_highlight' | 'minimal';
 export type CaptionPosition = 'top' | 'middle' | 'bottom';
+export type CaptionKind = 'subtitle' | 'intro_hook';
 export type OverlayPosition =
   | 'bottom-left'
   | 'bottom-center'
@@ -29,6 +30,7 @@ export interface CaptionItem {
   end: number;
   text: string;
   isManuallyEdited: boolean;
+  captionKind?: CaptionKind;
   highlightedWords: string[];
   words: WordTimestamp[];
 }
@@ -103,6 +105,16 @@ export interface SfxClipItem {
   duration: number;
   trimStart?: number;
   volume: number;
+  sourceDuration?: number;
+}
+
+export interface AudioEditItem {
+  id: string;
+  start: number;
+  end: number;
+  muted: boolean;
+  volume: number;
+  label?: string;
 }
 
 export interface HeatmapPoint {
@@ -151,6 +163,7 @@ export interface TracksState {
   zooms?: ZoomEffectItem[];
   drawings?: DrawingItem[];
   sfx?: SfxClipItem[];
+  audioEdits?: AudioEditItem[];
 }
 
 export interface CaptionStyle {
@@ -194,6 +207,14 @@ export interface AiActionLogItem {
   timestamp: string;
 }
 
+export interface AiPendingProposal {
+  projectId?: string;
+  toolCalls: ToolCall[];
+  autoCaptions: CaptionItem[] | null;
+  generatedAssets?: SfxAsset[];
+  status: 'pending' | 'accepted' | 'dismissed';
+}
+
 export interface AiChatMessage {
   id: string;
   role: 'user' | 'assistant';
@@ -202,6 +223,8 @@ export interface AiChatMessage {
   campaignLabel?: string;
   copyableCaption?: string;
   actions?: AiActionLogItem[];
+  generatedAssets?: SfxAsset[];
+  pendingProposal?: AiPendingProposal;
 }
 
 export interface HighlightClipInput {

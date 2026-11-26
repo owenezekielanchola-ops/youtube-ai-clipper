@@ -109,3 +109,24 @@ export function buildCampaignAssistantNotice(
 
   return { content, copyableCaption };
 }
+
+export function buildPostEditCampaignChecklist(
+  campaign: CampaignConfig,
+  clipTitle?: string | null,
+): { checklistText: string; copyableCaption: string } {
+  const copyableCaption = buildDefaultPostCaption(campaign, clipTitle);
+  const reqLines = campaign.requiredRules
+    .map((r) => `• ${r.title}: ${r.description}`)
+    .join('\n');
+  const banLines = campaign.prohibitedRules
+    .map((r) => `❌ ${r.title}: ${r.description}`)
+    .join('\n');
+
+  const checklistText =
+    `--- [${campaign.label} Posting Checklist] ---\n` +
+    `Caption & Hashtags (ready to copy):\n"${copyableCaption.replace(/\n+/g, ' ')}"\n\n` +
+    `Required Before Posting:\n${reqLines}\n\n` +
+    `Do NOT Do:\n${banLines}`;
+
+  return { checklistText, copyableCaption };
+}

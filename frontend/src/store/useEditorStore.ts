@@ -5,6 +5,7 @@ import type {
   AiActionLogItem,
   AiChatMessage,
   AspectRatio,
+  AudioEditItem,
   CachedTranscript,
   CaptionItem,
   CaptionPosition,
@@ -36,7 +37,11 @@ export const DEFAULT_OVERLAY_STYLE: OverlayStyle = {
   fontSize: 24,
 };
 
-export const API_BASE = 'http://localhost:8000';
+export const API_BASE =
+  import.meta.env.VITE_API_BASE ??
+  (import.meta.env.DEV ? '' : 'http://localhost:8000');
+
+let activeIngestSeq = 0;
 
 const makeId = (prefix: string) =>
   `${prefix}_${Math.random().toString(36).slice(2, 10)}`;
@@ -142,6 +147,146 @@ function pruneOrphanedAutoCaptions(
   );
 }
 
+function projectTlSpanToNewClips(
+  tlStart: number,
+  tlEnd: number,
+  oldClips: ClipItem[],
+  newClips: ClipItem[],
+): { start: number; end: number } | null {
+  const fragments: Array<{ start: number; end: number }> = [];
+  for (const oc of oldClips) {
+    const ovS = Math.max(tlStart, oc.timelineStart);
+    const ovE = Math.min(tlEnd, oc.timelineStart + oc.duration);
+    if (ovE <= ovS + 0.02) continue;
+    const oldSpd = Math.max(0.25, Math.min(4.0, oc.speed ?? 1));
+    const srcS = oc.sourceStart + (ovS - oc.timelineStart) * oldSpd;
+    const srcE = oc.sourceStart + (ovE - oc.timelineStart) * oldSpd;
+    for (const nc of newClips) {
+      const nOvS = Math.max(srcS, nc.sourceStart);
+      const nOvE = Math.min(srcE, nc.sourceEnd);
+      if (nOvE <= nOvS + 0.02) continue;
+      const newSpd = Math.max(0.25, Math.min(4.0, nc.speed ?? 1));
+      fragments.push({
+        start: nc.timelineStart + (nOvS - nc.sourceStart) / newSpd,
+        end: nc.timelineStart + (nOvE - nc.sourceStart) / newSpd,
+      });
+    }
+  }
+  if (fragments.length === 0) return null;
+  const minS = Math.min(...fragments.map((f) => f.start));
+  const maxE = Math.max(...fragments.map((f) => f.end));
+  return { start: Number(minS.toFixed(3)), end: Number(maxE.toFixed(3)) };
+}
+
+function remapTimelineEffects(
+  oldClips: ClipItem[],
+  newClips: ClipItem[],
+  tracks: Pick<ProjectState['tracks'], 'zooms' | 'drawings' | 'sfx' | 'audioEdits'>,
+  crop: VideoCropRect | null | undefined,
+): {
+  zooms: ZoomEffectItem[];
+  drawings: DrawingItem[];
+  sfx: SfxClipItem[];
+  audioEdits: AudioEditItem[];
+  crop: VideoCropRect | null;
+} {
+  const totalNewDur = newClips.reduce((acc, c) => acc + c.duration, 0);
+
+  let zoomsChanged = false;
+  const nextZooms: ZoomEffectItem[] = [];
+  for (const z of tracks.zooms ?? []) {
+    const mapped = projectTlSpanToNewClips(z.start, z.end, oldClips, newClips);
+    if (!mapped || mapped.end - mapped.start < 0.2) {
+      zoomsChanged = true;
+      continue;
+    }
+    if (mapped.start !== z.start || mapped.end !== z.end) {
+      zoomsChanged = true;
+      nextZooms.push({ ...z, start: mapped.start, end: mapped.end });
+    } else {
+      nextZooms.push(z);
+    }
+  }
+
+  let drawingsChanged = false;
+  const nextDrawings: DrawingItem[] = [];
+  for (const d of tracks.drawings ?? []) {
+    const mapped = projectTlSpanToNewClips(d.start, d.end, oldClips, newClips);
+    if (!mapped || mapped.end - mapped.start < 0.2) {
+      drawingsChanged = true;
+      continue;
+    }
+    if (mapped.start !== d.start || mapped.end !== d.end) {
+      drawingsChanged = true;
+      nextDrawings.push({ ...d, start: mapped.start, end: mapped.end });
+    } else {
+      nextDrawings.push(d);
+    }
+  }
+
+  let sfxChanged = false;
+  const nextSfx: SfxClipItem[] = [];
+  for (const sc of tracks.sfx ?? []) {
+    const mapped = projectTlSpanToNewClips(
+      sc.start,
+      sc.start + sc.duration,
+      oldClips,
+      newClips,
+    );
+    if (!mapped || mapped.start >= totalNewDur - 0.1) {
+      sfxChanged = true;
+      continue;
+    }
+    const clampedDur = Number(
+      Math.max(0.15, Math.min(sc.duration, totalNewDur - mapped.start)).toFixed(3),
+    );
+    if (mapped.start !== sc.start || clampedDur !== sc.duration) {
+      sfxChanged = true;
+      nextSfx.push({ ...sc, start: mapped.start, duration: clampedDur });
+    } else {
+      nextSfx.push(sc);
+    }
+  }
+
+  let nextCrop: VideoCropRect | null = crop ?? null;
+  if (crop && crop.start != null && crop.end != null) {
+    const mappedCrop = projectTlSpanToNewClips(crop.start, crop.end, oldClips, newClips);
+    if (!mappedCrop || mappedCrop.end - mappedCrop.start < 0.2) {
+      nextCrop = null;
+    } else if (mappedCrop.start !== crop.start || mappedCrop.end !== crop.end) {
+      nextCrop = {
+        ...crop,
+        start: Number(mappedCrop.start.toFixed(2)),
+        end: Number(mappedCrop.end.toFixed(2)),
+      };
+    }
+  }
+
+  let audioEditsChanged = false;
+  const nextAudioEdits: AudioEditItem[] = [];
+  for (const ae of tracks.audioEdits ?? []) {
+    const mapped = projectTlSpanToNewClips(ae.start, ae.end, oldClips, newClips);
+    if (!mapped || mapped.end - mapped.start < 0.15) {
+      audioEditsChanged = true;
+      continue;
+    }
+    if (mapped.start !== ae.start || mapped.end !== ae.end) {
+      audioEditsChanged = true;
+      nextAudioEdits.push({ ...ae, start: mapped.start, end: mapped.end });
+    } else {
+      nextAudioEdits.push(ae);
+    }
+  }
+
+  return {
+    zooms: zoomsChanged ? nextZooms : (tracks.zooms ?? []),
+    drawings: drawingsChanged ? nextDrawings : (tracks.drawings ?? []),
+    sfx: sfxChanged ? nextSfx : (tracks.sfx ?? []),
+    audioEdits: audioEditsChanged ? nextAudioEdits : (tracks.audioEdits ?? []),
+    crop: nextCrop,
+  };
+}
+
 function overlapsProtectedCaption(
   candidate: CaptionItem,
   protectedCaptions: CaptionItem[],
@@ -183,6 +328,7 @@ function createEmptyProject(): ProjectState {
       zooms: [],
       drawings: [],
       sfx: [],
+      audioEdits: [],
     },
     captionStyle: {
       preset: 'karaoke',
@@ -265,6 +411,7 @@ export interface EditorStoreState {
   selectedZoomId: string | null;
   selectedDrawingId: string | null;
   selectedSfxId: string | null;
+  selectedAudioEditId: string | null;
   sfxLibrary: SfxAsset[];
   isLoadingSfx: boolean;
 
@@ -284,6 +431,7 @@ export interface EditorStoreState {
   setSelectedZoomId: (id: string | null) => void;
   setSelectedDrawingId: (id: string | null) => void;
   setSelectedSfxId: (id: string | null) => void;
+  setSelectedAudioEditId: (id: string | null) => void;
   setActiveCampaign: (campaignId: string | null) => void;
   setOverlayText: (text: string | null) => void;
   updateOverlayStyle: (patch: Partial<OverlayStyle>) => void;
@@ -291,6 +439,7 @@ export interface EditorStoreState {
   setIsIngesting: (val: boolean) => void;
   setIsAiThinking: (val: boolean) => void;
   appendAiMessage: (msg: AiChatMessage) => void;
+  updateAiMessage: (id: string, patch: Partial<AiChatMessage>) => void;
 
   // =========================================================================
   // THE 13 SHARED TOOLS (Used identically by Manual UI & AI Function Calls)
@@ -307,7 +456,12 @@ export interface EditorStoreState {
     end_time?: number,
     providedCaptions?: CaptionItem[],
   ) => void;
-  add_caption: (start: number, end: number, text: string) => void;
+  add_caption: (
+    start: number,
+    end: number,
+    text: string,
+    kind?: 'subtitle' | 'intro_hook',
+  ) => void;
   delete_caption: (caption_id: string) => void;
   combine_captions: (caption_id_1: string, caption_id_2: string) => void;
   edit_caption: (
@@ -338,6 +492,13 @@ export interface EditorStoreState {
   add_sfx_clip: (item: Omit<SfxClipItem, 'id'>) => string;
   update_sfx_clip: (id: string, patch: Partial<Omit<SfxClipItem, 'id'>>) => void;
   delete_sfx_clip: (id: string) => void;
+  add_audio_edit: (item: Omit<AudioEditItem, 'id'>) => string;
+  update_audio_edit: (
+    id: string,
+    patch: Partial<Omit<AudioEditItem, 'id'>>,
+  ) => void;
+  delete_audio_edit: (id: string) => void;
+  split_audio_at: (timestamp: number) => void;
   set_video_crop: (crop: VideoCropRect | null) => void;
   reset_video_crop: () => void;
 
@@ -392,6 +553,7 @@ export const useEditorStore = create<EditorStoreState>()(
       selectedZoomId: null,
       selectedDrawingId: null,
       selectedSfxId: null,
+      selectedAudioEditId: null,
       sfxLibrary: [],
       isLoadingSfx: false,
 
@@ -412,20 +574,77 @@ export const useEditorStore = create<EditorStoreState>()(
           ...(val ? { activeDrawTool: null, isPlaying: false } : { isPlaying: state.isPlaying }),
         })),
       setSelectedZoomId: (id) =>
-        set({
+        set((state) => ({
           selectedZoomId: id,
-          ...(id ? { selectedDrawingId: null, selectedSfxId: null } : {}),
-        }),
+          ...(id
+            ? {
+                selectedDrawingId: null,
+                selectedSfxId: null,
+                selectedAudioEditId: null,
+                project: {
+                  ...state.project,
+                  workspaceState: {
+                    ...state.project.workspaceState,
+                    selectedClipIds: [],
+                  },
+                },
+              }
+            : {}),
+        })),
       setSelectedDrawingId: (id) =>
-        set({
+        set((state) => ({
           selectedDrawingId: id,
-          ...(id ? { selectedZoomId: null, selectedSfxId: null } : {}),
-        }),
+          ...(id
+            ? {
+                selectedZoomId: null,
+                selectedSfxId: null,
+                selectedAudioEditId: null,
+                project: {
+                  ...state.project,
+                  workspaceState: {
+                    ...state.project.workspaceState,
+                    selectedClipIds: [],
+                  },
+                },
+              }
+            : {}),
+        })),
       setSelectedSfxId: (id) =>
-        set({
+        set((state) => ({
           selectedSfxId: id,
-          ...(id ? { selectedZoomId: null, selectedDrawingId: null } : {}),
-        }),
+          ...(id
+            ? {
+                selectedZoomId: null,
+                selectedDrawingId: null,
+                selectedAudioEditId: null,
+                project: {
+                  ...state.project,
+                  workspaceState: {
+                    ...state.project.workspaceState,
+                    selectedClipIds: [],
+                  },
+                },
+              }
+            : {}),
+        })),
+      setSelectedAudioEditId: (id) =>
+        set((state) => ({
+          selectedAudioEditId: id,
+          ...(id
+            ? {
+                selectedZoomId: null,
+                selectedDrawingId: null,
+                selectedSfxId: null,
+                project: {
+                  ...state.project,
+                  workspaceState: {
+                    ...state.project.workspaceState,
+                    selectedClipIds: [],
+                  },
+                },
+              }
+            : {}),
+        })),
 
       fetchModelStatus: async () => {
         try {
@@ -486,6 +705,14 @@ export const useEditorStore = create<EditorStoreState>()(
 
       setSelectedClipIds: (ids) =>
         set((state) => ({
+          ...(ids.length > 0
+            ? {
+                selectedZoomId: null,
+                selectedDrawingId: null,
+                selectedSfxId: null,
+                selectedAudioEditId: null,
+              }
+            : {}),
           project: {
             ...state.project,
             workspaceState: {
@@ -547,7 +774,7 @@ export const useEditorStore = create<EditorStoreState>()(
             ...state.project,
             workspaceState: {
               ...state.project.workspaceState,
-              overlayText: text && text.trim() ? text.trim() : null,
+              overlayText: text && text.length > 0 ? text : null,
             },
           },
         })),
@@ -567,31 +794,50 @@ export const useEditorStore = create<EditorStoreState>()(
         })),
 
       loadProjectState: (project, transcript = null) =>
-        set({
-          project: {
-            ...project,
-            workspaceState: {
-              ...project.workspaceState,
-              overlayStyle:
-                project.workspaceState?.overlayStyle ?? { ...DEFAULT_OVERLAY_STYLE },
-              crop: project.workspaceState?.crop ?? null,
+        set(() => {
+          const base = createEmptyProject();
+          return {
+            project: {
+              ...base,
+              ...project,
+              sourceVideo: {
+                ...base.sourceVideo,
+                ...(project.sourceVideo ?? {}),
+                heatmap: project.sourceVideo?.heatmap ?? [],
+                audioPeaks: project.sourceVideo?.audioPeaks ?? [],
+              },
+              workspaceState: {
+                ...base.workspaceState,
+                ...(project.workspaceState ?? {}),
+                selectedClipIds: project.workspaceState?.selectedClipIds ?? [],
+                overlayStyle: {
+                  ...DEFAULT_OVERLAY_STYLE,
+                  ...(project.workspaceState?.overlayStyle ?? {}),
+                },
+                crop: project.workspaceState?.crop ?? null,
+              },
+              captionStyle: {
+                ...base.captionStyle,
+                ...(project.captionStyle ?? {}),
+              },
+              tracks: {
+                clips: recalculateTimeline(project.tracks?.clips ?? []),
+                captions: project.tracks?.captions ?? [],
+                zooms: project.tracks?.zooms ?? [],
+                drawings: project.tracks?.drawings ?? [],
+                sfx: project.tracks?.sfx ?? [],
+                audioEdits: project.tracks?.audioEdits ?? [],
+              },
             },
-            tracks: {
-              ...project.tracks,
-              clips: recalculateTimeline(project.tracks?.clips ?? []),
-              captions: project.tracks?.captions ?? [],
-              zooms: project.tracks?.zooms ?? [],
-              drawings: project.tracks?.drawings ?? [],
-              sfx: project.tracks?.sfx ?? [],
-            },
-          },
-          transcript,
-          isPlaying: false,
-          isCropMode: false,
-          activeDrawTool: null,
-          selectedZoomId: null,
-          selectedDrawingId: null,
-          selectedSfxId: null,
+            transcript,
+            isPlaying: false,
+            isCropMode: false,
+            activeDrawTool: null,
+            selectedZoomId: null,
+            selectedDrawingId: null,
+            selectedSfxId: null,
+            selectedAudioEditId: null,
+          };
         }),
 
       setIsIngesting: (val) => set({ isIngesting: val }),
@@ -600,35 +846,60 @@ export const useEditorStore = create<EditorStoreState>()(
       appendAiMessage: (msg) =>
         set((state) => ({ aiMessages: [...state.aiMessages, msg] })),
 
+      updateAiMessage: (id, patch) =>
+        set((state) => ({
+          aiMessages: state.aiMessages.map((m) =>
+            m.id === id ? { ...m, ...patch } : m,
+          ),
+        })),
+
       // 1. isolate_highlight_clips
       isolate_highlight_clips: (clips) =>
         set((state) => {
+          if (!Array.isArray(clips)) return state;
           const maxDur = state.project.sourceVideo.originalDuration || 99999;
-          const rawClips: ClipItem[] = clips
-            .filter((c) => c.source_end > c.source_start + 0.2)
-            .map((c, idx) => {
-              const s = Math.max(0, c.source_start);
-              const e = Math.min(maxDur, c.source_end);
-              return {
-                id: makeId('clip'),
-                title: c.title || `Highlight ${idx + 1}`,
-                sourceStart: s,
-                sourceEnd: e,
-                timelineStart: 0,
-                duration: e - s,
-                viralityScore: c.virality_score,
-                reason: c.reason,
-              };
+          const rawClips: ClipItem[] = [];
+          clips.forEach((c, idx) => {
+            const rawS = Number(c?.source_start);
+            const rawE = Number(c?.source_end);
+            if (!Number.isFinite(rawS) || !Number.isFinite(rawE)) return;
+            const s = Math.max(0, rawS);
+            const e = Math.min(maxDur, rawE);
+            if (e <= s + 0.2) return;
+            rawClips.push({
+              id: makeId('clip'),
+              title: c.title || `Highlight ${idx + 1}`,
+              sourceStart: s,
+              sourceEnd: e,
+              timelineStart: 0,
+              duration: e - s,
+              viralityScore: c.virality_score,
+              reason: c.reason,
             });
+          });
+
+          if (rawClips.length === 0) {
+            return {
+              statusBanner: 'Skipped isolating clips: no valid highlight ranges found within video bounds.',
+            };
+          }
 
           const nextClips = recalculateTimeline(rawClips);
+          const curCrop = state.project.workspaceState.crop;
+          const nextCrop =
+            curCrop && curCrop.start != null && curCrop.end != null ? null : (curCrop ?? null);
           return {
+            selectedZoomId: null,
+            selectedDrawingId: null,
+            selectedSfxId: null,
+            selectedAudioEditId: null,
             project: {
               ...state.project,
               workspaceState: {
                 ...state.project.workspaceState,
                 playheadPosition: 0,
-                selectedClipIds: nextClips.length > 0 ? [nextClips[0].id] : [],
+                selectedClipIds: [nextClips[0].id],
+                crop: nextCrop,
               },
               tracks: {
                 ...state.project.tracks,
@@ -637,6 +908,10 @@ export const useEditorStore = create<EditorStoreState>()(
                   state.project.tracks.captions,
                   nextClips,
                 ),
+                zooms: [],
+                drawings: [],
+                sfx: [],
+                audioEdits: [],
               },
             },
           };
@@ -645,19 +920,47 @@ export const useEditorStore = create<EditorStoreState>()(
       // 2. trim_clip
       trim_clip: (clip_id, new_source_start, new_source_end) =>
         set((state) => {
+          if (!Number.isFinite(new_source_start) || !Number.isFinite(new_source_end)) {
+            return state;
+          }
           const maxDur = state.project.sourceVideo.originalDuration || 99999;
-          const updated = state.project.tracks.clips.map((clip) => {
+          const oldClips = state.project.tracks.clips;
+          const updated = oldClips.map((clip) => {
             if (clip.id !== clip_id) return clip;
             const s = Math.max(0, Math.min(new_source_start, maxDur - 0.2));
             const e = Math.min(maxDur, Math.max(s + 0.2, new_source_end));
             return { ...clip, sourceStart: s, sourceEnd: e };
           });
+          const nextClips = recalculateTimeline(updated);
+          const totalDur = nextClips.reduce((acc, c) => acc + c.duration, 0);
+          const remapped = remapTimelineEffects(
+            oldClips,
+            nextClips,
+            state.project.tracks,
+            state.project.workspaceState.crop,
+          );
           return {
             project: {
               ...state.project,
+              workspaceState: {
+                ...state.project.workspaceState,
+                playheadPosition: Math.min(
+                  state.project.workspaceState.playheadPosition,
+                  totalDur,
+                ),
+                crop: remapped.crop,
+              },
               tracks: {
                 ...state.project.tracks,
-                clips: recalculateTimeline(updated),
+                clips: nextClips,
+                captions: pruneOrphanedAutoCaptions(
+                  state.project.tracks.captions,
+                  nextClips,
+                ),
+                zooms: remapped.zooms,
+                drawings: remapped.drawings,
+                sfx: remapped.sfx,
+                audioEdits: remapped.audioEdits,
               },
             },
           };
@@ -666,6 +969,7 @@ export const useEditorStore = create<EditorStoreState>()(
       // 3. split_clip
       split_clip: (clip_id, split_timestamp) =>
         set((state) => {
+          if (!Number.isFinite(split_timestamp)) return state;
           const nextClips: ClipItem[] = [];
           let newlyCreatedId: string | null = null;
 
@@ -690,6 +994,10 @@ export const useEditorStore = create<EditorStoreState>()(
             }
 
             const splitSource = Number((clip.sourceStart + offset * clipSpeed).toFixed(3));
+            if (splitSource <= clip.sourceStart + 0.1 || splitSource >= clip.sourceEnd - 0.1) {
+              nextClips.push(clip);
+              continue;
+            }
             const rightId = makeId('clip');
             newlyCreatedId = rightId;
 
@@ -733,11 +1041,19 @@ export const useEditorStore = create<EditorStoreState>()(
       // 4. delete_clips
       delete_clips: (clip_ids) =>
         set((state) => {
+          if (!Array.isArray(clip_ids) || clip_ids.length === 0) return state;
+          const oldClips = state.project.tracks.clips;
           const idSet = new Set(clip_ids);
           const remaining = recalculateTimeline(
-            state.project.tracks.clips.filter((c) => !idSet.has(c.id)),
+            oldClips.filter((c) => !idSet.has(c.id)),
           );
           const totalDur = remaining.reduce((acc, c) => acc + c.duration, 0);
+          const remapped = remapTimelineEffects(
+            oldClips,
+            remaining,
+            state.project.tracks,
+            state.project.workspaceState.crop,
+          );
           return {
             project: {
               ...state.project,
@@ -750,6 +1066,7 @@ export const useEditorStore = create<EditorStoreState>()(
                 selectedClipIds: state.project.workspaceState.selectedClipIds.filter(
                   (id) => !idSet.has(id),
                 ),
+                crop: remapped.crop,
               },
               tracks: {
                 ...state.project.tracks,
@@ -758,6 +1075,10 @@ export const useEditorStore = create<EditorStoreState>()(
                   state.project.tracks.captions,
                   remaining,
                 ),
+                zooms: remapped.zooms,
+                drawings: remapped.drawings,
+                sfx: remapped.sfx,
+                audioEdits: remapped.audioEdits,
               },
             },
           };
@@ -783,7 +1104,7 @@ export const useEditorStore = create<EditorStoreState>()(
           const c2 = clips[secondIdx];
 
           // Only merge truly contiguous source clips with matching playback speeds
-          if (c2.sourceStart < c1.sourceStart || c2.sourceStart - c1.sourceEnd > 0.5) {
+          if (Math.abs(c2.sourceStart - c1.sourceEnd) > 0.5) {
             return {
               statusBanner:
                 'Can only merge adjacent clips that are contiguous in the source video.',
@@ -823,7 +1144,8 @@ export const useEditorStore = create<EditorStoreState>()(
       // 6. reorder_clips
       reorder_clips: (clip_id, new_index) =>
         set((state) => {
-          const clips = [...state.project.tracks.clips];
+          const oldClips = state.project.tracks.clips;
+          const clips = [...oldClips];
           const oldIdx = clips.findIndex((c) => c.id === clip_id);
           if (oldIdx === -1) return state;
           const clampedNewIdx = Math.max(0, Math.min(clips.length - 1, new_index));
@@ -831,13 +1153,28 @@ export const useEditorStore = create<EditorStoreState>()(
 
           const [moved] = clips.splice(oldIdx, 1);
           clips.splice(clampedNewIdx, 0, moved);
+          const nextClips = recalculateTimeline(clips);
+          const remapped = remapTimelineEffects(
+            oldClips,
+            nextClips,
+            state.project.tracks,
+            state.project.workspaceState.crop,
+          );
 
           return {
             project: {
               ...state.project,
+              workspaceState: {
+                ...state.project.workspaceState,
+                crop: remapped.crop,
+              },
               tracks: {
                 ...state.project.tracks,
-                clips: recalculateTimeline(clips),
+                clips: nextClips,
+                zooms: remapped.zooms,
+                drawings: remapped.drawings,
+                sfx: remapped.sfx,
+                audioEdits: remapped.audioEdits,
               },
             },
           };
@@ -846,12 +1183,19 @@ export const useEditorStore = create<EditorStoreState>()(
       // 7. remove_time_ranges
       remove_time_ranges: (ranges) =>
         set((state) => {
-          if (!ranges || ranges.length === 0) return state;
+          if (!Array.isArray(ranges) || ranges.length === 0) return state;
+          const oldClips = state.project.tracks.clips;
           let sortedRanges = [...ranges]
-            .filter((r) => r.end > r.start)
+            .filter(
+              (r) =>
+                Number.isFinite(r?.start) &&
+                Number.isFinite(r?.end) &&
+                r.end > r.start,
+            )
             .sort((a, b) => a.start - b.start);
+          if (sortedRanges.length === 0) return state;
 
-          const anyOverlap = state.project.tracks.clips.some((clip) =>
+          const anyOverlap = oldClips.some((clip) =>
             sortedRanges.some(
               (rem) => rem.end > clip.sourceStart && rem.start < clip.sourceEnd,
             ),
@@ -860,21 +1204,22 @@ export const useEditorStore = create<EditorStoreState>()(
             !anyOverlap &&
             sortedRanges.length === 1 &&
             sortedRanges[0].start === 0 &&
-            state.project.tracks.clips.length > 0
+            oldClips.length > 0
           ) {
-            const firstClip = state.project.tracks.clips[0];
+            const firstClip = oldClips[0];
             if (firstClip.sourceStart > 0) {
+              const spd0 = Math.max(0.25, Math.min(4.0, firstClip.speed ?? 1));
               sortedRanges = [
                 {
                   start: firstClip.sourceStart,
-                  end: firstClip.sourceStart + sortedRanges[0].end,
+                  end: firstClip.sourceStart + sortedRanges[0].end * spd0,
                 },
               ];
             }
           }
 
           const nextClips: ClipItem[] = [];
-          for (const clip of state.project.tracks.clips) {
+          for (const clip of oldClips) {
             let pieces: Array<{ start: number; end: number }> = [
               { start: clip.sourceStart, end: clip.sourceEnd },
             ];
@@ -910,6 +1255,13 @@ export const useEditorStore = create<EditorStoreState>()(
 
           const recalculated = recalculateTimeline(nextClips);
           const totalDur = recalculated.reduce((sum, c) => sum + c.duration, 0);
+          const survivingClipIds = new Set(recalculated.map((c) => c.id));
+          const remapped = remapTimelineEffects(
+            oldClips,
+            recalculated,
+            state.project.tracks,
+            state.project.workspaceState.crop,
+          );
           return {
             project: {
               ...state.project,
@@ -919,6 +1271,11 @@ export const useEditorStore = create<EditorStoreState>()(
                   state.project.workspaceState.playheadPosition,
                   totalDur,
                 ),
+                selectedClipIds:
+                  state.project.workspaceState.selectedClipIds.filter((id) =>
+                    survivingClipIds.has(id),
+                  ),
+                crop: remapped.crop,
               },
               tracks: {
                 ...state.project.tracks,
@@ -927,6 +1284,10 @@ export const useEditorStore = create<EditorStoreState>()(
                   state.project.tracks.captions,
                   recalculated,
                 ),
+                zooms: remapped.zooms,
+                drawings: remapped.drawings,
+                sfx: remapped.sfx,
+                audioEdits: remapped.audioEdits,
               },
             },
           };
@@ -1025,8 +1386,9 @@ export const useEditorStore = create<EditorStoreState>()(
         }),
 
       // 9. add_caption
-      add_caption: (start, end, text) =>
+      add_caption: (start, end, text, kind = 'subtitle') =>
         set((state) => {
+          if (!Number.isFinite(start) || !Number.isFinite(end)) return state;
           const s = Math.max(0, Number(start.toFixed(3)));
           const e = Math.max(s + 0.3, Number(end.toFixed(3)));
           const words = text
@@ -1040,6 +1402,7 @@ export const useEditorStore = create<EditorStoreState>()(
             end: e,
             text: text.trim(),
             isManuallyEdited: true,
+            captionKind: kind,
             highlightedWords: [],
             words: words.map((w, idx) => ({
               word: w,
@@ -1047,7 +1410,43 @@ export const useEditorStore = create<EditorStoreState>()(
               end: Number((s + (idx + 1) * perWord).toFixed(3)),
             })),
           };
-          const next = [...state.project.tracks.captions, newCap].sort(
+          const baseCaptions =
+            kind === 'intro_hook'
+              ? state.project.tracks.captions.flatMap((c) => {
+                  if (c.isManuallyEdited) return [c];
+                  if (c.end <= s || c.start >= e) return [c];
+                  if (c.end > e + 0.25) {
+                    const remWords = c.words.filter((w) => w.end > e + 0.03);
+                    const remText = remWords.length
+                      ? remWords.map((w) => w.word).join(' ')
+                      : c.text;
+                    return [
+                      {
+                        ...c,
+                        start: Number(e.toFixed(3)),
+                        text: remText,
+                        words: remWords,
+                      },
+                    ];
+                  }
+                  if (c.start < s - 0.25) {
+                    const remWords = c.words.filter((w) => w.start < s - 0.03);
+                    const remText = remWords.length
+                      ? remWords.map((w) => w.word).join(' ')
+                      : c.text;
+                    return [
+                      {
+                        ...c,
+                        end: Number(s.toFixed(3)),
+                        text: remText,
+                        words: remWords,
+                      },
+                    ];
+                  }
+                  return [];
+                })
+              : state.project.tracks.captions;
+          const next = [...baseCaptions, newCap].sort(
             (a, b) => a.start - b.start,
           );
           return {
@@ -1083,7 +1482,18 @@ export const useEditorStore = create<EditorStoreState>()(
           const cur = caps[firstIdx];
           const nxt = caps[secondIdx];
           const combinedText = `${cur.text.trim()} ${nxt.text.trim()}`.trim();
-          const combinedWords = [...cur.words, ...nxt.words];
+          const synthWords = (c: CaptionItem) => {
+            if (c.words.length > 0) return c.words;
+            const toks = c.text.trim().split(/\s+/).filter(Boolean);
+            const span = Math.max(0.2, c.end - c.start);
+            const per = span / Math.max(1, toks.length);
+            return toks.map((w, wi) => ({
+              word: w,
+              start: Number((c.start + wi * per).toFixed(3)),
+              end: Number((c.start + (wi + 1) * per).toFixed(3)),
+            }));
+          };
+          const combinedWords = [...synthWords(cur), ...synthWords(nxt)];
           const combinedHighlights = Array.from(
             new Set([...cur.highlightedWords, ...nxt.highlightedWords]),
           );
@@ -1147,6 +1557,7 @@ export const useEditorStore = create<EditorStoreState>()(
       // 11. adjust_caption_timing
       adjust_caption_timing: (caption_id, new_start, new_end, markManual = true) =>
         set((state) => {
+          if (!Number.isFinite(new_start) || !Number.isFinite(new_end)) return state;
           const s = Math.max(0, Number(new_start.toFixed(3)));
           const e = Math.max(s + 0.2, Number(new_end.toFixed(3)));
           const nextCaptions = state.project.tracks.captions
@@ -1234,11 +1645,29 @@ export const useEditorStore = create<EditorStoreState>()(
             cur.highlightColor,
           );
           const rawFontSize = Number(rawArgs.font_size ?? rawArgs.fontSize ?? cur.fontSize);
+          const rawPreset = String(rawArgs.preset ?? cur.preset).trim().toLowerCase();
+          const validPresets: CaptionPreset[] = [
+            'karaoke',
+            'bold_social',
+            'yellow_highlight',
+            'minimal',
+          ];
+          const nextPreset: CaptionPreset = validPresets.includes(rawPreset as CaptionPreset)
+            ? (rawPreset as CaptionPreset)
+            : cur.preset;
+          const rawPosStr = String(rawArgs.position ?? cur.position).trim().toLowerCase();
+          const mappedPos = rawPosStr === 'center' ? 'middle' : rawPosStr;
+          const validPositions: CaptionPosition[] = ['top', 'middle', 'bottom'];
+          const nextPosition: CaptionPosition = validPositions.includes(
+            mappedPos as CaptionPosition,
+          )
+            ? (mappedPos as CaptionPosition)
+            : cur.position;
           return {
             project: {
               ...state.project,
               captionStyle: {
-                preset: (rawArgs.preset as CaptionPreset | undefined) ?? cur.preset,
+                preset: nextPreset,
                 fontFamily: String(
                   rawArgs.font_family ?? rawArgs.fontFamily ?? cur.fontFamily,
                 ),
@@ -1247,7 +1676,7 @@ export const useEditorStore = create<EditorStoreState>()(
                   : cur.fontSize,
                 textColor: nextTextCol,
                 highlightColor: nextHlCol,
-                position: (rawArgs.position as CaptionPosition | undefined) ?? cur.position,
+                position: nextPosition,
                 isBold:
                   typeof (rawArgs.is_bold ?? rawArgs.isBold) === 'boolean'
                     ? Boolean(rawArgs.is_bold ?? rawArgs.isBold)
@@ -1272,16 +1701,38 @@ export const useEditorStore = create<EditorStoreState>()(
       // 14. Speed controls
       set_clip_speed: (clip_id, speed) =>
         set((state) => {
-          const clamped = Math.max(0.25, Math.min(4.0, Number(speed) || 1));
-          const updated = state.project.tracks.clips.map((c) =>
+          if (!Number.isFinite(speed) || speed <= 0) return state;
+          const oldClips = state.project.tracks.clips;
+          const clamped = Math.max(0.25, Math.min(4.0, speed));
+          const updated = oldClips.map((c) =>
             c.id === clip_id ? { ...c, speed: clamped } : c,
+          );
+          const nextClips = recalculateTimeline(updated);
+          const totalDur = nextClips.reduce((acc, c) => acc + c.duration, 0);
+          const remapped = remapTimelineEffects(
+            oldClips,
+            nextClips,
+            state.project.tracks,
+            state.project.workspaceState.crop,
           );
           return {
             project: {
               ...state.project,
+              workspaceState: {
+                ...state.project.workspaceState,
+                playheadPosition: Math.min(
+                  state.project.workspaceState.playheadPosition,
+                  totalDur,
+                ),
+                crop: remapped.crop,
+              },
               tracks: {
                 ...state.project.tracks,
-                clips: recalculateTimeline(updated),
+                clips: nextClips,
+                zooms: remapped.zooms,
+                drawings: remapped.drawings,
+                sfx: remapped.sfx,
+                audioEdits: remapped.audioEdits,
               },
             },
           };
@@ -1289,13 +1740,22 @@ export const useEditorStore = create<EditorStoreState>()(
 
       set_range_speed: (start_time, end_time, speed) =>
         set((state) => {
+          if (
+            !Number.isFinite(start_time) ||
+            !Number.isFinite(end_time) ||
+            !Number.isFinite(speed) ||
+            speed <= 0
+          ) {
+            return state;
+          }
+          const oldClips = state.project.tracks.clips;
           const sTl = Math.max(0, start_time);
           const eTl = Math.max(sTl + 0.1, end_time);
-          const clamped = Math.max(0.25, Math.min(4.0, Number(speed) || 1));
+          const clamped = Math.max(0.25, Math.min(4.0, speed));
           const nextClips: ClipItem[] = [];
           const selectedNewIds: string[] = [];
 
-          for (const clip of state.project.tracks.clips) {
+          for (const clip of oldClips) {
             const cStart = clip.timelineStart;
             const cEnd = clip.timelineStart + clip.duration;
             const spd = Math.max(0.25, Math.min(4.0, clip.speed ?? 1));
@@ -1339,19 +1799,37 @@ export const useEditorStore = create<EditorStoreState>()(
             }
           }
 
+          const recalculated = recalculateTimeline(nextClips);
+          const totalDur = recalculated.reduce((acc, c) => acc + c.duration, 0);
+          const remapped = remapTimelineEffects(
+            oldClips,
+            recalculated,
+            state.project.tracks,
+            state.project.workspaceState.crop,
+          );
+
           return {
             project: {
               ...state.project,
               workspaceState: {
                 ...state.project.workspaceState,
+                playheadPosition: Math.min(
+                  state.project.workspaceState.playheadPosition,
+                  totalDur,
+                ),
                 selectedClipIds:
                   selectedNewIds.length > 0
                     ? selectedNewIds
                     : state.project.workspaceState.selectedClipIds,
+                crop: remapped.crop,
               },
               tracks: {
                 ...state.project.tracks,
-                clips: recalculateTimeline(nextClips),
+                clips: recalculated,
+                zooms: remapped.zooms,
+                drawings: remapped.drawings,
+                sfx: remapped.sfx,
+                audioEdits: remapped.audioEdits,
               },
             },
           };
@@ -1360,17 +1838,23 @@ export const useEditorStore = create<EditorStoreState>()(
       // 15. Zoom effects
       add_zoom_effect: (item) => {
         const id = makeId('zoom');
-        const start = Math.max(0, Number(item.start.toFixed(3)));
-        const end = Math.max(start + 0.25, Number(item.end.toFixed(3)));
+        const safeS = Number.isFinite(item.start) ? item.start : 0;
+        const safeE = Number.isFinite(item.end) ? item.end : safeS + 2.0;
+        const start = Math.max(0, Number(safeS.toFixed(3)));
+        const end = Math.max(start + 0.25, Number(safeE.toFixed(3)));
+        const stSc = Number.isFinite(item.startScale) ? item.startScale : 1.0;
+        const enSc = Number.isFinite(item.endScale) ? item.endScale : 1.35;
+        const fx = Number.isFinite(item.focusX) ? item.focusX : 0.5;
+        const fy = Number.isFinite(item.focusY) ? item.focusY : 0.5;
         const newZoom: ZoomEffectItem = {
           ...item,
           id,
           start,
           end,
-          startScale: Math.max(1.0, Math.min(3.0, item.startScale ?? 1.0)),
-          endScale: Math.max(1.0, Math.min(3.0, item.endScale ?? 1.35)),
-          focusX: Math.max(0.0, Math.min(1.0, item.focusX ?? 0.5)),
-          focusY: Math.max(0.0, Math.min(1.0, item.focusY ?? 0.5)),
+          startScale: Math.max(1.0, Math.min(3.0, stSc)),
+          endScale: Math.max(1.0, Math.min(3.0, enSc)),
+          focusX: Math.max(0.0, Math.min(1.0, fx)),
+          focusY: Math.max(0.0, Math.min(1.0, fy)),
         };
         set((state) => ({
           selectedZoomId: id,
@@ -1378,6 +1862,10 @@ export const useEditorStore = create<EditorStoreState>()(
           selectedSfxId: null,
           project: {
             ...state.project,
+            workspaceState: {
+              ...state.project.workspaceState,
+              selectedClipIds: [],
+            },
             tracks: {
               ...state.project.tracks,
               zooms: [...(state.project.tracks.zooms ?? []), newZoom].sort(
@@ -1415,29 +1903,39 @@ export const useEditorStore = create<EditorStoreState>()(
         })),
 
       delete_zoom_effect: (id) =>
-        set((state) => ({
-          selectedZoomId: state.selectedZoomId === id ? null : state.selectedZoomId,
-          project: {
-            ...state.project,
-            tracks: {
-              ...state.project.tracks,
-              zooms: (state.project.tracks.zooms ?? []).filter((z) => z.id !== id),
+        set((state) => {
+          const curZooms = state.project.tracks.zooms ?? [];
+          if (!curZooms.some((z) => z.id === id)) {
+            return state.selectedZoomId === id ? { selectedZoomId: null } : state;
+          }
+          return {
+            selectedZoomId: state.selectedZoomId === id ? null : state.selectedZoomId,
+            project: {
+              ...state.project,
+              tracks: {
+                ...state.project.tracks,
+                zooms: curZooms.filter((z) => z.id !== id),
+              },
             },
-          },
-        })),
+          };
+        }),
 
       // 16. Drawing overlays
       add_drawing: (item) => {
         const id = makeId('draw');
-        const start = Math.max(0, Number(item.start.toFixed(3)));
-        const end = Math.max(start + 0.25, Number(item.end.toFixed(3)));
+        const safeS = Number.isFinite(item.start) ? item.start : 0;
+        const safeE = Number.isFinite(item.end) ? item.end : safeS + 2.5;
+        const start = Math.max(0, Number(safeS.toFixed(3)));
+        const end = Math.max(start + 0.25, Number(safeE.toFixed(3)));
+        const sw = Number.isFinite(item.strokeWidth) ? item.strokeWidth : 6;
+        const op = Number.isFinite(item.opacity) ? item.opacity : 1.0;
         const newDrawing: DrawingItem = {
           ...item,
           id,
           start,
           end,
-          strokeWidth: Math.max(2, Math.min(24, item.strokeWidth ?? 6)),
-          opacity: Math.max(0.1, Math.min(1.0, item.opacity ?? 1.0)),
+          strokeWidth: Math.max(2, Math.min(24, sw)),
+          opacity: Math.max(0.1, Math.min(1.0, op)),
         };
         set((state) => ({
           selectedDrawingId: id,
@@ -1445,6 +1943,10 @@ export const useEditorStore = create<EditorStoreState>()(
           selectedSfxId: null,
           project: {
             ...state.project,
+            workspaceState: {
+              ...state.project.workspaceState,
+              selectedClipIds: [],
+            },
             tracks: {
               ...state.project.tracks,
               drawings: [...(state.project.tracks.drawings ?? []), newDrawing].sort(
@@ -1482,33 +1984,47 @@ export const useEditorStore = create<EditorStoreState>()(
         })),
 
       delete_drawing: (id) =>
-        set((state) => ({
-          selectedDrawingId: state.selectedDrawingId === id ? null : state.selectedDrawingId,
-          project: {
-            ...state.project,
-            tracks: {
-              ...state.project.tracks,
-              drawings: (state.project.tracks.drawings ?? []).filter((d) => d.id !== id),
+        set((state) => {
+          const curDrawings = state.project.tracks.drawings ?? [];
+          if (!curDrawings.some((d) => d.id === id)) {
+            return state.selectedDrawingId === id ? { selectedDrawingId: null } : state;
+          }
+          return {
+            selectedDrawingId: state.selectedDrawingId === id ? null : state.selectedDrawingId,
+            project: {
+              ...state.project,
+              tracks: {
+                ...state.project.tracks,
+                drawings: curDrawings.filter((d) => d.id !== id),
+              },
             },
-          },
-        })),
+          };
+        }),
 
       // 17. SFX timeline clips
       add_sfx_clip: (item) => {
         const id = makeId('sfxclip');
         const matchedAsset = get().sfxLibrary.find((a) => a.id === item.assetId);
         const maxSourceDur =
-          matchedAsset && matchedAsset.duration > 0 ? matchedAsset.duration : null;
-        const start = Math.max(0, Number(item.start.toFixed(3)));
-        let trimStart = Math.max(0, Number((item.trimStart ?? 0).toFixed(3)));
+          matchedAsset && matchedAsset.duration > 0
+            ? matchedAsset.duration
+            : item.sourceDuration && item.sourceDuration > 0
+              ? item.sourceDuration
+              : null;
+        const safeS = Number.isFinite(item.start) ? item.start : 0;
+        const start = Math.max(0, Number(safeS.toFixed(3)));
+        const rawTrim = Number.isFinite(item.trimStart) ? (item.trimStart as number) : 0;
+        let trimStart = Math.max(0, Number(rawTrim.toFixed(3)));
         if (maxSourceDur !== null) {
           trimStart = Math.min(Math.max(0, maxSourceDur - 0.15), trimStart);
         }
-        let duration = Math.max(0.15, Number((item.duration || 1.5).toFixed(3)));
+        const rawDur = Number.isFinite(item.duration) && item.duration > 0 ? item.duration : 1.5;
+        let duration = Math.max(0.15, Number(rawDur.toFixed(3)));
         if (maxSourceDur !== null) {
           duration = Math.min(Math.max(0.15, maxSourceDur - trimStart), duration);
         }
-        const volume = Math.max(0, Math.min(2.0, Number((item.volume ?? 0.85).toFixed(2))));
+        const safeVol = Number.isFinite(item.volume) ? item.volume : 0.85;
+        const volume = Math.max(0, Math.min(2.0, Number(safeVol.toFixed(2))));
         const newSfx: SfxClipItem = {
           ...item,
           id,
@@ -1516,6 +2032,7 @@ export const useEditorStore = create<EditorStoreState>()(
           duration: Number(duration.toFixed(3)),
           trimStart: Number(trimStart.toFixed(3)),
           volume,
+          ...(maxSourceDur !== null ? { sourceDuration: maxSourceDur } : {}),
         };
         set((state) => ({
           selectedSfxId: id,
@@ -1523,6 +2040,10 @@ export const useEditorStore = create<EditorStoreState>()(
           selectedDrawingId: null,
           project: {
             ...state.project,
+            workspaceState: {
+              ...state.project.workspaceState,
+              selectedClipIds: [],
+            },
             tracks: {
               ...state.project.tracks,
               sfx: [...(state.project.tracks.sfx ?? []), newSfx].sort(
@@ -1581,18 +2102,235 @@ export const useEditorStore = create<EditorStoreState>()(
         })),
 
       delete_sfx_clip: (id) =>
+        set((state) => {
+          const curSfx = state.project.tracks.sfx ?? [];
+          if (!curSfx.some((sc) => sc.id === id)) {
+            return state.selectedSfxId === id ? { selectedSfxId: null } : state;
+          }
+          return {
+            selectedSfxId: state.selectedSfxId === id ? null : state.selectedSfxId,
+            project: {
+              ...state.project,
+              tracks: {
+                ...state.project.tracks,
+                sfx: curSfx.filter((sc) => sc.id !== id),
+              },
+            },
+          };
+        }),
+
+      // 18. Video Audio Mute / Cut / Volume Segments
+      add_audio_edit: (item) => {
+        const id = makeId('aud');
+        const safeS = Number.isFinite(item.start) ? item.start : 0;
+        const safeE = Number.isFinite(item.end) ? item.end : safeS + 2.0;
+        const rawVol = Number.isFinite(item.volume) ? item.volume : item.muted ? 0 : 1;
+        const muted = Boolean(item.muted) || rawVol <= 0.001;
+        const vol = muted ? 0 : Math.max(0, Math.min(2, Number(rawVol.toFixed(2))));
         set((state) => ({
-          selectedSfxId: state.selectedSfxId === id ? null : state.selectedSfxId,
+          selectedAudioEditId: id,
+          selectedZoomId: null,
+          selectedDrawingId: null,
+          selectedSfxId: null,
+          project: {
+            ...state.project,
+            workspaceState: {
+              ...state.project.workspaceState,
+              selectedClipIds: [],
+            },
+            tracks: {
+              ...state.project.tracks,
+              audioEdits: [
+                ...(state.project.tracks.audioEdits ?? []),
+                {
+                  id,
+                  start: Math.max(0, Number(safeS.toFixed(3))),
+                  end: Math.max(safeS + 0.15, Number(safeE.toFixed(3))),
+                  muted,
+                  volume: vol,
+                  ...(item.label ? { label: String(item.label).slice(0, 60) } : {}),
+                },
+              ],
+            },
+          },
+        }));
+        return id;
+      },
+
+      update_audio_edit: (id, patch) =>
+        set((state) => ({
           project: {
             ...state.project,
             tracks: {
               ...state.project.tracks,
-              sfx: (state.project.tracks.sfx ?? []).filter((sc) => sc.id !== id),
+              audioEdits: (state.project.tracks.audioEdits ?? []).map((ae) => {
+                if (ae.id !== id) return ae;
+                const nextS =
+                  patch.start !== undefined && Number.isFinite(patch.start)
+                    ? Math.max(0, Number(patch.start.toFixed(3)))
+                    : ae.start;
+                const nextE =
+                  patch.end !== undefined && Number.isFinite(patch.end)
+                    ? Math.max(nextS + 0.15, Number(patch.end.toFixed(3)))
+                    : Math.max(nextS + 0.15, ae.end);
+                const nextMuted =
+                  patch.muted !== undefined ? Boolean(patch.muted) : ae.muted;
+                const nextVol =
+                  patch.volume !== undefined && Number.isFinite(patch.volume)
+                    ? Math.max(0, Math.min(2, Number(patch.volume.toFixed(2))))
+                    : nextMuted
+                      ? 0
+                      : ae.volume > 0.001
+                        ? ae.volume
+                        : 1;
+                const finalMuted =
+                  patch.muted !== undefined
+                    ? nextMuted
+                    : patch.volume !== undefined
+                      ? nextVol <= 0.001
+                      : nextMuted;
+                return {
+                  ...ae,
+                  ...patch,
+                  start: nextS,
+                  end: nextE,
+                  muted: finalMuted,
+                  volume: finalMuted ? 0 : nextVol,
+                };
+              }),
             },
           },
         })),
 
-      // 18. Source video crop rectangle
+      delete_audio_edit: (id) =>
+        set((state) => {
+          const cur = state.project.tracks.audioEdits ?? [];
+          if (id === 'all') {
+            if (cur.length === 0 && !state.selectedAudioEditId) return state;
+            return {
+              selectedAudioEditId: null,
+              project: {
+                ...state.project,
+                tracks: {
+                  ...state.project.tracks,
+                  audioEdits: [],
+                },
+              },
+            };
+          }
+          if (!cur.some((ae) => ae.id === id)) {
+            return state.selectedAudioEditId === id ? { selectedAudioEditId: null } : state;
+          }
+          return {
+            selectedAudioEditId:
+              state.selectedAudioEditId === id ? null : state.selectedAudioEditId,
+            project: {
+              ...state.project,
+              tracks: {
+                ...state.project.tracks,
+                audioEdits: cur.filter((ae) => ae.id !== id),
+              },
+            },
+          };
+        }),
+
+      split_audio_at: (timestamp) =>
+        set((state) => {
+          if (!Number.isFinite(timestamp)) return state;
+          const ts = Number(Math.max(0, timestamp).toFixed(3));
+          const curEdits = state.project.tracks.audioEdits ?? [];
+          const existingIdx = curEdits.findIndex(
+            (ae) => ts > ae.start + 0.15 && ts < ae.end - 0.15,
+          );
+          if (existingIdx !== -1) {
+            const target = curEdits[existingIdx];
+            const rightId = makeId('aud');
+            const nextEdits = [
+              ...curEdits.slice(0, existingIdx),
+              { ...target, end: ts },
+              {
+                id: rightId,
+                start: ts,
+                end: target.end,
+                muted: target.muted,
+                volume: target.volume,
+                label: target.label,
+              },
+              ...curEdits.slice(existingIdx + 1),
+            ];
+            return {
+              selectedAudioEditId: rightId,
+              selectedZoomId: null,
+              selectedDrawingId: null,
+              selectedSfxId: null,
+              project: {
+                ...state.project,
+                workspaceState: {
+                  ...state.project.workspaceState,
+                  selectedClipIds: [],
+                },
+                tracks: {
+                  ...state.project.tracks,
+                  audioEdits: nextEdits,
+                },
+              },
+            };
+          }
+
+          const targetClip = state.project.tracks.clips.find(
+            (c) => ts > c.timelineStart + 0.15 && ts < c.timelineStart + c.duration - 0.15,
+          );
+          if (!targetClip) return state;
+
+          const cStart = Number(targetClip.timelineStart.toFixed(3));
+          const cEnd = Number((targetClip.timelineStart + targetClip.duration).toFixed(3));
+          const leftId = makeId('aud');
+          const rightId = makeId('aud');
+          const overlapsRange = (rs: number, re: number) =>
+            curEdits.some((ae) => Math.min(ae.end, re) - Math.max(ae.start, rs) > 0.1);
+          const toAdd: AudioEditItem[] = [];
+          if (!overlapsRange(cStart, ts)) {
+            toAdd.push({
+              id: leftId,
+              start: cStart,
+              end: ts,
+              muted: false,
+              volume: 1.0,
+              label: 'Audio Part 1',
+            });
+          }
+          if (!overlapsRange(ts, cEnd)) {
+            toAdd.push({
+              id: rightId,
+              start: ts,
+              end: cEnd,
+              muted: false,
+              volume: 1.0,
+              label: 'Audio Part 2',
+            });
+          }
+          if (toAdd.length === 0) return state;
+          const selectId = toAdd[toAdd.length - 1].id;
+          return {
+            selectedAudioEditId: selectId,
+            selectedZoomId: null,
+            selectedDrawingId: null,
+            selectedSfxId: null,
+            project: {
+              ...state.project,
+              workspaceState: {
+                ...state.project.workspaceState,
+                selectedClipIds: [],
+              },
+              tracks: {
+                ...state.project.tracks,
+                audioEdits: [...curEdits, ...toAdd],
+              },
+            },
+          };
+        }),
+
+      // 19. Source video crop rectangle
       set_video_crop: (crop) =>
         set((state) => {
           if (!crop) {
@@ -1606,10 +2344,22 @@ export const useEditorStore = create<EditorStoreState>()(
               },
             };
           }
-          const x = Math.max(0, Math.min(0.9, Number((crop.x ?? 0).toFixed(4))));
-          const y = Math.max(0, Math.min(0.9, Number((crop.y ?? 0).toFixed(4))));
-          const w = Math.max(0.1, Math.min(1 - x, Number((crop.w ?? 1).toFixed(4))));
-          const h = Math.max(0.1, Math.min(1 - y, Number((crop.h ?? 1).toFixed(4))));
+          const rawX = Number(crop.x ?? 0);
+          const rawY = Number(crop.y ?? 0);
+          const rawW = Number(crop.w ?? 1);
+          const rawH = Number(crop.h ?? 1);
+          if (
+            !Number.isFinite(rawX) ||
+            !Number.isFinite(rawY) ||
+            !Number.isFinite(rawW) ||
+            !Number.isFinite(rawH)
+          ) {
+            return state;
+          }
+          const x = Math.max(0, Math.min(0.9, Number(rawX.toFixed(4))));
+          const y = Math.max(0, Math.min(0.9, Number(rawY.toFixed(4))));
+          const w = Math.max(0.1, Math.min(1 - x, Number(rawW.toFixed(4))));
+          const h = Math.max(0.1, Math.min(1 - y, Number(rawH.toFixed(4))));
           const isFullFrame = x <= 0.005 && y <= 0.005 && w >= 0.99 && h >= 0.99;
           const hasTimeWindow =
             crop.start != null &&
@@ -1667,27 +2417,34 @@ export const useEditorStore = create<EditorStoreState>()(
 
             switch (tc.name) {
               case 'isolate_highlight_clips': {
-                const clips = (args.clips as HighlightClipInput[]) || [];
+                const clips = Array.isArray(args.clips)
+                  ? (args.clips as HighlightClipInput[])
+                  : [];
                 store.isolate_highlight_clips(clips);
                 summary = `Isolated ${clips.length} viral clip(s)`;
                 break;
               }
               case 'trim_clip': {
-                store.trim_clip(
-                  String(args.clip_id),
-                  Number(args.new_source_start),
-                  Number(args.new_source_end),
-                );
-                summary = `Trimmed clip ${String(args.clip_id)}`;
+                const s = Number(args.new_source_start);
+                const e = Number(args.new_source_end);
+                if (Number.isFinite(s) && Number.isFinite(e)) {
+                  store.trim_clip(String(args.clip_id), s, e);
+                  summary = `Trimmed clip ${String(args.clip_id)}`;
+                }
                 break;
               }
               case 'split_clip': {
-                store.split_clip(String(args.clip_id), Number(args.split_timestamp));
-                summary = `Split clip at ${Number(args.split_timestamp).toFixed(1)}s`;
+                const ts = Number(args.split_timestamp);
+                if (Number.isFinite(ts)) {
+                  store.split_clip(String(args.clip_id), ts);
+                  summary = `Split clip at ${ts.toFixed(1)}s`;
+                }
                 break;
               }
               case 'delete_clips': {
-                const ids = (args.clip_ids as string[]) || [];
+                const ids = Array.isArray(args.clip_ids)
+                  ? (args.clip_ids as string[])
+                  : [];
                 store.delete_clips(ids);
                 summary = `Deleted ${ids.length} clip(s)`;
                 break;
@@ -1698,12 +2455,17 @@ export const useEditorStore = create<EditorStoreState>()(
                 break;
               }
               case 'reorder_clips': {
-                store.reorder_clips(String(args.clip_id), Number(args.new_index));
-                summary = `Reordered clip to #${Number(args.new_index) + 1}`;
+                const ni = Number(args.new_index);
+                if (Number.isFinite(ni)) {
+                  store.reorder_clips(String(args.clip_id), ni);
+                  summary = `Reordered clip to #${ni + 1}`;
+                }
                 break;
               }
               case 'remove_time_ranges': {
-                const ranges = (args.ranges as TimeRange[]) || [];
+                const ranges = Array.isArray(args.ranges)
+                  ? (args.ranges as TimeRange[])
+                  : [];
                 store.remove_time_ranges(ranges);
                 summary = `Removed ${ranges.length} time range(s)`;
                 break;
@@ -1718,12 +2480,18 @@ export const useEditorStore = create<EditorStoreState>()(
                 break;
               }
               case 'add_caption': {
+                const capKind =
+                  args.kind === 'intro_hook' || args.caption_kind === 'intro_hook'
+                    ? 'intro_hook'
+                    : 'subtitle';
                 store.add_caption(
                   Number(args.start),
                   Number(args.end),
                   String(args.text || ''),
+                  capKind,
                 );
-                summary = 'Added caption';
+                summary =
+                  capKind === 'intro_hook' ? 'Added intro hook caption' : 'Added caption';
                 break;
               }
               case 'delete_caption': {
@@ -2015,6 +2783,51 @@ export const useEditorStore = create<EditorStoreState>()(
                     : `Cropped frame (${Math.round(w * 100)}% x ${Math.round(h * 100)}%)`;
                 break;
               }
+              case 'edit_video_audio': {
+                const clipsNow = get().project.tracks.clips;
+                const totalDur = Math.max(
+                  0.5,
+                  clipsNow.reduce((acc, c) => acc + c.duration, 0),
+                );
+                const ph = get().project.workspaceState.playheadPosition;
+                const rawS = Number(args.start ?? ph ?? 0);
+                const start = Math.max(0, Math.min(totalDur - 0.15, Number.isFinite(rawS) ? rawS : 0));
+                const rawE = Number(args.end ?? Math.min(totalDur, start + 3.0));
+                const end = Math.min(
+                  totalDur,
+                  Math.max(start + 0.15, Number.isFinite(rawE) ? rawE : start + 3.0),
+                );
+                const muted = Boolean(args.muted ?? true);
+                const rawVol = Number(args.volume ?? (muted ? 0 : 0.25));
+                const volume = muted ? 0 : Math.max(0, Math.min(2, Number.isFinite(rawVol) ? rawVol : 0.25));
+                const label = typeof args.label === 'string' ? args.label : undefined;
+                store.add_audio_edit({ start, end, muted, volume, label });
+                summary = muted
+                  ? `Muted video audio (${start.toFixed(1)}s–${end.toFixed(1)}s)`
+                  : `Set video audio ${Math.round(volume * 100)}% (${start.toFixed(1)}s–${end.toFixed(1)}s)`;
+                break;
+              }
+              case 'delete_audio_edit': {
+                const reqAudId = String(args.audio_edit_id || '').trim();
+                const curEdits = get().project.tracks.audioEdits ?? [];
+                if (reqAudId.toLowerCase() === 'all') {
+                  store.delete_audio_edit('all');
+                  summary = 'Restored all video audio';
+                } else {
+                  const exact = curEdits.find((ae) => ae.id === reqAudId);
+                  if (exact) {
+                    store.delete_audio_edit(exact.id);
+                    summary = `Restored video audio (${exact.start.toFixed(1)}s–${exact.end.toFixed(1)}s)`;
+                  } else if (curEdits.length > 0) {
+                    const lastAe = curEdits[curEdits.length - 1];
+                    store.delete_audio_edit(lastAe.id);
+                    summary = `Restored video audio (${lastAe.start.toFixed(1)}s–${lastAe.end.toFixed(1)}s)`;
+                  } else {
+                    summary = 'No active video audio edit to remove';
+                  }
+                }
+                break;
+              }
               default:
                 summary = `Unknown tool: ${tc.name}`;
             }
@@ -2044,6 +2857,8 @@ export const useEditorStore = create<EditorStoreState>()(
       },
 
       ingestYoutubeUrl: async (youtubeUrl, initialPrompt) => {
+        if (get().isIngesting) return;
+        const seq = ++activeIngestSeq;
         const effectivePrompt = (initialPrompt ?? get().ingestPrompt ?? '').trim();
         const isDemo = ['demo://sample', 'sample', 'demo'].includes(youtubeUrl.trim().toLowerCase());
         const useClipOnly = Boolean(effectivePrompt && !isDemo);
@@ -2077,6 +2892,10 @@ export const useEditorStore = create<EditorStoreState>()(
             throw new Error(err.detail || 'Ingest failed');
           }
           const data = await resp.json();
+          if (seq !== activeIngestSeq) return;
+          if (!data?.project?.sourceVideo || !data?.project?.tracks) {
+            throw new Error('Malformed project response from ingest endpoint.');
+          }
           const newMessages = [...get().aiMessages];
           let nextBanner: string | null = null;
           if (data.ai_message) {
@@ -2116,6 +2935,7 @@ export const useEditorStore = create<EditorStoreState>()(
               zooms: data.project?.tracks?.zooms ?? [],
               drawings: data.project?.tracks?.drawings ?? [],
               sfx: data.project?.tracks?.sfx ?? [],
+              audioEdits: data.project?.tracks?.audioEdits ?? [],
             },
           };
           if (activeCampaign) {
@@ -2141,6 +2961,7 @@ export const useEditorStore = create<EditorStoreState>()(
             selectedZoomId: null,
             selectedDrawingId: null,
             selectedSfxId: null,
+            selectedAudioEditId: null,
             statusBanner: nextBanner,
           });
           // Clear undo history on fresh ingest so undo only reverts edits on this project
@@ -2156,46 +2977,68 @@ export const useEditorStore = create<EditorStoreState>()(
 
       runAutoCaptions: async (startTime, endTime) => {
         const state = get();
+        const reqProjectId = state.project.projectId;
         if (state.transcript && state.transcript.words?.length) {
           state.generate_auto_captions(startTime, endTime);
           return;
         }
-        const resp = await fetch(`${API_BASE}/api/auto-captions`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            project_id: state.project.projectId,
-            start_time: startTime,
-            end_time: endTime,
-          }),
-        });
-        if (resp.ok) {
+        try {
+          const resp = await fetch(`${API_BASE}/api/auto-captions`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              project_id: reqProjectId,
+              start_time: startTime,
+              end_time: endTime,
+            }),
+          });
+          if (!resp.ok) {
+            const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+            get().setStatusBanner(err.detail || 'Auto captions failed.');
+            return;
+          }
           const data = await resp.json();
-          state.generate_auto_captions(startTime, endTime, data.captions);
+          if (get().project.projectId !== reqProjectId) return;
+          get().generate_auto_captions(startTime, endTime, data.captions);
+        } catch (err) {
+          get().setStatusBanner(
+            `Auto captions error: ${err instanceof Error ? err.message : String(err)}`,
+          );
         }
       },
 
       removeDetectedPauses: async (minGap = 0.7) => {
         const state = get();
-        if (!state.project.projectId || state.project.projectId === 'proj_empty') return;
-        const resp = await fetch(`${API_BASE}/api/detect-pauses`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            project_id: state.project.projectId,
-            min_gap: minGap,
-          }),
-        });
-        if (resp.ok) {
+        const reqProjectId = state.project.projectId;
+        if (!reqProjectId || reqProjectId === 'proj_empty') return;
+        try {
+          const resp = await fetch(`${API_BASE}/api/detect-pauses`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              project_id: reqProjectId,
+              min_gap: minGap,
+            }),
+          });
+          if (!resp.ok) {
+            const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+            get().setStatusBanner(err.detail || 'Pause detection failed.');
+            return;
+          }
           const data = await resp.json();
+          if (get().project.projectId !== reqProjectId) return;
           if (Array.isArray(data.ranges) && data.ranges.length > 0) {
-            state.remove_time_ranges(data.ranges);
-            state.setStatusBanner(
+            get().remove_time_ranges(data.ranges);
+            get().setStatusBanner(
               `Removed ${data.ranges.length} silence/pause gap(s) >= ${minGap}s.`,
             );
           } else {
-            state.setStatusBanner(`No pauses >= ${minGap}s found in transcript.`);
+            get().setStatusBanner(`No pauses >= ${minGap}s found in transcript.`);
           }
+        } catch (err) {
+          get().setStatusBanner(
+            `Pause detection error: ${err instanceof Error ? err.message : String(err)}`,
+          );
         }
       },
 
@@ -2281,13 +3124,36 @@ export const useEditorStore = create<EditorStoreState>()(
           const resp = await fetch(`${API_BASE}/api/sfx/${encodeURIComponent(sfxId)}`, {
             method: 'DELETE',
           });
-          if (resp.ok) {
-            set((state) => ({
-              sfxLibrary: state.sfxLibrary.filter((a) => a.id !== sfxId),
-            }));
+          if (!resp.ok) {
+            const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+            set({ statusBanner: err.detail || 'Failed to delete SFX asset.' });
+            return;
           }
-        } catch {
-          // Non-fatal
+          set((state) => {
+            const curSfx = state.project.tracks.sfx ?? [];
+            const nextSfx = curSfx.filter((sc) => sc.assetId !== sfxId);
+            const selectedWasRemoved =
+              state.selectedSfxId !== null &&
+              !nextSfx.some((sc) => sc.id === state.selectedSfxId);
+            return {
+              sfxLibrary: state.sfxLibrary.filter((a) => a.id !== sfxId),
+              selectedSfxId: selectedWasRemoved ? null : state.selectedSfxId,
+              project:
+                nextSfx.length === curSfx.length
+                  ? state.project
+                  : {
+                      ...state.project,
+                      tracks: {
+                        ...state.project.tracks,
+                        sfx: nextSfx,
+                      },
+                    },
+            };
+          });
+        } catch (err) {
+          set({
+            statusBanner: `Delete SFX error: ${err instanceof Error ? err.message : String(err)}`,
+          });
         }
       },
     }),

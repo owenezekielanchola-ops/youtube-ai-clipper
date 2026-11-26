@@ -25,6 +25,7 @@ workspace_data/**/_tmp_*/
 workspace_data/.bin/
 !workspace_data/sfx/*.mp3
 !workspace_data/sfx/library.json
+workspace_data/sfx/tts_*.mp3
 
 # Python
 __pycache__/
